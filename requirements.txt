@@ -1,6 +1,27 @@
-streamlit==1.37.1
-pandas==2.2.2
-numpy==2.0.1
-openpyxl==3.1.5
-gspread==6.1.2
-google-auth==2.33.0
+# Core
+streamlit>=1.37.0
+pandas>=2.2.2
+numpy>=1.26.4
+
+# Excel reading/writing
+openpyxl>=3.1.2
+xlrd>=2.0.1
+xlsxwriter>=3.2.0
+
+# Google Sheets integration
+gspread>=6.1.2
+google-auth>=2.34.0
+google-auth-oauthlib>=1.2.1
+google-auth-httplib2>=0.2.0
+
+# For handling JSON configs/secrets
+pyyaml>=6.0.2
+
+# Optional but useful for text/markdown formatting
+markdown-it-py>=3.0.0
+
+# For date/time utilities if needed
+python-dateutil>=2.9.0.post0
+
+# For potential data cleaning & dedupe helpers
+fuzzywuzzy[speedup]>=0.18.0
