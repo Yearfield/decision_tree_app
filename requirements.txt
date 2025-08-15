@@ -25,3 +25,6 @@ python-dateutil>=2.9.0.post0
 
 # For potential data cleaning & dedupe helpers
 fuzzywuzzy[speedup]>=0.18.0
+
+# For pdf export
+reportlab>=3.6
