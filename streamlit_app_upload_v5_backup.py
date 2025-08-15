@@ -1,5 +1,3 @@
-# streamlit_app_upload.py — Version 6.1
-
 import io
 import random
 from typing import Dict, List, Tuple, Optional, Set
@@ -8,8 +6,8 @@ import numpy as np
 import streamlit as st
 from datetime import datetime
 
-# ============ VERSION / CONFIG ============
-APP_VERSION = "v6.1"
+# ============ CONFIG ============
+APP_VERSION = "v6"
 CANON_HEADERS = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]
 LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
 SHEET_COMPLETED_SUFFIX = " (Completed)"
@@ -33,7 +31,6 @@ def normalize_text(x: str) -> str:
     return str(x).strip()
 
 def validate_headers(df: pd.DataFrame) -> bool:
-    # Allow extra trailing columns but first 8 must match canonical exactly
     return list(df.columns[:len(CANON_HEADERS)]) == CANON_HEADERS
 
 def parent_key_from_row_strict(row: pd.Series, upto_level: int) -> Optional[Tuple[str, ...]]:
@@ -57,8 +54,6 @@ def infer_branch_options(df: pd.DataFrame) -> Dict[str, List[str]]:
     for level in range(1, MAX_LEVELS+1):
         parent_to_children: Dict[Tuple[str, ...], List[str]] = {}
         for _, row in df.iterrows():
-            if LEVEL_COLS[level-1] not in df.columns: 
-                continue
             child = normalize_text(row[LEVEL_COLS[level-1]])
             if child == "":
                 continue
@@ -85,14 +80,85 @@ def infer_branch_options_with_overrides(df: pd.DataFrame, overrides: Dict[str, L
         merged[k] = vals
     return merged
 
-def enforce_k_five(opts: List[str]) -> List[str]:
+def enforce_k_five(opts: List[str]) -> Tuple[List[str], List[str]]:
     """Ensure exactly 5 options (trim or pad with blanks)."""
     clean = [normalize_text(o) for o in opts if normalize_text(o) != ""]
+    extras = []
     if len(clean) > 5:
+        extras = clean[5:]
         clean = clean[:5]
     elif len(clean) < 5:
         clean = clean + [""]*(5-len(clean))
-    return clean
+    return clean, extras
+
+def mark_duplicates(df_completed: pd.DataFrame) -> pd.DataFrame:
+    keycols = ["Vital Measurement"] + LEVEL_COLS
+    dup_mask = df_completed.duplicated(subset=keycols, keep=False)
+    df_completed = df_completed.copy()
+    if "Duplicate" not in df_completed.columns:
+        df_completed.insert(len(df_completed.columns), "Duplicate", dup_mask)
+    else:
+        df_completed["Duplicate"] = dup_mask
+    return df_completed
+
+def build_completed_sheet(df: pd.DataFrame, user_fixes: Dict[str, List[str]]) -> pd.DataFrame:
+    """
+    Expand to full 5-way tree using observed + user-approved options.
+    Merge triage/actions where exact path existed.
+    Always produces a full table of all expanded rows (not only changed ones).
+    """
+    observed = infer_branch_options(df)
+    for k, v in user_fixes.items():
+        observed[k] = v
+    for k in list(observed.keys()):
+        opts5, _ = enforce_k_five(observed[k])
+        observed[k] = opts5
+
+    all_vm = sorted(set(normalize_text(x) for x in df["Vital Measurement"] if normalize_text(x) != ""))
+    completed_rows = []
+
+    for vm_val in all_vm:
+        def dfs(level: int, prefix: Tuple[str, ...]):
+            if level > MAX_LEVELS:
+                row = {"Vital Measurement": vm_val}
+                for i, val in enumerate(prefix, 1):
+                    row[f"Node {i}"] = val
+                for i in range(1, MAX_LEVELS+1):
+                    row.setdefault(f"Node {i}", "")
+                row["Diagnostic Triage"] = ""
+                row["Actions"] = ""
+                completed_rows.append(row); return
+            key = level_key_tuple(level, prefix)
+            opts = observed.get(key, [])
+            if len(opts) != 5 or any(o == "" for o in opts):
+                return
+            for o in opts:
+                dfs(level+1, prefix + (o,))
+        dfs(1, tuple())
+
+    if not completed_rows:
+        out = pd.DataFrame(columns=CANON_HEADERS + ["Duplicate","Auto-filled"])
+    else:
+        out = pd.DataFrame(completed_rows, columns=CANON_HEADERS)
+        # Merge existing triage/actions where exact path matches
+        keycols = ["Vital Measurement"] + LEVEL_COLS
+        df_keyed = df.copy()
+        for c in CANON_HEADERS:
+            if c not in df_keyed.columns:
+                df_keyed[c] = ""
+        df_keyed = df_keyed[CANON_HEADERS]
+        # Mark which paths are new (autofilled)
+        orig_keys = set(tuple(row) for row in df_keyed[keycols].itertuples(index=False, name=None))
+        out_keys = [tuple(row) for row in out[keycols].itertuples(index=False, name=None)]
+        out["Auto-filled"] = [k not in orig_keys for k in out_keys]
+        # Merge outcomes from original where present
+        out = out.merge(df_keyed, on=keycols, how="left", suffixes=("", "_old"))
+        for col in ["Diagnostic Triage","Actions"]:
+            out[col] = np.where(out[f"{col}_old"].notna() & (out[f"{col}_old"] != ""), out[f"{col}_old"], out[col])
+            out.drop(columns=[f"{col}_old"], inplace=True)
+
+    out = mark_duplicates(out)
+    return out
 
 def compute_virtual_parents(store: Dict[str, List[str]]) -> Dict[int, Set[Tuple[str, ...]]]:
     """Expand parents forward using known store (observed + overrides)."""
@@ -121,95 +187,6 @@ def compute_virtual_parents(store: Dict[str, List[str]]) -> Dict[int, Set[Tuple[
                 parents_by_level[k].add(tuple(parent_tuple[:k-1]))
     return parents_by_level
 
-# ============ Completed sheet builder (no Auto-filled column) ============
-def build_completed_sheet(df: pd.DataFrame, user_fixes: Dict[str, List[str]]) -> pd.DataFrame:
-    """
-    Expand to full 5-way tree using observed + user-approved options.
-    Merge triage/actions where exact path existed.
-    Always produces a table of all expanded rows (not only changed ones).
-    """
-    observed = infer_branch_options(df)
-    for k, v in user_fixes.items():
-        observed[k] = v
-    for k in list(observed.keys()):
-        observed[k] = enforce_k_five(observed[k])
-
-    all_vm = sorted(set(normalize_text(x) for x in df["Vital Measurement"] if normalize_text(x) != ""))
-    completed_rows = []
-
-    for vm_val in all_vm:
-        def dfs(level: int, prefix: Tuple[str, ...]):
-            if level > MAX_LEVELS:
-                row = {"Vital Measurement": vm_val}
-                for i, val in enumerate(prefix, 1):
-                    row[f"Node {i}"] = val
-                for i in range(1, MAX_LEVELS+1):
-                    row.setdefault(f"Node {i}", "")
-                row["Diagnostic Triage"] = ""
-                row["Actions"] = ""
-                completed_rows.append(row); return
-            key = level_key_tuple(level, prefix)
-            opts = observed.get(key, [])
-            if len(opts) != 5 or any(o == "" for o in opts):
-                return
-            for o in opts:
-                dfs(level+1, prefix + (o,))
-        dfs(1, tuple())
-
-    if not completed_rows:
-        out = pd.DataFrame(columns=CANON_HEADERS)
-    else:
-        out = pd.DataFrame(completed_rows, columns=CANON_HEADERS)
-        # Merge existing triage/actions where exact path matches
-        keycols = ["Vital Measurement"] + LEVEL_COLS
-        df_keyed = df.copy()
-        for c in CANON_HEADERS:
-            if c not in df_keyed.columns:
-                df_keyed[c] = ""
-        df_keyed = df_keyed[CANON_HEADERS]
-        out = out.merge(df_keyed, on=keycols, how="left", suffixes=("", "_old"))
-        for col in ["Diagnostic Triage","Actions"]:
-            out[col] = np.where(out[f"{col}_old"].notna() & (out[f"{col}_old"] != ""), out[f"{col}_old"], out[col])
-            out.drop(columns=[f"{col}_old"], inplace=True)
-    return out
-
-# ======== Progress / depth metrics ========
-def compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
-    """Parents with exactly 5 children across all levels."""
-    store = infer_branch_options(df)
-    total = 0; ok = 0
-    for level in range(1, MAX_LEVELS+1):
-        # parents observed at this level
-        parents = set()
-        for _, row in df.iterrows():
-            p = parent_key_from_row_strict(row, level)
-            if p is not None:
-                parents.add(p)
-        for p in parents:
-            total += 1
-            key = level_key_tuple(level, p)
-            if len(store.get(key, [])) == 5:
-                ok += 1
-    return ok, total
-
-def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
-    """Rows where Node 1..5 are all non-empty (full path)."""
-    if df.empty:
-        return (0,0)
-    nodes = df[LEVEL_COLS].applymap(normalize_text)
-    full = nodes.ne("").all(axis=1)
-    return int(full.sum()), int(len(df))
-
-def branch_depth_badge_html(df: pd.DataFrame) -> str:
-    ok_p, total_p = compute_parent_depth_score(df)
-    ok_r, total_r = compute_row_path_score(df)
-    return (
-        f"<div style='display:inline-block;background:#eef6ff;"
-        f"padding:6px 10px;border-radius:8px;border:1px solid #cfe2ff;margin-left:8px;'>"
-        f"Parents 5/5: <b>{ok_p}/{total_p}</b> &nbsp;|&nbsp; Rows full path: <b>{ok_r}/{total_r}</b>"
-        f"</div>"
-    )
-
 # ======== Google Sheets helpers ========
 def push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFrame) -> bool:
     """Overwrite or create target sheet with df using service account in secrets."""
@@ -217,7 +194,7 @@ def push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFrame
         import gspread
         from google.oauth2.service_account import Credentials
         if "gcp_service_account" not in st.secrets:
-            st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
+            st.error("Google Sheets secrets missing. Add [gcp_service_account] in secrets.")
             return False
         sa_info = st.secrets["gcp_service_account"]
         scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
@@ -227,7 +204,7 @@ def push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFrame
         try:
             ws = sh.worksheet(sheet_name); ws.clear()
         except Exception:
-            ws = sh.add_worksheet(title=sheet_name, rows=max(len(df)+50, 200), cols=max(len(df.columns)+2, 10))
+            ws = sh.add_worksheet(title=sheet_name, rows=max(len(df)+10, 100), cols=max(len(df.columns)+2, 8))
         df = df.fillna("")
         values = [list(df.columns)] + df.astype(str).values.tolist()
         ws.update(values); return True
@@ -262,7 +239,7 @@ def backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
         st.error(f"Backup failed: {e}")
         return None
 
-# ======== Human-readable issue text ========
+# ======== Pretty message for branch issues ========
 def describe_branch(level: int, parent: Tuple[str, ...], have_n: int, label: str) -> str:
     parts = []
     for i, val in enumerate(parent, start=1):
@@ -270,7 +247,104 @@ def describe_branch(level: int, parent: Tuple[str, ...], have_n: int, label: str
     ctx = " under <ROOT>" if not parts else f" under {parts[-1]}" + (f" (from {', '.join(parts[:-1])})" if len(parts) > 1 else "")
     return f"Node {level}{ctx} has {have_n}/5 options. [{label}]"
 
-# ======== PDF export (ReportLab) ========
+# ======== Styling for autofilled preview ========
+def style_completed(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
+    if "Auto-filled" not in df.columns:
+        return df.style
+    def highlight_row(row):
+        return ["background-color: #eaffea" if row.get("Auto-filled", False) else "" for _ in row]
+    return df.style.apply(lambda r: highlight_row(r), axis=1)
+
+# ======== Progress helpers ========
+def compute_branch_progress(df: pd.DataFrame) -> Tuple[int, int]:
+    store = infer_branch_options(df)
+    total = 0
+    ok = 0
+    for level in range(1, MAX_LEVELS+1):
+        parents = set()
+        for _, row in df.iterrows():
+            p = parent_key_from_row_strict(row, level)
+            if p is not None:
+                parents.add(p)
+        for p in parents:
+            total += 1
+            key = level_key_tuple(level, p)
+            if len(store.get(key, [])) == 5:
+                ok += 1
+    return ok, total
+
+def compute_outcome_progress(df: pd.DataFrame) -> Tuple[int, int]:
+    if df.empty:
+        return 0, 0
+    tri = df["Diagnostic Triage"].map(normalize_text)
+    act = df["Actions"].map(normalize_text)
+    done = ((tri != "") & (act != "")).sum()
+    return int(done), int(len(df))
+
+# ======== Data quality helpers ========
+def build_vocabulary(df: pd.DataFrame) -> List[str]:
+    vocab = set()
+    for col in LEVEL_COLS:
+        for x in df[col].dropna().astype(str):
+            x = x.strip()
+            if x:
+                vocab.add(x)
+    return sorted(vocab)
+
+def normalize_label(s: str, case_mode: str) -> str:
+    s = s.strip()
+    if case_mode == "lower":
+        return s.lower()
+    if case_mode == "UPPER":
+        return s.upper()
+    if case_mode == "Title":
+        return s.title()
+    return s
+
+def apply_synonyms(s: str, syn_map: Dict[str,str]) -> str:
+    return syn_map.get(s, s)
+
+def normalize_sheet_df(df: pd.DataFrame, case_mode: str, syn_map: Dict[str,str]) -> pd.DataFrame:
+    df2 = df.copy()
+    for col in ["Vital Measurement"] + LEVEL_COLS:
+        if col not in df2.columns: continue
+        df2[col] = df2[col].astype(str).map(lambda v: apply_synonyms(normalize_label(v, case_mode), syn_map) if v else v).map(normalize_text)
+    for col in ["Diagnostic Triage","Actions"]:
+        if col in df2.columns:
+            df2[col] = df2[col].map(normalize_text)
+    return df2
+
+def parse_synonym_map(text: str) -> Dict[str,str]:
+    mapping = {}
+    for line in text.splitlines():
+        if "=>" in line:
+            a,b = line.split("=>",1)
+            a = a.strip(); b = b.strip()
+            if a and b:
+                mapping[a] = b
+    return mapping
+
+# ======== UI badges / legend ========
+def render_badge_legend():
+    st.markdown(
+        "<div style='font-size:0.95rem'>"
+        "✅ <b>OK</b> &nbsp;&nbsp; "
+        "🟦 <b>No group of symptoms</b> &nbsp;&nbsp; "
+        "🟨 <b>Symptom left out</b> &nbsp;&nbsp; "
+        "⛔ <b>Overspecified</b> &nbsp;&nbsp; "
+        "🟠 <b>Unsaved</b> &nbsp;&nbsp; "
+        "🟢 <b>Saved</b> &nbsp;&nbsp; "
+        "⚠️ <b>Inconsistent</b>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+def status_badge(status: str, inconsistent: bool=False) -> str:
+    base = {"OK":"✅","No group of symptoms":"🟦","Symptom left out":"🟨","Overspecified":"⛔"}.get(status,"")
+    inc = " ⚠️" if inconsistent else ""
+    return f"{base} {status}{inc}"
+
+# ======== PDF export (reportlab) ========
 def build_symptoms_pdf(store: Dict[str, List[str]], parents: List[Tuple[str,...]], level: int, sheet_name: str) -> bytes:
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
@@ -318,32 +392,25 @@ def build_symptoms_pdf(store: Dict[str, List[str]], parents: List[Tuple[str,...]
     return buffer.getvalue()
 
 # ============ HEADER ============
-left, right = st.columns([1,2])
+left, right = st.columns([1,1])
 with left:
     st.title(f"🌳 Decision Tree Builder — {APP_VERSION}")
 with right:
-    badges = ""
-    wb_upload = ss_get("upload_workbook", {})
-    if wb_upload:
-        # If a sheet is selected later, we’ll recompute; here show for first sheet if exists
-        first_sheet = next(iter(wb_upload))
-        df0 = wb_upload[first_sheet]
-        if validate_headers(df0) and not df0.empty:
-            badges = branch_depth_badge_html(df0)
-    st.markdown(badges, unsafe_allow_html=True)
+    # Conditional GS reminder
     if "gcp_service_account" not in st.secrets:
-        st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
+        st.error("Google Sheets not configured. Add your **service account JSON** in Secrets under `[gcp_service_account]`.")
     else:
         st.caption("Google Sheets linked ✓")
 
 st.caption("Canonical headers: Vital Measurement, Node 1, Node 2, Node 3, Node 4, Node 5, Diagnostic Triage, Actions")
 
 with st.sidebar:
-    st.header("❓ Tips")
+    st.header("❓ Help & Legend")
+    render_badge_legend()
     st.markdown("""
-- **Dataset to push** defaults to **Source (raw)** so you always get your full dataset in Sheets.
-- Switch to **Completed (expanded)** if you want the 5-way expanded tree (only where each parent has 5 children).
-- Use **Data Quality → Branch Depth Validator** to spot incomplete parents and row paths.
+- **Unsaved** badge = differs from last 'Sheets Push' snapshot.
+- **Build Completed** expands paths only where each level has 5 options.
+- Use **Quick Nav** to jump to the next Missing/Incomplete branch.
 """)
 
 tab1, tab2, tab3, tab4 = st.tabs(["⬆️ Upload Excel/CSV", "📄 Google Sheets Mode", "🧪 Fill Diagnostic & Actions", "🧬 Symptoms"])
@@ -369,51 +436,42 @@ with tab1:
 
     if file is not None:
         if file.name.lower().endswith(".csv"):
-            df = pd.read_csv(file)
-            # Ensure canonical columns (add if missing)
-            for c in CANON_HEADERS:
-                if c not in df.columns:
-                    df[c] = ""
-            df = df[CANON_HEADERS]
-            sheets = {"Sheet1": df}
+            df = pd.read_csv(file); sheets = {"Sheet1": df}
         else:
-            xls = pd.ExcelFile(file)
-            sheets = {}
-            for name in xls.sheet_names:
-                dfx = xls.parse(name)
-                dfx.columns = [normalize_text(c) for c in dfx.columns]
-                for c in CANON_HEADERS:
-                    if c not in dfx.columns:
-                        dfx[c] = ""
-                dfx = dfx[CANON_HEADERS]
-                # Drop fully blank placeholder rows (all node cells empty)
-                node_block = ["Vital Measurement"] + LEVEL_COLS
-                dfx = dfx[~dfx[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)].copy()
-                sheets[name] = dfx
+            xls = pd.ExcelFile(file); sheets = {name: xls.parse(name) for name in xls.sheet_names}
+        # Drop fully blank placeholder rows
+        for nm in list(sheets.keys()):
+            dfx = sheets[nm].copy()
+            dfx.columns = [normalize_text(c) for c in dfx.columns]
+            for c in CANON_HEADERS:
+                if c not in dfx.columns:
+                    dfx[c] = ""
+            dfx = dfx[CANON_HEADERS]
+            node_block = ["Vital Measurement"] + LEVEL_COLS
+            dfx = dfx[~dfx[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)].copy()
+            sheets[nm] = dfx
+
         ss_set("upload_workbook", {k: v.copy() for k, v in sheets.items()})
         ss_set("upload_filename", file.name)
 
-    wb = ss_get("upload_workbook", {})
-    if not wb:
-        st.info("Upload a workbook to continue.")
-    else:
-        st.write(f"Found {len(wb)} sheet(s). Choose one to process:")
-        sheet_name = st.selectbox("Sheet", list(wb.keys()))
-        df_in = wb[sheet_name].copy()
-
+        st.write(f"Found {len(sheets)} sheet(s). Choose one to process:")
+        sheet_name = st.selectbox("Sheet", list(sheets.keys()))
+        df_in = sheets[sheet_name].copy()
+        df_in.columns = [normalize_text(c) for c in df_in.columns]
         if not validate_headers(df_in):
             st.error("Headers mismatch. First 8 columns must be: " + ", ".join(CANON_HEADERS)); st.stop()
+        for c in CANON_HEADERS: df_in[c] = df_in[c].map(normalize_text)
 
         # Progress summary
-        ok_p, total_p = compute_parent_depth_score(df_in)
-        ok_r, total_r = compute_row_path_score(df_in)
+        ok, total = compute_branch_progress(df_in)
+        done, total_rows = compute_outcome_progress(df_in)
         p1, p2 = st.columns(2)
         with p1:
-            st.metric("Parents with 5 children", f"{ok_p}/{total_p}")
-            st.progress(0 if total_p==0 else ok_p/total_p)
+            st.metric("Branch defs complete", f"{ok}/{total}")
+            st.progress(0 if total==0 else ok/total)
         with p2:
-            st.metric("Rows with full path", f"{ok_r}/{total_r}")
-            st.progress(0 if total_r==0 else ok_r/total_r)
+            st.metric("Outcomes filled", f"{done}/{total_rows}")
+            st.progress(0 if total_rows==0 else done/total_rows)
 
         st.markdown("#### Preview (first 50 rows)")
         st.dataframe(df_in.head(50), use_container_width=True)
@@ -442,8 +500,10 @@ with tab1:
             if not stack:
                 st.info("Nothing to undo.")
             else:
-                last = stack.pop(); ss_set("undo_stack", stack)
+                last = stack.pop()
+                ss_set("undo_stack", stack)
                 if last.get("context") == "upload" and last.get("sheet") == sheet_name:
+                    # restore overrides snapshot
                     bo_all = ss_get("branch_overrides_upload", {})
                     bo_all[sheet_name] = last["overrides_sheet_before"]
                     ss_set("branch_overrides_upload", bo_all)
@@ -451,18 +511,18 @@ with tab1:
                 else:
                     st.info("Last undo snapshot was for a different tab/sheet.")
 
-        # Push settings row for per-parent pushes
+        # Push settings for per-parent push (Upload tab)
         st.info("Per-parent Sheets Push — set your target below:")
-        cols_push = st.columns([2,2,2,1])
+        cols_push = st.columns([2,2,1])
         with cols_push[0]:
             up_sid_inline = st.text_input("Spreadsheet ID (Upload)", value=ss_get("gs_spreadsheet_id",""), key="up_sid_inline")
             if up_sid_inline: ss_set("gs_spreadsheet_id", up_sid_inline)
         with cols_push[1]:
             up_target_inline = st.text_input("Target tab", value=f"{sheet_name}{SHEET_COMPLETED_SUFFIX}", key="up_target_inline")
         with cols_push[2]:
-            push_dataset = st.radio("Dataset to push", ["Source (raw)","Completed (expanded)"], horizontal=True, key="up_dataset_choice")
-        with cols_push[3]:
             up_backup_inline = st.checkbox("Backup", value=True, key="up_backup_inline")
+
+        # NOTE: We intentionally DO NOT render badge legend here (as requested)
 
         user_fixes: Dict[str, List[str]] = {}
 
@@ -472,7 +532,9 @@ with tab1:
             for (level, parent, key) in missing:
                 with st.expander(describe_branch(level, parent, 0, "No group of symptoms")):
                     cols = st.columns(5)
-                    edit_keys = [f"miss_{key}_{i}" for i in range(5)]
+                    edit_keys = []
+                    for i in range(5):
+                        edit_keys.append(f"miss_{key}_{i}")
                     edit = [
                         cols[i].text_input(
                             f"Option {i+1}",
@@ -481,6 +543,7 @@ with tab1:
                             key=edit_keys[i],
                         ) for i in range(5)
                     ]
+                    # Validation
                     non_empty = [normalize_text(x) for x in edit if normalize_text(x)]
                     if len(non_empty) < 5:
                         st.info("Please fill all 5 options.")
@@ -507,29 +570,27 @@ with tab1:
                             })
                             ss_set("undo_stack", stack)
                             # Apply fix to overrides
-                            overrides_upload[key] = enforce_k_five(edit)
+                            overrides_upload[key] = [normalize_text(x) for x in edit]
                             overrides_upload_all[sheet_name] = overrides_upload
                             ss_set("branch_overrides_upload", overrides_upload_all)
-                            # Decide dataset
-                            if push_dataset == "Source (raw)":
-                                df_to_push = df_in.copy()
-                            else:
-                                df_to_push = build_completed_sheet(df_in, overrides_upload)
-                            # Backup + Push
+                            # Build & (optional) backup & Push
+                            completed_now = build_completed_sheet(df_in, overrides_upload)
                             if up_backup_inline:
                                 backup = backup_sheet_copy(sid, up_target_inline)
                                 if backup: st.info(f"Backed up '{up_target_inline}' to '{backup}'.")
-                            ok = push_to_google_sheets(sid, up_target_inline, df_to_push)
-                            if ok: st.success(f"Pushed '{push_dataset}' to '{up_target_inline}'.")
+                            ok = push_to_google_sheets(sid, up_target_inline, completed_now)
+                            if ok: st.success(f"Pushed Completed to '{up_target_inline}'.")
 
         # --- Symptom left out (<5 options) ---
         if incomplete:
             st.warning(f"Symptom left out (<5 options): {len(incomplete)}")
             for (level,parent,key,opts) in incomplete:
                 with st.expander(describe_branch(level, parent, len(opts), "Symptom left out")):
-                    padded = enforce_k_five(opts)
+                    padded = (opts[:5] + [""] * (5 - len(opts))) if len(opts) < 5 else opts[:5]
                     cols = st.columns(5)
-                    edit_keys = [f"incomp_{key}_{i}" for i in range(5)]
+                    edit_keys = []
+                    for i in range(5):
+                        edit_keys.append(f"incomp_{key}_{i}")
                     edit = [
                         cols[i].text_input(
                             f"Option {i+1}",
@@ -562,52 +623,51 @@ with tab1:
                             })
                             ss_set("undo_stack", stack)
                             # Apply fix to overrides
-                            overrides_upload[key] = enforce_k_five(edit)
+                            overrides_upload[key] = [normalize_text(x) for x in edit]
                             overrides_upload_all[sheet_name] = overrides_upload
                             ss_set("branch_overrides_upload", overrides_upload_all)
-                            # Decide dataset
-                            if push_dataset == "Source (raw)":
-                                df_to_push = df_in.copy()
-                            else:
-                                df_to_push = build_completed_sheet(df_in, overrides_upload)
-                            # Backup + Push
+                            # Build & Push
+                            completed_now = build_completed_sheet(df_in, overrides_upload)
                             if up_backup_inline:
                                 backup = backup_sheet_copy(sid, up_target_inline)
                                 if backup: st.info(f"Backed up '{up_target_inline}' to '{backup}'.")
-                            ok = push_to_google_sheets(sid, up_target_inline, df_to_push)
-                            if ok: st.success(f"Pushed '{push_dataset}' to '{up_target_inline}'.")
+                            ok = push_to_google_sheets(sid, up_target_inline, completed_now)
+                            if ok: st.success(f"Pushed Completed to '{up_target_inline}'.")
 
         if overspec:
             st.error(f"Overspecified branches (>5 options): {len(overspec)} — choose exactly 5")
             for (level,parent,key,opts) in overspec:
                 with st.expander(describe_branch(level, parent, len(opts), "Overspecified")):
                     chosen = st.multiselect("Select 5 options", opts, default=opts[:5], key=f"over_{key}")
-                    fix = chosen[:5] if len(chosen) >= 5 else enforce_k_five(chosen)
-                    user_fixes[key] = [normalize_text(x) for x in fix]
+                    if len(chosen)!=5: st.warning("Please select exactly 5.")
+                    user_fixes[key] = [normalize_text(x) for x in chosen] if len(chosen)==5 else [normalize_text(x) for x in opts[:5]]
 
         st.markdown("---")
-        completed_preview = None
-        if st.button("Build Completed (Expanded 5× Tree)"):
+        completed = None
+        if st.button("Build Completed Sheet"):
+            # Merge current overrides + fixes
+            overrides_upload_all = ss_get("branch_overrides_upload", {})
+            overrides_upload = overrides_upload_all.get(sheet_name, {})
             merged = {**overrides_upload, **user_fixes}
-            completed_preview = build_completed_sheet(df_in, merged)
-            st.success(f"Completed rows: {len(completed_preview)}")
-            st.dataframe(completed_preview.head(50), use_container_width=True)
-            mp = ss_get("upload_completed", {}); mp[sheet_name] = completed_preview.copy(); ss_set("upload_completed", mp)
+            completed = build_completed_sheet(df_in, merged)
+            st.success(f"Completed rows: {len(completed)}")
+            st.dataframe(style_completed(completed), use_container_width=True)
+            # Save for download
+            completed_map = ss_get("upload_completed", {}); completed_map[sheet_name] = completed.copy(); ss_set("upload_completed", completed_map)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                wb = ss_get("upload_workbook", {sheet_name: df_in})
                 for nm, d in wb.items():
                     d.to_excel(writer, index=False, sheet_name=nm[:31] or "Sheet1")
-                out_name = f"{sheet_name}{SHEET_COMPLETED_SUFFIX}"
-                completed_preview.to_excel(writer, index=False, sheet_name=out_name[:31])
+                out_name = f"{sheet_name}{SHEET_COMPLETED_SUFFIX}"; completed.to_excel(writer, index=False, sheet_name=out_name[:31])
             st.download_button("Download updated workbook", data=buffer.getvalue(), file_name="decision_tree_completed.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+        # One-click push (auto-build on push)
         st.markdown("#### Push to Google Sheets (overwrite)")
-        st.caption("Requires [gcp_service_account] in Secrets. Defaults to full dataset push.")
+        st.caption("Requires service account credentials in app secrets under [gcp_service_account].")
         up_spreadsheet_id = st.text_input("Spreadsheet ID (Upload tab)", value=ss_get("gs_spreadsheet_id",""), key="up_sheet_id_main")
         if up_spreadsheet_id: ss_set("gs_spreadsheet_id", up_spreadsheet_id)
         up_target_tab = st.text_input("Target tab name", value=f"{sheet_name}{SHEET_COMPLETED_SUFFIX}", key="up_target_tab")
-        push_dataset_main = st.radio("Dataset to push (Upload tab)", ["Source (raw)","Completed (expanded)"], horizontal=True, key="up_dataset_choice_main", index=0)
-        only_incomplete = st.checkbox("Push only incomplete rows", value=False, key="up_only_incomplete")
         up_confirm = st.checkbox("I confirm I want to overwrite the target tab.", key="up_confirm")
         up_backup = st.checkbox("Create a backup tab before overwriting", value=True, key="up_backup")
         if st.button("Push (Upload tab)"):
@@ -616,36 +676,30 @@ with tab1:
             elif not up_confirm:
                 st.warning("Please tick the confirmation checkbox before pushing.")
             else:
-                if push_dataset_main == "Source (raw)":
-                    df_to_push = df_in.copy()
-                    if only_incomplete:
-                        # Incomplete = any blank among canonical columns
-                        mask = df_to_push[CANON_HEADERS].applymap(normalize_text).eq("").any(axis=1)
-                        df_to_push = df_to_push[mask].copy()
-                else:
+                local_completed = completed
+                if local_completed is None:
+                    overrides_upload_all = ss_get("branch_overrides_upload", {})
+                    overrides_upload = overrides_upload_all.get(sheet_name, {})
                     merged = {**overrides_upload, **user_fixes}
-                    df_to_push = build_completed_sheet(df_in, merged)
-                    if only_incomplete:
-                        # For completed, consider incomplete outcomes only
-                        tri_empty = df_to_push["Diagnostic Triage"].map(normalize_text) == ""
-                        act_empty = df_to_push["Actions"].map(normalize_text) == ""
-                        df_to_push = df_to_push[tri_empty | act_empty].copy()
+                    local_completed = build_completed_sheet(df_in, merged)
+                    st.info(f"Built Completed sheet on-the-fly: {len(local_completed)} rows")
                 if up_backup:
                     backup_name = backup_sheet_copy(up_spreadsheet_id, up_target_tab)
                     if backup_name: st.info(f"Backed up current '{up_target_tab}' to '{backup_name}'.")
-                ok = push_to_google_sheets(up_spreadsheet_id, up_target_tab, df_to_push)
-                if ok: st.success(f"Pushed {len(df_to_push)} rows to Google Sheets.")
+                ok = push_to_google_sheets(up_spreadsheet_id, up_target_tab, local_completed)
+                if ok: st.success("Pushed to Google Sheets.")
 
 # ---------- Google Sheets mode ----------
 with tab2:
     st.subheader("Google Sheets (optional)")
     if "gcp_service_account" not in st.secrets:
-        st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
+        st.error("Google Sheets not configured. Add your **service account JSON** in Secrets under `[gcp_service_account]`.")
     else:
         st.caption("Service account ready ✓")
     spreadsheet_id = st.text_input("Spreadsheet ID", value=ss_get("gs_spreadsheet_id",""), key="gs_id")
     if spreadsheet_id: ss_set("gs_spreadsheet_id", spreadsheet_id)
-    sheet_name_g = st.text_input("Sheet name to process (e.g., BP)", value="BP")
+    load_mode = st.radio("Load scope", ["Single sheet", "All sheets"], horizontal=True)
+    sheet_name_g = st.text_input("Sheet name to process (for single sheet)", value="BP")
     run_btn = st.button("Load")
 
     def get_gsheet_client():
@@ -656,23 +710,124 @@ with tab2:
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
+    st.markdown("**Create a new sheet (Google Sheets)**")
+    new_gs_sheet = st.text_input("New sheet name (Google Sheets)", key="new_gs_sheet")
+    if st.button("Create sheet (Google Sheets)"):
+        try:
+            client = get_gsheet_client(); sh = client.open_by_key(spreadsheet_id)
+            ws = sh.add_worksheet(title=new_gs_sheet, rows=100, cols=26); ws.update([CANON_HEADERS])
+            st.success(f"Created new tab '{new_gs_sheet}' with canonical headers.")
+        except Exception as e:
+            st.error(f"Google Sheets error: {e}")
+
     if run_btn:
         try:
-            client = get_gsheet_client()
-            sh = client.open_by_key(spreadsheet_id)
-            ws = sh.worksheet(sheet_name_g)
-            values = ws.get_all_values()
-            if not values: st.error("Selected sheet is empty."); st.stop()
-            header = values[0]; rows = values[1:]
-            df_g = pd.DataFrame(rows, columns=header)
-            df_g.columns = [normalize_text(c) for c in df_g.columns]
-            if not validate_headers(df_g): st.error("Sheet does not match canonical headers."); st.stop()
-            for c in CANON_HEADERS: df_g[c] = df_g[c].map(normalize_text)
-            node_block = ["Vital Measurement"] + LEVEL_COLS
-            df_g = df_g[~df_g[node_block].apply(lambda r: all(v == "" for v in r), axis=1)].copy()
-            wb_g = ss_get("gs_workbook", {}); wb_g[sheet_name_g] = df_g; ss_set("gs_workbook", wb_g)
-            st.success(f"Loaded '{sheet_name_g}' from Google Sheets.")
-            st.dataframe(df_g.head(50), use_container_width=True)
+            client = get_gsheet_client(); sh = client.open_by_key(spreadsheet_id)
+            if load_mode == "Single sheet":
+                ws = sh.worksheet(sheet_name_g); values = ws.get_all_values()
+                if not values: st.error("Selected sheet is empty."); st.stop()
+                header = values[0]; rows = values[1:]
+                df_g = pd.DataFrame(rows, columns=header)
+                df_g.columns = [normalize_text(c) for c in df_g.columns]
+                if not validate_headers(df_g): st.error("Sheet does not match canonical headers."); st.stop()
+                for c in CANON_HEADERS: df_g[c] = df_g[c].map(normalize_text)
+                # Drop fully blank placeholder rows
+                node_block = ["Vital Measurement"] + LEVEL_COLS
+                df_g = df_g[~df_g[node_block].apply(lambda r: all(v == "" for v in r), axis=1)].copy()
+
+                st.markdown("#### Progress")
+                ok, total = compute_branch_progress(df_g); done, total_rows = compute_outcome_progress(df_g)
+                st.write(f"Branch definitions complete: **{ok}/{total}**"); st.progress(0 if total==0 else ok/total)
+                st.write(f"Outcomes filled (Diagnostic Triage + Actions): **{done}/{total_rows}**"); st.progress(0 if total_rows==0 else done/total_rows)
+                st.markdown("#### Preview (first 50 rows)"); st.dataframe(df_g.head(50), use_container_width=True)
+
+                overrides_gs_all = ss_get("branch_overrides_gs", {})
+                overrides_gs = overrides_gs_all.get(sheet_name_g, {})
+                store = infer_branch_options_with_overrides(df_g, overrides_gs)
+                parents_by_level = compute_virtual_parents(store)
+
+                missing, overspec, incomplete = [], [], []
+                for level in range(1, MAX_LEVELS+1):
+                    for parent in sorted(parents_by_level.get(level, set())):
+                        key = level_key_tuple(level, parent); opts = store.get(key, [])
+                        if len(opts)==0: missing.append((level,parent,key))
+                        elif len(opts)<5: incomplete.append((level,parent,key,opts))
+                        elif len(opts)>5: overspec.append((level,parent,key,opts))
+
+                st.markdown("#### Review & Complete")
+                render_badge_legend()  # keep badges here
+
+                user_fixes: Dict[str, List[str]] = {}
+                if missing:
+                    st.warning(f"No group of symptoms: {len(missing)}")
+                    for (level,parent,key) in missing:
+                        with st.expander(describe_branch(level, parent, 0, "No group of symptoms")):
+                            cols = st.columns(5)
+                            edit = [cols[i].text_input(f"Option {i+1}", value="", placeholder="Enter option", key=f"g_miss_{key}_{i}") for i in range(5)]
+                            st.caption("Enter the 5 options for this parent.")
+                            user_fixes[key] = [normalize_text(x) for x in edit]
+                if incomplete:
+                    st.warning(f"Symptom left out (<5 options): {len(incomplete)}")
+                    for (level,parent,key,opts) in incomplete:
+                        with st.expander(describe_branch(level, parent, len(opts), "Symptom left out")):
+                            padded = (opts[:5] + [""] * (5 - len(opts))) if len(opts) < 5 else opts[:5]
+                            cols = st.columns(5)
+                            edit = [cols[i].text_input(f"Option {i+1}", value=padded[i], placeholder="Enter option", key=f"g_incomp_{key}_{i}") for i in range(5)]
+                            st.caption("Fill the remaining boxes so there are exactly 5 options.")
+                            user_fixes[key] = [normalize_text(x) for x in edit]
+                if overspec:
+                    st.error(f"Overspecified branches (>5 options): {len(overspec)} — choose exactly 5")
+                    for (level,parent,key,opts) in overspec:
+                        with st.expander(describe_branch(level, parent, len(opts), "Overspecified")):
+                            chosen = st.multiselect("Select 5 options", opts, default=opts[:5], key=f"g_over_{key}")
+                            if len(chosen)!=5: st.warning("Please select exactly 5.")
+                            user_fixes[key] = [normalize_text(x) for x in chosen] if len(chosen)==5 else [normalize_text(x) for x in opts[:5]]
+
+                completed_g = None
+                if st.button("Build Completed (Sheets)"):
+                    merged = {**overrides_gs, **user_fixes}
+                    completed_g = build_completed_sheet(df_g, merged)
+                    st.success(f"Completed rows: {len(completed_g)}"); st.dataframe(completed_g.head(50), use_container_width=True)
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                        df_g.to_excel(writer, index=False, sheet_name=sheet_name_g)
+                        completed_g.to_excel(writer, index=False, sheet_name=f"{sheet_name_g}{SHEET_COMPLETED_SUFFIX}")
+                    st.download_button("Download updated workbook", data=buffer.getvalue(), file_name=f"{sheet_name_g}_completed.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+                st.markdown("#### Push to Google Sheets (overwrite)")
+                st.caption("Uses the same Spreadsheet ID; choose a target tab to overwrite or create.")
+                target_tab = st.text_input("Target tab name", value=f"{sheet_name_g}{SHEET_COMPLETED_SUFFIX}", key="g_target_tab")
+                if st.button("Push (Sheets tab)"):
+                    if not spreadsheet_id or not target_tab:
+                        st.warning("Enter Spreadsheet ID and target tab name.")
+                    else:
+                        local_completed = completed_g
+                        if local_completed is None:
+                            merged = {**overrides_gs, **user_fixes}
+                            local_completed = build_completed_sheet(df_g, merged)
+                            st.info(f"Built Completed sheet on-the-fly: {len(local_completed)} rows")
+                        ok = push_to_google_sheets(spreadsheet_id, target_tab, local_completed)
+                        if ok: st.success("Pushed to Google Sheets.")
+
+            else:
+                wb = {}
+                for ws in sh.worksheets():
+                    values = ws.get_all_values()
+                    if not values: df_g = pd.DataFrame(columns=CANON_HEADERS)
+                    else:
+                        header = values[0]; rows = values[1:]
+                        df_g = pd.DataFrame(rows, columns=header)
+                        df_g.columns = [normalize_text(c) for c in df_g.columns]
+                        if validate_headers(df_g):
+                            for c in CANON_HEADERS: df_g[c] = df_g[c].map(normalize_text)
+                            node_block = ["Vital Measurement"] + LEVEL_COLS
+                            df_g = df_g[~df_g[node_block].apply(lambda r: all(v == "" for v in r), axis=1)].copy()
+                        else:
+                            if df_g.empty: df_g = pd.DataFrame(columns=CANON_HEADERS)
+                            else: st.warning(f"Sheet '{ws.title}' does not match canonical headers; loaded raw values.")
+                    wb[ws.title] = df_g
+                ss_set("gs_workbook", wb); ss_set("gs_spreadsheet_id", spreadsheet_id)
+                st.success(f"Loaded {len(wb)} Sheets from Google Sheets. Use the '🧪 Fill Diagnostic & Actions' and '🧬 Symptoms' tabs.")
         except Exception as e:
             st.error(f"Google Sheets error: {e}")
 
@@ -698,7 +853,7 @@ with tab3:
             tri_empty = df["Diagnostic Triage"].map(normalize_text) == ""
             act_empty = df["Actions"].map(normalize_text) == ""
             path_complete = df[LEVEL_COLS].applymap(normalize_text).ne("").all(axis=1)
-            mask = path_complete & (tri_empty | act_empty)
+            mask = path_complete & tri_empty & act_empty
             idxs = list(df[mask].index)
             for ix in idxs: candidates.append((nm, ix))
         if not candidates: st.success("No rows found with empty Diagnostic Triage & Actions in the selected sheets. 🎉")
@@ -746,8 +901,7 @@ with tab4:
         sid_input = st.text_input("Spreadsheet ID for pushes", value=sid_current, key="sym_sid")
         if sid_input and sid_input != sid_current:
             ss_set("gs_spreadsheet_id", sid_input)
-        push_dataset_sym = st.radio("Dataset to push", ["Source (raw)","Completed (expanded)"], horizontal=True, key="sym_dataset_choice", index=0)
-        st.caption("Target tab will be '<SheetName> (Completed)' by default for Completed; choose your own for Source.")
+        st.caption("Target tab will be '<SheetName> (Completed)'.")
         push_backup = st.checkbox("Create a backup tab before bulk overwrite", value=True, key="sym_push_backup")
 
     # Undo stack controls
@@ -789,53 +943,14 @@ with tab4:
         sheet = st.selectbox("Sheet", list(wb.keys()), key="sym_sheet")
         df = wb.get(sheet, pd.DataFrame())
 
-        # Build store + parents
-        overrides_current = ss_get(override_root, {}).get(sheet, {})
-        store = infer_branch_options_with_overrides(df, overrides_current)
-        parents_by_level = compute_virtual_parents(store)
-
         # Data Quality Tools
         if not df.empty and validate_headers(df):
             with st.expander("🧼 Data quality tools (applies to this sheet)"):
-                # Branch Depth Validator
-                ok_p, total_p = compute_parent_depth_score(df)
-                ok_r, total_r = compute_row_path_score(df)
-                st.write(f"Parents with 5 children: **{ok_p}/{total_p}**")
-                st.write(f"Rows with full path: **{ok_r}/{total_r}**")
-                # Inline normalization (optional)
                 case_mode = st.selectbox("Case normalization", ["None","Title","lower","UPPER"], index=0)
                 syn_text = st.text_area("Synonym map (one per line: A => B)", key="sym_syn_map_text")
-                def parse_synonym_map(text: str) -> Dict[str,str]:
-                    mapping = {}
-                    for line in text.splitlines():
-                        if "=>" in line:
-                            a,b = line.split("=>",1)
-                            a = a.strip(); b = b.strip()
-                            if a and b: mapping[a] = b
-                    return mapping
-                def normalize_label(s: str, case_mode: str) -> str:
-                    s = s.strip()
-                    if case_mode == "lower": return s.lower()
-                    if case_mode == "UPPER": return s.upper()
-                    if case_mode == "Title": return s.title()
-                    return s
-                def normalize_sheet_df(df0: pd.DataFrame, case_mode: str, syn_map: Dict[str,str]) -> pd.DataFrame:
-                    df2 = df0.copy()
-                    for col in ["Vital Measurement"] + LEVEL_COLS:
-                        if col not in df2.columns: continue
-                        def _apply(v):
-                            v = normalize_text(v)
-                            v = syn_map.get(v, v)
-                            v = normalize_label(v, case_mode) if case_mode!="None" else v
-                            return v
-                        df2[col] = df2[col].map(_apply)
-                    for col in ["Diagnostic Triage","Actions"]:
-                        if col in df2.columns:
-                            df2[col] = df2[col].map(normalize_text)
-                    return df2
                 if st.button("Normalize sheet now"):
                     syn_map = parse_synonym_map(syn_text)
-                    df_norm = normalize_sheet_df(df, case_mode, syn_map)
+                    df_norm = normalize_sheet_df(df, case_mode if case_mode!="None" else "None", syn_map)
                     wb[sheet] = df_norm
                     if source == "Upload workbook":
                         ss_set("upload_workbook", wb)
@@ -848,10 +963,29 @@ with tab4:
                             ok = push_to_google_sheets(sid, sheet, df_norm)
                             if ok: st.success("Normalized sheet pushed to Google Sheets.")
 
+        # Build store + parents
+        overrides_current = ss_get(override_root, {}).get(sheet, {})
+        store = infer_branch_options_with_overrides(df, overrides_current)
+        parents_by_level = compute_virtual_parents(store)
+
+        # Orphan finder (rows with deeper nodes but missing earlier nodes)
+        if not df.empty and validate_headers(df):
+            orphan_rows = []
+            for idx, row in df.iterrows():
+                for j in range(1, MAX_LEVELS+1):
+                    if normalize_text(row[LEVEL_COLS[j-1]]) != "":
+                        earlier_blank = any(normalize_text(row[LEVEL_COLS[k]]) == "" for k in range(0, j-1))
+                        if earlier_blank:
+                            orphan_rows.append(int(idx))
+                            break
+            if orphan_rows:
+                with st.expander(f"🧭 Orphan rows detected: {len(orphan_rows)}"):
+                    st.write(orphan_rows[:50])
+
         # Controls (Symptoms list)
         level = st.selectbox("Level to inspect (child options of...)", [1,2,3,4,5], format_func=lambda x: f"Node {x}", key="sym_level")
 
-        # Persistent search
+        # Apply deferred search BEFORE creating widget
         _pending = st.session_state.pop("sym_search_pending", None)
         if _pending is not None:
             st.session_state["sym_search"] = _pending
@@ -883,6 +1017,7 @@ with tab4:
         with top_cols[3]:
             compact = st.checkbox("Compact mode", value=True)
         with top_cols[4]:
+            # Quick jump menu
             parent_choices = ["(select parent)"] + [(" > ".join(p) or "<ROOT>") for p in sorted(parents_by_level.get(level, set()))]
             pick_parent = st.selectbox("Quick jump", parent_choices)
             if pick_parent and pick_parent != "(select parent)":
@@ -918,40 +1053,16 @@ with tab4:
         else:
             entries.sort(key=lambda e: e[0])
 
-        # Vocabulary for suggestions (for inline editing)
-        def build_vocabulary(df0: pd.DataFrame) -> List[str]:
-            vocab = set()
-            for col in LEVEL_COLS:
-                if col in df0.columns:
-                    for x in df0[col].dropna().astype(str):
-                        x = x.strip()
-                        if x: vocab.add(x)
-            return sorted(vocab)
-        vocab = build_vocabulary(df)
-        vocab_opts = ["(pick suggestion)"] + vocab
-
-        render_pdf_colA, render_pdf_colB = st.columns([1,3])
-        with render_pdf_colA:
-            # PDF export for selected Node level
-            level_for_pdf = st.selectbox("PDF: Level to export (parents at...)", [1,2,3,4,5], format_func=lambda x: f"Node {x}")
-            if st.button("📄 Download Symptoms + Branches (PDF)"):
-                parents_list = sorted(parents_by_level.get(level_for_pdf, set()))
-                pdf_bytes = build_symptoms_pdf(store, parents_list, level_for_pdf, sheet)
-                st.download_button(
-                    "Download PDF",
-                    data=pdf_bytes,
-                    file_name=f"{sheet}_Node{level_for_pdf}_Symptoms.pdf",
-                    mime="application/pdf"
-                )
-
-        with render_pdf_colB:
-            st.caption("Inline edit child branches and optionally push the **Source** or **Completed** dataset to Google Sheets.")
-
-        # Legend / Unsaved badge reference (compare to last_pushed_overrides)
+        # Legend + Unsaved/saved info reference
+        render_badge_legend()
         last_pushed_all = ss_get("last_pushed_overrides", {})
         last_pushed_sheet = last_pushed_all.get(sheet, {})
 
-        # Render entries with inline editing
+        # Vocabulary for suggestions
+        vocab = build_vocabulary(df)
+        vocab_opts = ["(pick suggestion)"] + vocab
+
+        # Render entries
         for parent_tuple, children, status in entries:
             keyname = level_key_tuple(level, parent_tuple)
             last_label = parent_tuple[-1] if parent_tuple else "<ROOT>"
@@ -960,9 +1071,10 @@ with tab4:
             last_val = last_pushed_sheet.get(keyname, None)
             unsaved = (last_val is None) or (list(current_val) != list(last_val))
             save_badge = "🟠 Unsaved" if unsaved else "🟢 Saved"
-            subtitle = f"{' > '.join(parent_tuple) or '<ROOT>'} — {status} {'⚠️' if inconsistent_flag else ''} — {save_badge}"
+            subtitle = f"{' > '.join(parent_tuple) or '<ROOT>'} — {status_badge(status, inconsistent_flag)} — {save_badge}"
 
             with st.expander(subtitle):
+                # Inputs
                 selected_vals = []
                 if compact:
                     for i in range(5):
@@ -1000,14 +1112,14 @@ with tab4:
                                 uniq.append(v); seen.add(v)
                         vals = uniq + [""] * max(0, 5 - len(uniq))
                         if fill_other: vals = [v if v else "Other" for v in vals]
-                    return enforce_k_five(vals)
+                    vals, _ = enforce_k_five(vals); return vals
 
                 # Save in-session (overrides)
                 if st.button("Save 5 branches for this parent", key=f"sym_save_{level}_{'__'.join(parent_tuple)}"):
                     fixed = build_final_values()
                     overrides_all = ss_get(override_root, {})
                     overrides_sheet = overrides_all.get(sheet, {}).copy()
-                    # undo snapshot
+                    # push to undo stack BEFORE change
                     stack = ss_get("undo_stack", [])
                     stack.append({
                         "context": "symptoms",
@@ -1021,12 +1133,12 @@ with tab4:
                     overrides_sheet[keyname] = fixed
                     overrides_all[sheet] = overrides_sheet
                     ss_set(override_root, overrides_all)
-                    # update local view
+                    # Update local copies for this render
                     overrides_current = overrides_sheet
                     store[keyname] = fixed
                     st.success("Saved in-session. (Undo available above)")
 
-                # Sheets Push (per-parent) with dataset choice
+                # Sheets Push (per-parent) — Symptoms tab
                 if st.button("➡️ Sheets Push", type="primary", key=f"sym_push_{level}_{'__'.join(parent_tuple)}"):
                     sid = ss_get("gs_spreadsheet_id", "")
                     if not sid:
@@ -1035,7 +1147,7 @@ with tab4:
                         fixed = build_final_values()
                         overrides_all = ss_get(override_root, {})
                         overrides_sheet = overrides_all.get(sheet, {}).copy()
-                        # undo snapshot
+                        # Undo snapshot BEFORE change
                         stack = ss_get("undo_stack", [])
                         stack.append({
                             "context": "symptoms",
@@ -1050,45 +1162,51 @@ with tab4:
                         overrides_sheet[keyname] = fixed
                         overrides_all[sheet] = overrides_sheet
                         ss_set(override_root, overrides_all)
-                        # Choose dataset
-                        if push_dataset_sym == "Source (raw)":
-                            df_to_push = df.copy()
-                            target_tab = sheet  # keep same tab name
-                        else:
-                            df_to_push = build_completed_sheet(df, overrides_sheet)
-                            target_tab = f"{sheet}{SHEET_COMPLETED_SUFFIX}"
-                        ok = push_to_google_sheets(sid, target_tab, df_to_push)
+                        # Build & Push
+                        completed_now = build_completed_sheet(df, overrides_sheet)
+                        target_tab = f"{sheet}{SHEET_COMPLETED_SUFFIX}"
+                        ok = push_to_google_sheets(sid, target_tab, completed_now)
                         if ok:
-                            # mark last pushed
+                            # Mark this parent as 'last pushed'
                             lp_all = ss_get("last_pushed_overrides", {})
-                            lp_sheet = lp_all.get(sheet, {}).copy(); lp_sheet[keyname] = fixed
-                            lp_all[sheet] = lp_sheet; ss_set("last_pushed_overrides", lp_all)
-                            st.success(f"Pushed {len(df_to_push)} rows to '{target_tab}'.")
+                            lp_sheet = lp_all.get(sheet, {}).copy()
+                            lp_sheet[keyname] = fixed
+                            lp_all[sheet] = lp_sheet
+                            ss_set("last_pushed_overrides", lp_all)
+                            st.success(f"Pushed Completed to '{target_tab}'.")
 
-        # Bulk push + PDF already above
+        # Build & Push (bulk) and PDF export
         st.markdown("---")
-        st.markdown("#### Bulk Push (from Symptoms)")
-        colA, colB = st.columns([1,2])
+        st.markdown("#### Bulk Build / Push and PDF")
+        colA, colB, colC = st.columns([1,1,2])
         with colA:
-            if st.button("📤 Bulk Sheets Push (build/overwrite)", type="primary"):
+            if st.button("📤 Bulk Sheets Push (build & overwrite)", type="primary"):
                 sid = ss_get("gs_spreadsheet_id", "")
                 if not sid:
                     st.error("Missing Spreadsheet ID. Enter it in 'Push Settings' above.")
                 else:
-                    if push_dataset_sym == "Source (raw)":
-                        df_to_push = df.copy()
-                        target_tab = sheet
-                    else:
-                        df_to_push = build_completed_sheet(df, overrides_current)
-                        target_tab = f"{sheet}{SHEET_COMPLETED_SUFFIX}"
+                    completed_now = build_completed_sheet(df, overrides_current)
+                    target_tab = f"{sheet}{SHEET_COMPLETED_SUFFIX}"
                     if ss_get("sym_push_backup", True):
                         backup_name = backup_sheet_copy(sid, target_tab)
                         if backup_name: st.info(f"Backed up current '{target_tab}' to '{backup_name}'.")
-                    ok = push_to_google_sheets(sid, target_tab, df_to_push)
+                    ok = push_to_google_sheets(sid, target_tab, completed_now)
                     if ok:
+                        # Snapshot overrides as 'last pushed'
                         lp_all = ss_get("last_pushed_overrides", {})
                         lp_all[sheet] = overrides_current.copy()
                         ss_set("last_pushed_overrides", lp_all)
-                        st.success(f"Pushed {len(df_to_push)} rows to '{target_tab}'.")
+                        st.success(f"Pushed Completed to '{target_tab}'.")
         with colB:
-            st.caption("Bulk push respects your dataset choice (Source vs Completed).")
+            level_for_pdf = st.selectbox("PDF: Level to export (parents at...)", [1,2,3,4,5], format_func=lambda x: f"Node {x}")
+            if st.button("📄 Download Symptoms + Branches (PDF)"):
+                parents_list = sorted(parents_by_level.get(level_for_pdf, set()))
+                pdf_bytes = build_symptoms_pdf(store, parents_list, level_for_pdf, sheet)
+                st.download_button(
+                    "Download PDF",
+                    data=pdf_bytes,
+                    file_name=f"{sheet}_Node{level_for_pdf}_Symptoms.pdf",
+                    mime="application/pdf"
+                )
+        with colC:
+            st.caption("Bulk push builds the Completed sheet from current overrides and overwrites the target tab in your Google Sheet.")
