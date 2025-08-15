@@ -81,7 +81,7 @@ def infer_branch_options(df: pd.DataFrame) -> Dict[str, List[str]]:
 def infer_branch_options_with_overrides(df: pd.DataFrame, overrides: Dict[str, List[str]]) -> Dict[str, List[str]]:
     """
     Merge observed store with overrides for the selected sheet.
-    Ensures override lists are trimmed/padded to exactly 5 during display/usage.
+    We don't enforce exactly 5 here; shorter lists show as incomplete.
     """
     base = infer_branch_options(df)
     merged = dict(base)
@@ -90,12 +90,11 @@ def infer_branch_options_with_overrides(df: pd.DataFrame, overrides: Dict[str, L
             vals = [normalize_text(x) for x in v]
         else:
             vals = [normalize_text(v)]
-        # don't enforce exactly 5 here; allow shorter lists to show up as incomplete
         merged[k] = vals
     return merged
 
 def propose_autofill(level: int, parent: Tuple[str, ...], existing_store: Dict[str, List[str]]) -> List[str]:
-    """Propose options based on sibling context first, then level-wide frequency."""
+    """(Kept for reference; not used in Missing/Incomplete sections after your request)."""
     context = parent[:-1] if len(parent) > 0 else tuple()
     level_prefix = f"L{level}|"
     ctx_counts: Dict[Tuple[str, ...], int] = {}
@@ -352,7 +351,7 @@ def apply_synonyms(s: str, syn_map: Dict[str,str]) -> str:
 def normalize_sheet_df(df: pd.DataFrame, case_mode: str, syn_map: Dict[str,str]) -> pd.DataFrame:
     df2 = df.copy()
     for col in ["Vital Measurement"] + LEVEL_COLS:
-        if col not in df2.columns: 
+        if col not in df2.columns:
             continue
         df2[col] = df2[col].astype(str).map(lambda v: apply_synonyms(normalize_label(v, case_mode), syn_map) if v else v).map(normalize_text)
     for col in ["Diagnostic Triage","Actions"]:
@@ -478,21 +477,41 @@ with tab1:
 
         user_fixes: Dict[str, List[str]] = {}
 
+        # --- No group of symptoms (0 options) ---
         if missing:
             st.warning(f"No group of symptoms: {len(missing)}")
             for (level, parent, key) in missing:
                 with st.expander(describe_branch(level, parent, 0, "No group of symptoms")):
-                    proposal = propose_autofill(level, parent, store); proposal5,_ = enforce_k_five(proposal)
-                    cols = st.columns(5); edit = [cols[i].text_input(f"Option {i+1}", value=proposal5[i] if i<len(proposal5) else "", key=f"miss_{key}_{i}") for i in range(5)]
-                    st.caption("Approve or edit the proposed 5 options."); user_fixes[key] = [normalize_text(x) for x in edit]
+                    cols = st.columns(5)
+                    # Show 5 empty boxes; you fill them
+                    edit = [
+                        cols[i].text_input(
+                            f"Option {i+1}",
+                            value="",
+                            placeholder="Enter option",
+                            key=f"miss_{key}_{i}",
+                        ) for i in range(5)
+                    ]
+                    st.caption("Enter the 5 options for this parent.")
+                    user_fixes[key] = [normalize_text(x) for x in edit]
 
+        # --- Symptom left out (<5 options) ---
         if incomplete:
             st.warning(f"Symptom left out (<5 options): {len(incomplete)}")
             for (level,parent,key,opts) in incomplete:
                 with st.expander(describe_branch(level, parent, len(opts), "Symptom left out")):
-                    proposal = (opts + propose_autofill(level, parent, store))[:5]; proposal5,_ = enforce_k_five(proposal)
-                    cols = st.columns(5); edit = [cols[i].text_input(f"Option {i+1}", value=proposal5[i] if i<len(proposal5) else "", key=f"incomp_{key}_{i}") for i in range(5)]
-                    st.caption("Please fill remaining blanks to reach exactly 5 options."); user_fixes[key] = [normalize_text(x) for x in edit]
+                    padded = (opts[:5] + [""] * (5 - len(opts))) if len(opts) < 5 else opts[:5]
+                    cols = st.columns(5)
+                    edit = [
+                        cols[i].text_input(
+                            f"Option {i+1}",
+                            value=padded[i],
+                            placeholder="Enter option",
+                            key=f"incomp_{key}_{i}",
+                        ) for i in range(5)
+                    ]
+                    st.caption("Fill the remaining boxes so there are exactly 5 options.")
+                    user_fixes[key] = [normalize_text(x) for x in edit]
 
         if overspec:
             st.error(f"Overspecified branches (>5 options): {len(overspec)} — choose exactly 5")
@@ -600,24 +619,41 @@ with tab2:
                 render_badge_legend()
 
                 user_fixes: Dict[str, List[str]] = {}
+                # --- No group of symptoms (0 options) ---
                 if missing:
                     st.warning(f"No group of symptoms: {len(missing)}")
                     for (level,parent,key) in missing:
                         with st.expander(describe_branch(level, parent, 0, "No group of symptoms")):
-                            proposal = propose_autofill(level, parent, store); proposal5,_ = enforce_k_five(proposal)
                             cols = st.columns(5)
-                            edit = [cols[i].text_input(f"Option {i+1}", value=proposal5[i] if i<len(proposal5) else "", key=f"g_miss_{key}_{i}") for i in range(5)]
+                            edit = [
+                                cols[i].text_input(
+                                    f"Option {i+1}",
+                                    value="",
+                                    placeholder="Enter option",
+                                    key=f"g_miss_{key}_{i}",
+                                ) for i in range(5)
+                            ]
+                            st.caption("Enter the 5 options for this parent.")
                             user_fixes[key] = [normalize_text(x) for x in edit]
+                # --- Symptom left out (<5 options) ---
                 if incomplete:
                     st.warning(f"Symptom left out (<5 options): {len(incomplete)}")
                     for (level,parent,key,opts) in incomplete:
                         with st.expander(describe_branch(level, parent, len(opts), "Symptom left out")):
-                            proposal = (opts + propose_autofill(level, parent, store))[:5]; proposal5,_ = enforce_k_five(proposal)
+                            padded = (opts[:5] + [""] * (5 - len(opts))) if len(opts) < 5 else opts[:5]
                             cols = st.columns(5)
-                            edit = [cols[i].text_input(f"Option {i+1}", value=proposal5[i] if i<len(proposal5) else "", key=f"g_incomp_{key}_{i}") for i in range(5)]
+                            edit = [
+                                cols[i].text_input(
+                                    f"Option {i+1}",
+                                    value=padded[i],
+                                    placeholder="Enter option",
+                                    key=f"g_incomp_{key}_{i}",
+                                ) for i in range(5)
+                            ]
+                            st.caption("Fill the remaining boxes so there are exactly 5 options.")
                             user_fixes[key] = [normalize_text(x) for x in edit]
                 if overspec:
-                    st.error(f"Overspecified branches (>5): {len(overspec)} — choose exactly 5")
+                    st.error(f"Overspecified branches (>5 options): {len(overspec)} — choose exactly 5")
                     for (level,parent,key,opts) in overspec:
                         with st.expander(describe_branch(level, parent, len(opts), "Overspecified")):
                             chosen = st.multiselect("Select 5 options", opts, default=opts[:5], key=f"g_over_{key}")
@@ -801,11 +837,17 @@ with tab4:
 
             # Controls
             level = st.selectbox("Level to inspect (child options of...)", [1,2,3,4,5], format_func=lambda x: f"Node {x}", key="sym_level")
+
+            # Apply deferred search change before creating the widget
+            _pending = st.session_state.pop("sym_search_pending", None)
+            if _pending is not None:
+                st.session_state["sym_search"] = _pending
+
             search = st.text_input("Search parent symptom/path", key="sym_search").strip().lower()
             compact = st.checkbox("Compact edit mode (mobile-friendly)", value=True)
             sort_mode = st.radio("Sort by", ["Problem severity (issues first)", "Alphabetical (parent path)"], horizontal=True)
 
-            # Inconsistency detection & entries (now across ALL parents, including virtual)
+            # Inconsistency detection & entries (including virtual parents)
             label_childsets: Dict[Tuple[int,str], set] = {}
             entries = []  # (parent_tuple, children, status)
             for parent_tuple in sorted(parents_by_level.get(level, set())):
@@ -839,7 +881,7 @@ with tab4:
             # Legend + Next best action
             render_badge_legend()
             if entries:
-                # Next best action chooses first by severity, but if ties, prefer inconsistent ones.
+                # Next best action chooses first by severity, then prioritize inconsistent ones.
                 def score(entry):
                     parent_tuple, children, status = entry
                     inc = ((level, (parent_tuple[-1] if parent_tuple else "<ROOT>")) in inconsistent_labels)
@@ -848,8 +890,9 @@ with tab4:
                 nba_path = " > ".join(nba[0]) or "<ROOT>"
                 st.info(f"Next best action suggestion: **{status_badge(nba[2], ((level, (nba[0][-1] if nba[0] else '<ROOT>'))) in inconsistent_labels)}** at **{nba_path}**")
                 if st.button("Jump to next best action"):
-                    # Set search to that path to surface it
-                    st.session_state["sym_search"] = nba_path.lower()
+                    # Defer change so we can set search before the widget is recreated
+                    st.session_state["sym_search_pending"] = nba_path.lower()
+                    st.rerun()
 
             st.markdown(f"#### {len(entries)} parent contexts at Node {level}")
 
