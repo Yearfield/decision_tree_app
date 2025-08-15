@@ -1,4 +1,4 @@
-# streamlit_app_upload.py — Version 6.2.1
+# streamlit_app_upload.py — Version 6.2.2
 
 import io
 import random
@@ -9,10 +9,10 @@ import streamlit as st
 from datetime import datetime
 
 # ============ VERSION / CONFIG ============
-APP_VERSION = "v6.2.1"
+APP_VERSION = "v6.2.2"
 CANON_HEADERS = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]
 LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
-SHEET_COMPLETED_SUFFIX = " (Completed)"  # kept only for backward compatibility with old tabs; not used as a mode now
+SHEET_COMPLETED_SUFFIX = " (Completed)"  # legacy tab name; not a mode
 MAX_LEVELS = 5
 
 st.set_page_config(page_title=f"Decision Tree Builder {APP_VERSION}", page_icon="🌳", layout="wide")
@@ -27,7 +27,6 @@ def ss_set(key, value):
     st.session_state[key] = value
 
 def mark_session_edit(sheet: str, keyname: str):
-    """Remember which parent-keys were edited during this session (per sheet)."""
     ek = ss_get("session_edited_keys", {})
     cur = set(ek.get(sheet, []))
     cur.add(keyname)
@@ -205,45 +204,57 @@ def backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
         st.error(f"Backup failed: {e}")
         return None
 
-# ============ RAW+ (augmented) builder ============
+# ============ RAW+ (augmented) builder with optional PARTIAL expansion ============
 def build_raw_plus(
     df: pd.DataFrame,
     overrides: Dict[str, List[str]],
     include_scope: str,
-    edited_keys_for_sheet: Set[str]
+    edited_keys_for_sheet: Set[str],
+    allow_partial: bool
 ) -> Tuple[pd.DataFrame, Dict[str,int]]:
     """
-    Return the raw dataframe augmented with extra rows generated from (observed + overrides)
-    for 5/5-complete subtrees. Dedup by (VM + Node1..5). New rows have empty Triage/Actions.
-    include_scope: 'all' or 'session' (only subtrees rooted at parents edited this session).
+    Return the raw dataframe augmented with extra rows generated from (observed + overrides).
+    Dedup by (VM + Node1..5). New rows have empty Triage/Actions.
+    include_scope: 'all' or 'session'
+    allow_partial: if True, when a deeper level has no children, emit row with blanks for remaining Nodes.
     """
-    # Build store and enforce exactly 5 where specified
     store = infer_branch_options_with_overrides(df, overrides)
-    for k in list(store.keys()):
-        store[k] = enforce_k_five(store[k])
 
     all_vm = sorted(set(normalize_text(x) for x in df["Vital Measurement"] if normalize_text(x) != ""))
 
     generated_rows = []
 
-    def expand_from_prefix(vm_val: str, start_level: int, prefix: Tuple[str, ...]):
-        def dfs(level: int, pref: Tuple[str, ...]):
-            if level > MAX_LEVELS:
-                row = {"Vital Measurement": vm_val}
-                for i, val in enumerate(pref, 1):
-                    row[f"Node {i}"] = val
-                for i in range(1, MAX_LEVELS+1):
-                    row.setdefault(f"Node {i}", "")
-                row["Diagnostic Triage"] = ""
-                row["Actions"] = ""
-                generated_rows.append(row); return
-            key = level_key_tuple(level, pref)
-            opts = store.get(key, [])
-            if len(opts) != 5 or any(o == "" for o in opts):
+    def emit_row(vm_val: str, pref: Tuple[str, ...]):
+        row = {"Vital Measurement": vm_val}
+        for i, val in enumerate(pref, 1):
+            row[f"Node {i}"] = val
+        for i in range(1, MAX_LEVELS+1):
+            row.setdefault(f"Node {i}", "")
+        row["Diagnostic Triage"] = ""
+        row["Actions"] = ""
+        generated_rows.append(row)
+
+    def dfs(vm_val: str, level: int, pref: Tuple[str, ...]):
+        if level > MAX_LEVELS:
+            emit_row(vm_val, pref); return
+        key = level_key_tuple(level, pref)
+        opts_raw = store.get(key, [])
+        children = [normalize_text(o) for o in opts_raw if normalize_text(o) != ""]
+        if len(children) == 5:
+            for o in children:
+                dfs(vm_val, level+1, pref + (o,))
+        else:
+            if not children:
+                if allow_partial:
+                    # No children at this level → emit current prefix as a partial path
+                    emit_row(vm_val, pref)
+                # else: stop (no full subtree)
                 return
-            for o in opts:
-                dfs(level+1, pref + (o,))
-        dfs(start_level, prefix)
+            else:
+                # Some children present (<5) — expand what we have
+                for o in children:
+                    dfs(vm_val, level+1, pref + (o,))
+                # If allow_partial and we didn't reach deeper 5/5, deeper dfs will emit partials when it hits a gap.
 
     # Choose prefixes based on scope
     prefixes: List[Tuple[int, Tuple[str, ...]]] = []
@@ -264,7 +275,7 @@ def build_raw_plus(
     # Generate rows from selected prefixes for every VM
     for vm_val in all_vm:
         for (lvl, parent) in prefixes:
-            expand_from_prefix(vm_val, lvl, parent)
+            dfs(vm_val, lvl, parent)
 
     # Deduplicate against existing rows
     keycols = ["Vital Measurement"] + LEVEL_COLS
@@ -294,13 +305,12 @@ def build_raw_plus(
     }
     return df_aug, stats
 
-# ======== Progress / depth metrics (for badges/quality) ========
+# ======== Progress / depth metrics ========
 def compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
     """Parents with exactly 5 children across all levels."""
     store = infer_branch_options(df)
     total = 0; ok = 0
     for level in range(1, MAX_LEVELS+1):
-        # parents observed at this level
         parents = set()
         for _, row in df.iterrows():
             p = parent_key_from_row_strict(row, level)
@@ -309,7 +319,7 @@ def compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
         for p in parents:
             total += 1
             key = level_key_tuple(level, p)
-            if len(store.get(key, [])) == 5:
+            if len([x for x in store.get(key, []) if normalize_text(x)!=""]) == 5:
                 ok += 1
     return ok, total
 
@@ -321,15 +331,37 @@ def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
     full = nodes.ne("").all(axis=1)
     return int(full.sum()), int(len(df))
 
-def branch_depth_badge_html(df: pd.DataFrame) -> str:
+def progress_badge_html(df: pd.DataFrame) -> str:
     ok_p, total_p = compute_parent_depth_score(df)
     ok_r, total_r = compute_row_path_score(df)
-    return (
-        f"<div style='display:inline-block;background:#eef6ff;"
-        f"padding:6px 10px;border-radius:8px;border:1px solid #cfe2ff;margin-left:8px;'>"
-        f"Parents 5/5: <b>{ok_p}/{total_p}</b> &nbsp;|&nbsp; Rows full path: <b>{ok_r}/{total_r}</b>"
-        f"</div>"
-    )
+    pct_p = 0 if total_p==0 else int(round(100*ok_p/total_p))
+    pct_r = 0 if total_r==0 else int(round(100*ok_r/total_r))
+    bar_css = """
+    <style>
+      .badge-wrap { display:inline-block; padding:8px 10px; border-radius:12px; border:1px solid #dbe0e6; background:#f8fafc; }
+      .badge-row { font: 12px/1.2 -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin:4px 0 6px 0; color:#0f172a;}
+      .bar { position:relative; height:10px; background:#eef2f6; border:1px solid #dbe0e6; border-radius:8px; overflow:hidden; }
+      .fill { position:absolute; left:0; top:0; bottom:0; width:VAR%; background:linear-gradient(90deg,#60a5fa,#2563eb); }
+      .fill2 { position:absolute; left:0; top:0; bottom:0; width:VAR2%; background:linear-gradient(90deg,#34d399,#059669); }
+      .badge-top { display:flex; justify-content:space-between; }
+      .muted { color:#334155; }
+      .strong { font-weight:600; }
+    </style>
+    """
+    html = f"""
+    {bar_css}
+    <div class='badge-wrap'>
+      <div class='badge-row'>
+        <div class='badge-top'><span class='muted'>Parents 5/5</span><span class='strong'>{ok_p}/{total_p}</span></div>
+        <div class='bar'><div class='fill' style='width:{pct_p}%;'></div></div>
+      </div>
+      <div class='badge-row'>
+        <div class='badge-top'><span class='muted'>Rows full path</span><span class='strong'>{ok_r}/{total_r}</span></div>
+        <div class='bar'><div class='fill2' style='width:{pct_r}%;'></div></div>
+      </div>
+    </div>
+    """
+    return html
 
 # ======== PDF export (ReportLab) ========
 def build_symptoms_pdf(store: Dict[str, List[str]], parents: List[Tuple[str,...]], level: int, sheet_name: str) -> bytes:
@@ -386,11 +418,10 @@ with right:
     badges = ""
     wb_upload = ss_get("upload_workbook", {})
     if wb_upload:
-        # If a sheet is selected later, we’ll recompute; here show for first sheet if exists
         first_sheet = next(iter(wb_upload))
         df0 = wb_upload[first_sheet]
         if validate_headers(df0) and not df0.empty:
-            badges = branch_depth_badge_html(df0)
+            badges = progress_badge_html(df0)
     st.markdown(badges, unsafe_allow_html=True)
     if "gcp_service_account" not in st.secrets:
         st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
@@ -402,17 +433,18 @@ st.caption("Canonical headers: Vital Measurement, Node 1, Node 2, Node 3, Node 4
 with st.sidebar:
     st.header("❓ Tips")
     st.markdown("""
-- **Push (Raw+)** writes your current sheet **plus** new rows generated from your **saved branch overrides** (5/5 parents only), with no duplicates.
-- New rows will have **empty** Diagnostic Triage / Actions so you can fill them later.
-- Use the **Data Quality** tools to reach 5/5 where needed; Raw+ only expands fully specified parents.
+- **Raw+** writes your current sheet **plus** rows generated from your **saved branch overrides**.  
+- Toggle **Allow partial expansion** to also add paths where deeper levels aren’t complete (remaining Nodes blank).
+- Use **Dry-run** to preview/verify counts before writing; keep **Backup** on for easy rollback.
 """)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "⬆️ Upload Excel/CSV",
     "📄 Google Sheets Mode",
     "🧪 Fill Diagnostic & Actions",
     "🧬 Symptoms",
-    "📜 Push Log"
+    "📜 Push Log",
+    "📚 Dictionary"
 ])
 
 # ---------- Upload mode ----------
@@ -437,7 +469,6 @@ with tab1:
     if file is not None:
         if file.name.lower().endswith(".csv"):
             df = pd.read_csv(file)
-            # Ensure canonical columns (add if missing)
             for c in CANON_HEADERS:
                 if c not in df.columns:
                     df[c] = ""
@@ -453,7 +484,6 @@ with tab1:
                     if c not in dfx.columns:
                         dfx[c] = ""
                 dfx = dfx[CANON_HEADERS]
-                # Drop fully blank placeholder rows (all node cells empty)
                 node_block = ["Vital Measurement"] + LEVEL_COLS
                 dfx = dfx[~dfx[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)].copy()
                 sheets[name] = dfx
@@ -482,8 +512,25 @@ with tab1:
             st.metric("Rows with full path", f"{ok_r}/{total_r}")
             st.progress(0 if total_r==0 else ok_r/total_r)
 
-        st.markdown("#### Preview (first 50 rows)")
-        st.dataframe(df_in.head(50), use_container_width=True)
+        # ===== Preview control: choose which 50 rows =====
+        total_rows = len(df_in)
+        st.markdown("#### Preview (50 rows)")
+        if total_rows <= 50:
+            st.caption(f"Showing all {total_rows} rows.")
+            st.dataframe(df_in, use_container_width=True)
+        else:
+            start_1based = st.number_input(
+                "Start row (1-based)",
+                min_value=1,
+                max_value=max(1, total_rows-49),
+                value=1,
+                step=50,
+                help="Pick where to start the 50-row preview."
+            )
+            start_idx = int(start_1based) - 1
+            end_idx = min(start_idx + 50, total_rows)
+            st.caption(f"Showing rows **{start_idx+1}–{end_idx}** of **{total_rows}**.")
+            st.dataframe(df_in.iloc[start_idx:end_idx], use_container_width=True)
 
         # Overrides for this sheet (Upload)
         overrides_upload_all = ss_get("branch_overrides_upload", {})
@@ -498,9 +545,10 @@ with tab1:
         for level in range(1, MAX_LEVELS+1):
             for parent in sorted(parents_by_level.get(level, set())):
                 key = level_key_tuple(level, parent); opts = store.get(key, [])
-                if len(opts)==0: missing.append((level,parent,key))
-                elif len(opts)<5: incomplete.append((level,parent,key,opts))
-                elif len(opts)>5: overspec.append((level,parent,key,opts))
+                non_empty = [x for x in opts if normalize_text(x)!=""]
+                if len(non_empty)==0: missing.append((level,parent,key))
+                elif len(non_empty)<5: incomplete.append((level,parent,key,opts))
+                elif len(non_empty)>5: overspec.append((level,parent,key,opts))
 
         st.markdown("#### Review & Complete")
         # Undo (Upload)
@@ -518,9 +566,9 @@ with tab1:
                 else:
                     st.info("Last undo snapshot was for a different tab/sheet.")
 
-        # Push settings row (applies to Raw+ pushes)
+        # Push settings (Raw+ for this sheet)
         st.info("Sheets Push (Raw+) — set your target below:")
-        cols_push = st.columns([2,2,2,1,1])
+        cols_push = st.columns([2,2,2,1,1,1])
         with cols_push[0]:
             up_sid_inline = st.text_input("Spreadsheet ID (Upload)", value=ss_get("gs_spreadsheet_id",""), key="up_sid_inline")
             if up_sid_inline: ss_set("gs_spreadsheet_id", up_sid_inline)
@@ -530,11 +578,12 @@ with tab1:
         with cols_push[2]:
             include_scope = st.radio("Include scope", ["All completed parents","Only parents edited this session"], horizontal=True, key="up_scope")
         with cols_push[3]:
-            up_backup_inline = st.checkbox("Backup", value=True, key="up_backup_inline")
+            allow_partial_inline = st.checkbox("Allow partial expansion", value=True, key="up_allow_partial_inline")
         with cols_push[4]:
+            up_backup_inline = st.checkbox("Backup", value=True, key="up_backup_inline")
+        with cols_push[5]:
             dry_run_inline = st.checkbox("Dry-run", value=False, key="up_dry_run_inline")
 
-        # Save target defaults per sheet
         if up_target_inline:
             saved = ss_get("saved_targets", {})
             saved.setdefault(sheet_name, {})
@@ -563,10 +612,8 @@ with tab1:
                         st.info("Please fill all 5 options.")
                     elif len(set(non_empty)) < 5:
                         st.warning("Duplicate values detected among the 5 options.")
-                    st.caption("Enter the 5 options for this parent.")
                     user_fixes[key] = [normalize_text(x) for x in edit]
 
-                    # Save overrides in-session (no direct push here)
                     if st.button("Save 5 branches", key=f"up_save_{key}"):
                         stack = ss_get("undo_stack", [])
                         stack.append({
@@ -585,7 +632,7 @@ with tab1:
         if incomplete:
             st.warning(f"Symptom left out (<5 options): {len(incomplete)}")
             for (level,parent,key,opts) in incomplete:
-                with st.expander(f"{' > '.join(parent) or '<ROOT>'} — Node {level} — {len(opts)}/5"):
+                with st.expander(f"{' > '.join(parent) or '<ROOT>'} — Node {level} — {len([x for x in opts if normalize_text(x)!=""])} / 5"):
                     padded = enforce_k_five(opts)
                     cols = st.columns(5)
                     edit_keys = [f"incomp_{key}_{i}" for i in range(5)]
@@ -598,7 +645,7 @@ with tab1:
                         ) for i in range(5)
                     ]
                     non_empty = [normalize_text(x) for x in edit if normalize_text(x)]
-                    if len(set([x for x in non_empty])) < len(non_empty):
+                    if len(set(non_empty)) < len(non_empty):
                         st.warning("Duplicate values detected among the non-empty options.")
                     if len(non_empty) < 5:
                         st.info("Fill the remaining boxes so there are exactly 5 options.")
@@ -646,11 +693,11 @@ with tab1:
         default_tab_main = ss_get("saved_targets", {}).get(sheet_name, {}).get("tab", f"{sheet_name}")
         up_target_tab = st.text_input("Target tab name", value=default_tab_main, key="up_target_tab")
         include_scope_main = st.radio("Include scope", ["All completed parents","Only parents edited this session"], horizontal=True, key="up_scope_main")
+        allow_partial_main = st.checkbox("Allow partial expansion", value=True, key="up_allow_partial_main")
         up_confirm = st.checkbox("I confirm I want to overwrite the target tab.", key="up_confirm")
         up_backup = st.checkbox("Create a backup tab before overwriting", value=True, key="up_backup")
         up_dry = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="up_dry")
 
-        # Precompute edited keys for this sheet
         edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_name, []))
 
         if st.button("Push Raw+ (augmented)"):
@@ -661,7 +708,7 @@ with tab1:
             else:
                 merged_overrides = {**overrides_upload, **user_fixes}
                 scope_flag = "session" if include_scope_main.endswith("session") else "all"
-                df_aug, stats = build_raw_plus(df_in, merged_overrides, scope_flag, edited_keys_for_sheet)
+                df_aug, stats = build_raw_plus(df_in, merged_overrides, scope_flag, edited_keys_for_sheet, allow_partial_main)
 
                 st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
                 st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{up_target_tab}**.")
@@ -669,7 +716,6 @@ with tab1:
                 if up_dry:
                     st.success("Dry-run complete. No changes written to Google Sheets.")
                     st.dataframe(df_aug.head(50), use_container_width=True)
-                    # Optional: download the augmented table
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                         df_aug.to_excel(writer, index=False, sheet_name=sheet_name[:31] or "Sheet1")
@@ -682,7 +728,6 @@ with tab1:
                         if backup_name: st.info(f"Backed up current '{up_target_tab}' to '{backup_name}'.")
                     ok = push_to_google_sheets(up_spreadsheet_id, up_target_tab, df_aug)
                     if ok:
-                        # Push log
                         log = ss_get("push_log", [])
                         log.append({
                             "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -691,10 +736,10 @@ with tab1:
                             "spreadsheet_id": up_spreadsheet_id,
                             "rows_written": len(df_aug),
                             "new_rows_added": stats["new_added"],
-                            "scope": scope_flag
+                            "scope": scope_flag,
+                            "allow_partial": allow_partial_main
                         })
                         ss_set("push_log", log)
-                        # Save target for this sheet
                         saved = ss_get("saved_targets", {})
                         saved.setdefault(sheet_name, {})
                         saved[sheet_name]["tab"] = up_target_tab
@@ -798,12 +843,12 @@ with tab3:
                         sid = ss_get("gs_spreadsheet_id", "")
                         if not sid: st.error("Missing Spreadsheet ID in session. Reload in the Google Sheets tab.")
                         else:
-                            # Push Raw+ (augmented) for this sheet
+                            # Quick Raw+ push with partial expansion ON by default here
                             overrides_all = ss_get(override_root, {})
                             overrides_sheet = overrides_all.get(sheet_cur, {})
-                            scope_flag = "all"  # default for this quick push
+                            scope_flag = "all"
                             edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_cur, []))
-                            df_aug, stats = build_raw_plus(wb[sheet_cur], overrides_sheet, scope_flag, edited_keys_for_sheet)
+                            df_aug, stats = build_raw_plus(wb[sheet_cur], overrides_sheet, scope_flag, edited_keys_for_sheet, allow_partial=True)
                             st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{sheet_cur}**.")
                             ok = push_to_google_sheets(sid, sheet_cur, df_aug)
                             if ok:
@@ -815,7 +860,8 @@ with tab3:
                                     "spreadsheet_id": sid,
                                     "rows_written": len(df_aug),
                                     "new_rows_added": stats["new_added"],
-                                    "scope": scope_flag
+                                    "scope": scope_flag,
+                                    "allow_partial": True
                                 })
                                 ss_set("push_log", log)
                                 st.success("Changes pushed to Google Sheets (Raw+).")
@@ -825,14 +871,15 @@ with tab3:
 with tab4:
     st.subheader("Symptoms — browse, check consistency, edit child branches, push Raw+, export PDF")
 
-    # Push settings (used by per-parent save/push and Bulk push)
+    # Push settings
     with st.expander("🔧 Google Sheets Push Settings"):
         sid_current = ss_get("gs_spreadsheet_id", "")
         sid_input = st.text_input("Spreadsheet ID for pushes", value=sid_current, key="sym_sid")
         if sid_input and sid_input != sid_current:
             ss_set("gs_spreadsheet_id", sid_input)
         include_scope_sym = st.radio("Include scope for Raw+", ["All completed parents","Only parents edited this session"], horizontal=True, key="sym_scope")
-        st.caption("Raw+ = Source rows + new rows generated from saved branch overrides (5/5 parents only).")
+        allow_partial_sym = st.checkbox("Allow partial expansion", value=True, key="sym_allow_partial")
+        st.caption("Raw+ = Source rows + new rows generated from saved branch overrides. With partial expansion, deeper missing levels result in blank Nodes.")
         push_backup = st.checkbox("Create a backup tab before overwrite", value=True, key="sym_push_backup")
         dry_run_sym = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="sym_dry_run")
 
@@ -950,7 +997,7 @@ with tab4:
                 cand = []
                 for pt in sorted(parents_by_level.get(level, set())):
                     key = level_key_tuple(level, pt)
-                    if len(store.get(key, [])) == 0:
+                    if len([x for x in store.get(key, []) if normalize_text(x)!=""]) == 0:
                         cand.append(pt)
                 if cand:
                     path = " > ".join(cand[0]) or "<ROOT>"
@@ -960,7 +1007,7 @@ with tab4:
             if st.button("Next Symptom left out"):
                 cand = []
                 for pt in sorted(parents_by_level.get(level, set())):
-                    key = level_key_tuple(level, pt); n = len(store.get(key, []))
+                    key = level_key_tuple(level, pt); n = len([x for x in store.get(key, []) if normalize_text(x)!=""])
                     if 1 <= n < 5: cand.append(pt)
                 if cand:
                     path = " > ".join(cand[0]) or "<ROOT>"
@@ -985,7 +1032,7 @@ with tab4:
             if search and (search not in parent_text.lower()):
                 continue
             key = level_key_tuple(level, parent_tuple)
-            children = store.get(key, [])
+            children = [x for x in store.get(key, []) if normalize_text(x)!=""]
             n = len(children)
             if n == 0: status = "No group of symptoms"
             elif n < 5: status = "Symptom left out"
@@ -1121,7 +1168,7 @@ with tab4:
                 if not sid or not target_tab:
                     st.error("Missing Spreadsheet ID or target tab.")
                 else:
-                    df_aug, stats = build_raw_plus(df, overrides_current, scope_flag, edited_keys_for_sheet)
+                    df_aug, stats = build_raw_plus(df, overrides_current, scope_flag, edited_keys_for_sheet, allow_partial_sym)
                     st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
                     st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{target_tab}**.")
                     if dry_run_sym:
@@ -1133,7 +1180,6 @@ with tab4:
                             if backup_name: st.info(f"Backed up current '{target_tab}' to '{backup_name}'.")
                         ok = push_to_google_sheets(sid, target_tab, df_aug)
                         if ok:
-                            # push log + save target
                             log = ss_get("push_log", [])
                             log.append({
                                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1142,7 +1188,8 @@ with tab4:
                                 "spreadsheet_id": sid,
                                 "rows_written": len(df_aug),
                                 "new_rows_added": stats["new_added"],
-                                "scope": scope_flag
+                                "scope": scope_flag,
+                                "allow_partial": allow_partial_sym
                             })
                             ss_set("push_log", log)
                             saved = ss_get("saved_targets", {})
@@ -1151,7 +1198,7 @@ with tab4:
                             ss_set("saved_targets", saved)
                             st.success(f"Pushed {len(df_aug)} rows to '{target_tab}'.")
         with colB:
-            st.caption("Raw+ respects your Include Scope choice.")
+            st.caption("Raw+ respects your Include Scope and Partial Expansion settings.")
 
 # ---------- Push Log ----------
 with tab5:
@@ -1162,6 +1209,71 @@ with tab5:
     else:
         df_log = pd.DataFrame(log)
         st.dataframe(df_log, use_container_width=True)
-        # Download log
         csv = df_log.to_csv(index=False).encode("utf-8")
         st.download_button("Download push log (CSV)", data=csv, file_name="push_log.csv", mime="text/csv")
+
+# ---------- Dictionary ----------
+with tab6:
+    st.subheader("Dictionary — all symptom labels (branches)")
+
+    # Choose source(s)
+    sources_avail = []
+    if ss_get("upload_workbook", {}): sources_avail.append("Upload workbook")
+    if ss_get("gs_workbook", {}): sources_avail.append("Google Sheets workbook")
+
+    if not sources_avail:
+        st.info("Load a workbook in the Upload or Google Sheets tab first.")
+    else:
+        source_choice = st.multiselect("Include sources", sources_avail, default=sources_avail)
+        dfs: List[pd.DataFrame] = []
+        sheets_map = {}
+        if "Upload workbook" in source_choice:
+            wb_u = ss_get("upload_workbook", {})
+            pick_u = st.multiselect("Sheets (Upload)", list(wb_u.keys()), default=list(wb_u.keys()), key="dict_pick_u")
+            for nm in pick_u:
+                if nm in wb_u:
+                    dfs.append(wb_u[nm]); sheets_map.setdefault(nm, "Upload")
+        if "Google Sheets workbook" in source_choice:
+            wb_g = ss_get("gs_workbook", {})
+            pick_g = st.multiselect("Sheets (Google Sheets)", list(wb_g.keys()), default=list(wb_g.keys()), key="dict_pick_g")
+            for nm in pick_g:
+                if nm in wb_g:
+                    dfs.append(wb_g[nm]); sheets_map.setdefault(nm, "Google")
+
+        if not dfs:
+            st.info("Select at least one sheet.")
+        else:
+            # Build dictionary: term → count, levels, sheets
+            term_rows = []
+            counts: Dict[str,int] = {}
+            levels_map: Dict[str, Set[int]] = {}
+            sheets_used: Dict[str, Set[str]] = {}
+            for sheet_nm, src in sheets_map.items():
+                pass  # just to keep mapping if needed later
+
+            for df0 in dfs:
+                for lvl, col in enumerate(LEVEL_COLS, start=1):
+                    if col in df0.columns:
+                        for val in df0[col].astype(str).map(normalize_text):
+                            if not val: continue
+                            counts[val] = counts.get(val, 0) + 1
+                            levels_map.setdefault(val, set()).add(lvl)
+
+            # Build DataFrame
+            for term, cnt in counts.items():
+                levels_list = sorted(list(levels_map.get(term, set())))
+                term_rows.append({
+                    "Term": term,
+                    "Count": cnt,
+                    "Levels": ", ".join([f"Node {i}" for i in levels_list])
+                })
+            dict_df = pd.DataFrame(term_rows).sort_values(["Term"]).reset_index(drop=True)
+
+            # Search/filter
+            q = st.text_input("Search term (optional)", key="dict_search").strip().lower()
+            if q:
+                dict_df = dict_df[dict_df["Term"].str.lower().str.contains(q)]
+
+            st.dataframe(dict_df, use_container_width=True, height=480)
+            csv = dict_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download dictionary (CSV)", data=csv, file_name="symptom_dictionary.csv", mime="text/csv")
