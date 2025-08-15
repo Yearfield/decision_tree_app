@@ -1,4 +1,4 @@
-# streamlit_app_upload.py — Version 6.2
+# streamlit_app_upload.py — Version 6.2.1
 
 import io
 import random
@@ -9,10 +9,10 @@ import streamlit as st
 from datetime import datetime
 
 # ============ VERSION / CONFIG ============
-APP_VERSION = "v6.2"
+APP_VERSION = "v6.2.1"
 CANON_HEADERS = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]
 LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
-SHEET_COMPLETED_SUFFIX = " (Completed)"
+SHEET_COMPLETED_SUFFIX = " (Completed)"  # kept only for backward compatibility with old tabs; not used as a mode now
 MAX_LEVELS = 5
 
 st.set_page_config(page_title=f"Decision Tree Builder {APP_VERSION}", page_icon="🌳", layout="wide")
@@ -25,6 +25,14 @@ def ss_get(key, default):
 
 def ss_set(key, value):
     st.session_state[key] = value
+
+def mark_session_edit(sheet: str, keyname: str):
+    """Remember which parent-keys were edited during this session (per sheet)."""
+    ek = ss_get("session_edited_keys", {})
+    cur = set(ek.get(sheet, []))
+    cur.add(keyname)
+    ek[sheet] = list(cur)
+    ss_set("session_edited_keys", ek)
 
 # ============ Core helpers ============
 def normalize_text(x: str) -> str:
@@ -121,96 +129,7 @@ def compute_virtual_parents(store: Dict[str, List[str]]) -> Dict[int, Set[Tuple[
                 parents_by_level[k].add(tuple(parent_tuple[:k-1]))
     return parents_by_level
 
-# ============ Completed sheet builder (no Auto-filled column) ============
-def build_completed_sheet(df: pd.DataFrame, user_fixes: Dict[str, List[str]]) -> pd.DataFrame:
-    """
-    Expand to full 5-way tree using observed + user-approved options.
-    Merge triage/actions where exact path existed.
-    Always produces a table of all expanded rows (not only changed ones).
-    """
-    observed = infer_branch_options(df)
-    for k, v in user_fixes.items():
-        observed[k] = v
-    for k in list(observed.keys()):
-        observed[k] = enforce_k_five(observed[k])
-
-    all_vm = sorted(set(normalize_text(x) for x in df["Vital Measurement"] if normalize_text(x) != ""))
-    completed_rows = []
-
-    for vm_val in all_vm:
-        def dfs(level: int, prefix: Tuple[str, ...]):
-            if level > MAX_LEVELS:
-                row = {"Vital Measurement": vm_val}
-                for i, val in enumerate(prefix, 1):
-                    row[f"Node {i}"] = val
-                for i in range(1, MAX_LEVELS+1):
-                    row.setdefault(f"Node {i}", "")
-                row["Diagnostic Triage"] = ""
-                row["Actions"] = ""
-                completed_rows.append(row); return
-            key = level_key_tuple(level, prefix)
-            opts = observed.get(key, [])
-            if len(opts) != 5 or any(o == "" for o in opts):
-                return
-            for o in opts:
-                dfs(level+1, prefix + (o,))
-        dfs(1, tuple())
-
-    if not completed_rows:
-        out = pd.DataFrame(columns=CANON_HEADERS)
-    else:
-        out = pd.DataFrame(completed_rows, columns=CANON_HEADERS)
-        # Merge existing triage/actions where exact path matches
-        keycols = ["Vital Measurement"] + LEVEL_COLS
-        df_keyed = df.copy()
-        for c in CANON_HEADERS:
-            if c not in df_keyed.columns:
-                df_keyed[c] = ""
-        df_keyed = df_keyed[CANON_HEADERS]
-        out = out.merge(df_keyed, on=keycols, how="left", suffixes=("", "_old"))
-        for col in ["Diagnostic Triage","Actions"]:
-            out[col] = np.where(out[f"{col}_old"].notna() & (out[f"{col}_old"] != ""), out[f"{col}_old"], out[col])
-            out.drop(columns=[f"{col}_old"], inplace=True)
-    return out
-
-# ======== Progress / depth metrics ========
-def compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
-    """Parents with exactly 5 children across all levels."""
-    store = infer_branch_options(df)
-    total = 0; ok = 0
-    for level in range(1, MAX_LEVELS+1):
-        # parents observed at this level
-        parents = set()
-        for _, row in df.iterrows():
-            p = parent_key_from_row_strict(row, level)
-            if p is not None:
-                parents.add(p)
-        for p in parents:
-            total += 1
-            key = level_key_tuple(level, p)
-            if len(store.get(key, [])) == 5:
-                ok += 1
-    return ok, total
-
-def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
-    """Rows where Node 1..5 are all non-empty (full path)."""
-    if df.empty:
-        return (0,0)
-    nodes = df[LEVEL_COLS].applymap(normalize_text)
-    full = nodes.ne("").all(axis=1)
-    return int(full.sum()), int(len(df))
-
-def branch_depth_badge_html(df: pd.DataFrame) -> str:
-    ok_p, total_p = compute_parent_depth_score(df)
-    ok_r, total_r = compute_row_path_score(df)
-    return (
-        f"<div style='display:inline-block;background:#eef6ff;"
-        f"padding:6px 10px;border-radius:8px;border:1px solid #cfe2ff;margin-left:8px;'>"
-        f"Parents 5/5: <b>{ok_p}/{total_p}</b> &nbsp;|&nbsp; Rows full path: <b>{ok_r}/{total_r}</b>"
-        f"</div>"
-    )
-
-# ======== Google Sheets helpers (RESIZE BEFORE UPDATE) ========
+# ============ Google Sheets helpers (RESIZE BEFORE UPDATE) ============
 def push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFrame) -> bool:
     """Overwrite or create target sheet with df using service account in secrets.
     Ensures the worksheet is resized so rows are never truncated.
@@ -286,13 +205,131 @@ def backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
         st.error(f"Backup failed: {e}")
         return None
 
-# ======== Human-readable issue text ========
-def describe_branch(level: int, parent: Tuple[str, ...], have_n: int, label: str) -> str:
-    parts = []
-    for i, val in enumerate(parent, start=1):
-        parts.append(f"Node {i} '{val}'")
-    ctx = " under <ROOT>" if not parts else f" under {parts[-1]}" + (f" (from {', '.join(parts[:-1])})" if len(parts) > 1 else "")
-    return f"Node {level}{ctx} has {have_n}/5 options. [{label}]"
+# ============ RAW+ (augmented) builder ============
+def build_raw_plus(
+    df: pd.DataFrame,
+    overrides: Dict[str, List[str]],
+    include_scope: str,
+    edited_keys_for_sheet: Set[str]
+) -> Tuple[pd.DataFrame, Dict[str,int]]:
+    """
+    Return the raw dataframe augmented with extra rows generated from (observed + overrides)
+    for 5/5-complete subtrees. Dedup by (VM + Node1..5). New rows have empty Triage/Actions.
+    include_scope: 'all' or 'session' (only subtrees rooted at parents edited this session).
+    """
+    # Build store and enforce exactly 5 where specified
+    store = infer_branch_options_with_overrides(df, overrides)
+    for k in list(store.keys()):
+        store[k] = enforce_k_five(store[k])
+
+    all_vm = sorted(set(normalize_text(x) for x in df["Vital Measurement"] if normalize_text(x) != ""))
+
+    generated_rows = []
+
+    def expand_from_prefix(vm_val: str, start_level: int, prefix: Tuple[str, ...]):
+        def dfs(level: int, pref: Tuple[str, ...]):
+            if level > MAX_LEVELS:
+                row = {"Vital Measurement": vm_val}
+                for i, val in enumerate(pref, 1):
+                    row[f"Node {i}"] = val
+                for i in range(1, MAX_LEVELS+1):
+                    row.setdefault(f"Node {i}", "")
+                row["Diagnostic Triage"] = ""
+                row["Actions"] = ""
+                generated_rows.append(row); return
+            key = level_key_tuple(level, pref)
+            opts = store.get(key, [])
+            if len(opts) != 5 or any(o == "" for o in opts):
+                return
+            for o in opts:
+                dfs(level+1, pref + (o,))
+        dfs(start_level, prefix)
+
+    # Choose prefixes based on scope
+    prefixes: List[Tuple[int, Tuple[str, ...]]] = []
+    if include_scope == "session":
+        for keyname in edited_keys_for_sheet:
+            if "|" not in keyname: 
+                continue
+            lvl_s, path = keyname.split("|", 1)
+            try:
+                lvl = int(lvl_s[1:])
+            except:
+                continue
+            parent_tuple = tuple([] if path == "<ROOT>" else path.split(">"))
+            prefixes.append((lvl, parent_tuple))
+    else:
+        prefixes = [(1, tuple())]  # start from root
+
+    # Generate rows from selected prefixes for every VM
+    for vm_val in all_vm:
+        for (lvl, parent) in prefixes:
+            expand_from_prefix(vm_val, lvl, parent)
+
+    # Deduplicate against existing rows
+    keycols = ["Vital Measurement"] + LEVEL_COLS
+    def make_key(rowlike) -> Tuple[str,...]:
+        return tuple(normalize_text(rowlike.get(c, "")) for c in keycols)
+
+    existing_keys = set()
+    for _, r in df.iterrows():
+        existing_keys.add(make_key(r))
+
+    to_append = []
+    duplicates = 0
+    for r in generated_rows:
+        k = make_key(r)
+        if k in existing_keys:
+            duplicates += 1
+        else:
+            to_append.append(r)
+            existing_keys.add(k)
+
+    df_aug = pd.concat([df, pd.DataFrame(to_append, columns=CANON_HEADERS)], ignore_index=True)
+    stats = {
+        "generated": len(generated_rows),
+        "new_added": len(to_append),
+        "duplicates_skipped": duplicates,
+        "final_total": len(df_aug)
+    }
+    return df_aug, stats
+
+# ======== Progress / depth metrics (for badges/quality) ========
+def compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
+    """Parents with exactly 5 children across all levels."""
+    store = infer_branch_options(df)
+    total = 0; ok = 0
+    for level in range(1, MAX_LEVELS+1):
+        # parents observed at this level
+        parents = set()
+        for _, row in df.iterrows():
+            p = parent_key_from_row_strict(row, level)
+            if p is not None:
+                parents.add(p)
+        for p in parents:
+            total += 1
+            key = level_key_tuple(level, p)
+            if len(store.get(key, [])) == 5:
+                ok += 1
+    return ok, total
+
+def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
+    """Rows where Node 1..5 are all non-empty (full path)."""
+    if df.empty:
+        return (0,0)
+    nodes = df[LEVEL_COLS].applymap(normalize_text)
+    full = nodes.ne("").all(axis=1)
+    return int(full.sum()), int(len(df))
+
+def branch_depth_badge_html(df: pd.DataFrame) -> str:
+    ok_p, total_p = compute_parent_depth_score(df)
+    ok_r, total_r = compute_row_path_score(df)
+    return (
+        f"<div style='display:inline-block;background:#eef6ff;"
+        f"padding:6px 10px;border-radius:8px;border:1px solid #cfe2ff;margin-left:8px;'>"
+        f"Parents 5/5: <b>{ok_p}/{total_p}</b> &nbsp;|&nbsp; Rows full path: <b>{ok_r}/{total_r}</b>"
+        f"</div>"
+    )
 
 # ======== PDF export (ReportLab) ========
 def build_symptoms_pdf(store: Dict[str, List[str]], parents: List[Tuple[str,...]], level: int, sheet_name: str) -> bytes:
@@ -365,12 +402,18 @@ st.caption("Canonical headers: Vital Measurement, Node 1, Node 2, Node 3, Node 4
 with st.sidebar:
     st.header("❓ Tips")
     st.markdown("""
-- **Dataset to push** defaults to **Source (raw)** so you always get your full dataset in Sheets.
-- Switch to **Completed (expanded)** if you want the 5-way expanded tree (only where each parent has 5 children).
-- Use **Data Quality → Branch Depth Validator** to spot incomplete parents and row paths.
+- **Push (Raw+)** writes your current sheet **plus** new rows generated from your **saved branch overrides** (5/5 parents only), with no duplicates.
+- New rows will have **empty** Diagnostic Triage / Actions so you can fill them later.
+- Use the **Data Quality** tools to reach 5/5 where needed; Raw+ only expands fully specified parents.
 """)
 
-tab1, tab2, tab3, tab4 = st.tabs(["⬆️ Upload Excel/CSV", "📄 Google Sheets Mode", "🧪 Fill Diagnostic & Actions", "🧬 Symptoms"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "⬆️ Upload Excel/CSV",
+    "📄 Google Sheets Mode",
+    "🧪 Fill Diagnostic & Actions",
+    "🧬 Symptoms",
+    "📜 Push Log"
+])
 
 # ---------- Upload mode ----------
 with tab1:
@@ -475,18 +518,28 @@ with tab1:
                 else:
                     st.info("Last undo snapshot was for a different tab/sheet.")
 
-        # Push settings row for per-parent pushes
-        st.info("Per-parent Sheets Push — set your target below:")
-        cols_push = st.columns([2,2,2,1])
+        # Push settings row (applies to Raw+ pushes)
+        st.info("Sheets Push (Raw+) — set your target below:")
+        cols_push = st.columns([2,2,2,1,1])
         with cols_push[0]:
             up_sid_inline = st.text_input("Spreadsheet ID (Upload)", value=ss_get("gs_spreadsheet_id",""), key="up_sid_inline")
             if up_sid_inline: ss_set("gs_spreadsheet_id", up_sid_inline)
         with cols_push[1]:
-            up_target_inline = st.text_input("Target tab", value=f"{sheet_name}{SHEET_COMPLETED_SUFFIX}", key="up_target_inline")
+            default_tab = ss_get("saved_targets", {}).get(sheet_name, {}).get("tab", f"{sheet_name}")
+            up_target_inline = st.text_input("Target tab", value=default_tab, key="up_target_inline")
         with cols_push[2]:
-            push_dataset = st.radio("Dataset to push", ["Source (raw)","Completed (expanded)"], horizontal=True, key="up_dataset_choice")
+            include_scope = st.radio("Include scope", ["All completed parents","Only parents edited this session"], horizontal=True, key="up_scope")
         with cols_push[3]:
             up_backup_inline = st.checkbox("Backup", value=True, key="up_backup_inline")
+        with cols_push[4]:
+            dry_run_inline = st.checkbox("Dry-run", value=False, key="up_dry_run_inline")
+
+        # Save target defaults per sheet
+        if up_target_inline:
+            saved = ss_get("saved_targets", {})
+            saved.setdefault(sheet_name, {})
+            saved[sheet_name]["tab"] = up_target_inline
+            ss_set("saved_targets", saved)
 
         user_fixes: Dict[str, List[str]] = {}
 
@@ -494,7 +547,7 @@ with tab1:
         if missing:
             st.warning(f"No group of symptoms: {len(missing)}")
             for (level, parent, key) in missing:
-                with st.expander(describe_branch(level, parent, 0, "No group of symptoms")):
+                with st.expander(f"{' > '.join(parent) or '<ROOT>'} — Node {level} — No group of symptoms"):
                     cols = st.columns(5)
                     edit_keys = [f"miss_{key}_{i}" for i in range(5)]
                     edit = [
@@ -510,52 +563,29 @@ with tab1:
                         st.info("Please fill all 5 options.")
                     elif len(set(non_empty)) < 5:
                         st.warning("Duplicate values detected among the 5 options.")
-
                     st.caption("Enter the 5 options for this parent.")
                     user_fixes[key] = [normalize_text(x) for x in edit]
 
-                    # Per-parent Sheets Push (Upload)
-                    if st.button("➡️ Sheets Push", type="primary", key=f"up_push_{key}"):
-                        sid = ss_get("gs_spreadsheet_id","")
-                        if not sid or not up_target_inline:
-                            st.error("Missing Spreadsheet ID or Target tab.")
-                        elif len(non_empty) < 5:
-                            st.error("Need all 5 options before pushing.")
-                        else:
-                            # Undo snapshot BEFORE change
-                            stack = ss_get("undo_stack", [])
-                            stack.append({
-                                "context": "upload",
-                                "sheet": sheet_name,
-                                "overrides_sheet_before": overrides_upload.copy()
-                            })
-                            ss_set("undo_stack", stack)
-                            # Apply fix to overrides
-                            overrides_upload[key] = enforce_k_five(edit)
-                            overrides_upload_all[sheet_name] = overrides_upload
-                            ss_set("branch_overrides_upload", overrides_upload_all)
-                            # Decide dataset
-                            if push_dataset == "Source (raw)":
-                                df_to_push = df_in.copy()
-                                if overrides_upload:
-                                    st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
-                                target_tab = up_target_inline
-                            else:
-                                df_to_push = build_completed_sheet(df_in, overrides_upload)
-                                target_tab = up_target_inline
-                            st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{target_tab}**.")
-                            # Backup + Push
-                            if up_backup_inline:
-                                backup = backup_sheet_copy(sid, target_tab)
-                                if backup: st.info(f"Backed up '{target_tab}' to '{backup}'.")
-                            ok = push_to_google_sheets(sid, target_tab, df_to_push)
-                            if ok: st.success(f"Pushed '{push_dataset}' to '{target_tab}'.")
+                    # Save overrides in-session (no direct push here)
+                    if st.button("Save 5 branches", key=f"up_save_{key}"):
+                        stack = ss_get("undo_stack", [])
+                        stack.append({
+                            "context": "upload",
+                            "sheet": sheet_name,
+                            "overrides_sheet_before": overrides_upload.copy()
+                        })
+                        ss_set("undo_stack", stack)
+                        overrides_upload[key] = enforce_k_five(edit)
+                        overrides_upload_all[sheet_name] = overrides_upload
+                        ss_set("branch_overrides_upload", overrides_upload_all)
+                        mark_session_edit(sheet_name, key)
+                        st.success("Saved 5 branches for this parent.")
 
         # --- Symptom left out (<5 options) ---
         if incomplete:
             st.warning(f"Symptom left out (<5 options): {len(incomplete)}")
             for (level,parent,key,opts) in incomplete:
-                with st.expander(describe_branch(level, parent, len(opts), "Symptom left out")):
+                with st.expander(f"{' > '.join(parent) or '<ROOT>'} — Node {level} — {len(opts)}/5"):
                     padded = enforce_k_five(opts)
                     cols = st.columns(5)
                     edit_keys = [f"incomp_{key}_{i}" for i in range(5)]
@@ -574,104 +604,102 @@ with tab1:
                         st.info("Fill the remaining boxes so there are exactly 5 options.")
                     user_fixes[key] = [normalize_text(x) for x in edit]
 
-                    # Per-parent Sheets Push (Upload)
-                    if st.button("➡️ Sheets Push", type="primary", key=f"up_push_{key}"):
-                        sid = ss_get("gs_spreadsheet_id","")
-                        if not sid or not up_target_inline:
-                            st.error("Missing Spreadsheet ID or Target tab.")
-                        elif len(non_empty) < 5:
-                            st.error("Need all 5 options before pushing.")
-                        else:
-                            # Undo snapshot BEFORE change
-                            stack = ss_get("undo_stack", [])
-                            stack.append({
-                                "context": "upload",
-                                "sheet": sheet_name,
-                                "overrides_sheet_before": overrides_upload.copy()
-                            })
-                            ss_set("undo_stack", stack)
-                            # Apply fix to overrides
-                            overrides_upload[key] = enforce_k_five(edit)
-                            overrides_upload_all[sheet_name] = overrides_upload
-                            ss_set("branch_overrides_upload", overrides_upload_all)
-                            # Decide dataset
-                            if push_dataset == "Source (raw)":
-                                df_to_push = df_in.copy()
-                                if overrides_upload:
-                                    st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
-                                target_tab = up_target_inline
-                            else:
-                                df_to_push = build_completed_sheet(df_in, overrides_upload)
-                                target_tab = up_target_inline
-                            st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{target_tab}**.")
-                            # Backup + Push
-                            if up_backup_inline:
-                                backup = backup_sheet_copy(sid, target_tab)
-                                if backup: st.info(f"Backed up '{target_tab}' to '{backup}'.")
-                            ok = push_to_google_sheets(sid, target_tab, df_to_push)
-                            if ok: st.success(f"Pushed '{push_dataset}' to '{target_tab}'.")
+                    if st.button("Save 5 branches", key=f"up_save_{key}"):
+                        stack = ss_get("undo_stack", [])
+                        stack.append({
+                            "context": "upload",
+                            "sheet": sheet_name,
+                            "overrides_sheet_before": overrides_upload.copy()
+                        })
+                        ss_set("undo_stack", stack)
+                        overrides_upload[key] = enforce_k_five(edit)
+                        overrides_upload_all[sheet_name] = overrides_upload
+                        ss_set("branch_overrides_upload", overrides_upload_all)
+                        mark_session_edit(sheet_name, key)
+                        st.success("Saved 5 branches for this parent.")
 
         if overspec:
             st.error(f"Overspecified branches (>5 options): {len(overspec)} — choose exactly 5")
             for (level,parent,key,opts) in overspec:
-                with st.expander(describe_branch(level, parent, len(opts), "Overspecified")):
+                with st.expander(f"{' > '.join(parent) or '<ROOT>'} — Node {level} — Overspecified"):
                     chosen = st.multiselect("Select 5 options", opts, default=opts[:5], key=f"over_{key}")
                     fix = chosen[:5] if len(chosen) >= 5 else enforce_k_five(chosen)
                     user_fixes[key] = [normalize_text(x) for x in fix]
+                    if st.button("Save 5 branches", key=f"up_save_over_{key}"):
+                        stack = ss_get("undo_stack", [])
+                        stack.append({
+                            "context": "upload",
+                            "sheet": sheet_name,
+                            "overrides_sheet_before": overrides_upload.copy()
+                        })
+                        ss_set("undo_stack", stack)
+                        overrides_upload[key] = enforce_k_five(fix)
+                        overrides_upload_all[sheet_name] = overrides_upload
+                        ss_set("branch_overrides_upload", overrides_upload_all)
+                        mark_session_edit(sheet_name, key)
+                        st.success("Saved 5 branches for this parent.")
 
         st.markdown("---")
-        completed_preview = None
-        if st.button("Build Completed (Expanded 5× Tree)"):
-            merged = {**overrides_upload, **user_fixes}
-            completed_preview = build_completed_sheet(df_in, merged)
-            st.success(f"Completed rows: {len(completed_preview)}")
-            st.dataframe(completed_preview.head(50), use_container_width=True)
-            mp = ss_get("upload_completed", {}); mp[sheet_name] = completed_preview.copy(); ss_set("upload_completed", mp)
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                for nm, d in wb.items():
-                    d.to_excel(writer, index=False, sheet_name=nm[:31] or "Sheet1")
-                out_name = f"{sheet_name}{SHEET_COMPLETED_SUFFIX}"
-                completed_preview.to_excel(writer, index=False, sheet_name=out_name[:31])
-            st.download_button("Download updated workbook", data=buffer.getvalue(), file_name="decision_tree_completed.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        st.markdown("#### Push to Google Sheets (overwrite)")
-        st.caption("Requires [gcp_service_account] in Secrets. Defaults to full dataset push.")
+        st.markdown("#### Push to Google Sheets (Raw+ augmented)")
         up_spreadsheet_id = st.text_input("Spreadsheet ID (Upload tab)", value=ss_get("gs_spreadsheet_id",""), key="up_sheet_id_main")
         if up_spreadsheet_id: ss_set("gs_spreadsheet_id", up_spreadsheet_id)
-        up_target_tab = st.text_input("Target tab name", value=f"{sheet_name}{SHEET_COMPLETED_SUFFIX}", key="up_target_tab")
-        push_dataset_main = st.radio("Dataset to push (Upload tab)", ["Source (raw)","Completed (expanded)"], horizontal=True, key="up_dataset_choice_main", index=0)
-        only_incomplete = st.checkbox("Push only incomplete rows", value=False, key="up_only_incomplete")
+        default_tab_main = ss_get("saved_targets", {}).get(sheet_name, {}).get("tab", f"{sheet_name}")
+        up_target_tab = st.text_input("Target tab name", value=default_tab_main, key="up_target_tab")
+        include_scope_main = st.radio("Include scope", ["All completed parents","Only parents edited this session"], horizontal=True, key="up_scope_main")
         up_confirm = st.checkbox("I confirm I want to overwrite the target tab.", key="up_confirm")
         up_backup = st.checkbox("Create a backup tab before overwriting", value=True, key="up_backup")
-        if st.button("Push (Upload tab)"):
+        up_dry = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="up_dry")
+
+        # Precompute edited keys for this sheet
+        edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_name, []))
+
+        if st.button("Push Raw+ (augmented)"):
             if not up_spreadsheet_id or not up_target_tab:
                 st.warning("Enter Spreadsheet ID and target tab name.")
-            elif not up_confirm:
+            elif not up_confirm and not up_dry:
                 st.warning("Please tick the confirmation checkbox before pushing.")
             else:
-                if push_dataset_main == "Source (raw)":
-                    df_to_push = df_in.copy()
-                    if only_incomplete:
-                        # Incomplete = any blank among canonical columns
-                        mask = df_to_push[CANON_HEADERS].applymap(normalize_text).eq("").any(axis=1)
-                        df_to_push = df_to_push[mask].copy()
-                    if overrides_upload:
-                        st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
+                merged_overrides = {**overrides_upload, **user_fixes}
+                scope_flag = "session" if include_scope_main.endswith("session") else "all"
+                df_aug, stats = build_raw_plus(df_in, merged_overrides, scope_flag, edited_keys_for_sheet)
+
+                st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
+                st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{up_target_tab}**.")
+
+                if up_dry:
+                    st.success("Dry-run complete. No changes written to Google Sheets.")
+                    st.dataframe(df_aug.head(50), use_container_width=True)
+                    # Optional: download the augmented table
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                        df_aug.to_excel(writer, index=False, sheet_name=sheet_name[:31] or "Sheet1")
+                    st.download_button("Download augmented (Raw+) workbook", data=buffer.getvalue(),
+                                       file_name="decision_tree_raw_plus.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 else:
-                    merged = {**overrides_upload, **user_fixes}
-                    df_to_push = build_completed_sheet(df_in, merged)
-                    if only_incomplete:
-                        # For completed, consider incomplete outcomes only
-                        tri_empty = df_to_push["Diagnostic Triage"].map(normalize_text) == ""
-                        act_empty = df_to_push["Actions"].map(normalize_text) == ""
-                        df_to_push = df_to_push[tri_empty | act_empty].copy()
-                st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{up_target_tab}**.")
-                if up_backup:
-                    backup_name = backup_sheet_copy(up_spreadsheet_id, up_target_tab)
-                    if backup_name: st.info(f"Backed up current '{up_target_tab}' to '{backup_name}'.")
-                ok = push_to_google_sheets(up_spreadsheet_id, up_target_tab, df_to_push)
-                if ok: st.success(f"Pushed {len(df_to_push)} rows to Google Sheets.")
+                    if up_backup:
+                        backup_name = backup_sheet_copy(up_spreadsheet_id, up_target_tab)
+                        if backup_name: st.info(f"Backed up current '{up_target_tab}' to '{backup_name}'.")
+                    ok = push_to_google_sheets(up_spreadsheet_id, up_target_tab, df_aug)
+                    if ok:
+                        # Push log
+                        log = ss_get("push_log", [])
+                        log.append({
+                            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "sheet": sheet_name,
+                            "target_tab": up_target_tab,
+                            "spreadsheet_id": up_spreadsheet_id,
+                            "rows_written": len(df_aug),
+                            "new_rows_added": stats["new_added"],
+                            "scope": scope_flag
+                        })
+                        ss_set("push_log", log)
+                        # Save target for this sheet
+                        saved = ss_get("saved_targets", {})
+                        saved.setdefault(sheet_name, {})
+                        saved[sheet_name]["tab"] = up_target_tab
+                        ss_set("saved_targets", saved)
+                        st.success(f"Pushed {len(df_aug)} rows to Google Sheets.")
 
 # ---------- Google Sheets mode ----------
 with tab2:
@@ -724,9 +752,10 @@ with tab3:
     else:
         source = st.radio("Choose data source", sources, horizontal=True)
         if source == "Upload workbook":
-            wb = ss_get("upload_workbook", {}); where = "upload"
+            wb = ss_get("upload_workbook", {}); where = "upload"; override_root = "branch_overrides_upload"
         else:
-            wb = ss_get("gs_workbook", {}); where = "gs"
+            wb = ss_get("gs_workbook", {}); where = "gs"; override_root = "branch_overrides_gs"
+
         selected_sheets = st.multiselect("Limit to sheets", list(wb.keys()), default=list(wb.keys()))
         candidates = []
         for nm in selected_sheets:
@@ -769,25 +798,43 @@ with tab3:
                         sid = ss_get("gs_spreadsheet_id", "")
                         if not sid: st.error("Missing Spreadsheet ID in session. Reload in the Google Sheets tab.")
                         else:
-                            df_to_push = wb[sheet_cur]
-                            st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{sheet_cur}**.")
-                            ok = push_to_google_sheets(sid, sheet_cur, df_to_push)
-                            if ok: st.success("Changes pushed to Google Sheets.")
+                            # Push Raw+ (augmented) for this sheet
+                            overrides_all = ss_get(override_root, {})
+                            overrides_sheet = overrides_all.get(sheet_cur, {})
+                            scope_flag = "all"  # default for this quick push
+                            edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_cur, []))
+                            df_aug, stats = build_raw_plus(wb[sheet_cur], overrides_sheet, scope_flag, edited_keys_for_sheet)
+                            st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{sheet_cur}**.")
+                            ok = push_to_google_sheets(sid, sheet_cur, df_aug)
+                            if ok:
+                                log = ss_get("push_log", [])
+                                log.append({
+                                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "sheet": sheet_cur,
+                                    "target_tab": sheet_cur,
+                                    "spreadsheet_id": sid,
+                                    "rows_written": len(df_aug),
+                                    "new_rows_added": stats["new_added"],
+                                    "scope": scope_flag
+                                })
+                                ss_set("push_log", log)
+                                st.success("Changes pushed to Google Sheets (Raw+).")
             else: st.info("Click 'Pick a random incomplete row' to begin.")
 
 # ---------- Symptoms browser & editor ----------
 with tab4:
-    st.subheader("Symptoms — browse, check consistency, edit child branches, push to Sheets, export PDF")
+    st.subheader("Symptoms — browse, check consistency, edit child branches, push Raw+, export PDF")
 
-    # Push settings (used by per-parent "Sheets Push" and Bulk push)
+    # Push settings (used by per-parent save/push and Bulk push)
     with st.expander("🔧 Google Sheets Push Settings"):
         sid_current = ss_get("gs_spreadsheet_id", "")
         sid_input = st.text_input("Spreadsheet ID for pushes", value=sid_current, key="sym_sid")
         if sid_input and sid_input != sid_current:
             ss_set("gs_spreadsheet_id", sid_input)
-        push_dataset_sym = st.radio("Dataset to push", ["Source (raw)","Completed (expanded)"], horizontal=True, key="sym_dataset_choice", index=0)
-        st.caption("Target tab will be '<SheetName> (Completed)' by default for Completed; choose your own for Source.")
-        push_backup = st.checkbox("Create a backup tab before bulk overwrite", value=True, key="sym_push_backup")
+        include_scope_sym = st.radio("Include scope for Raw+", ["All completed parents","Only parents edited this session"], horizontal=True, key="sym_scope")
+        st.caption("Raw+ = Source rows + new rows generated from saved branch overrides (5/5 parents only).")
+        push_backup = st.checkbox("Create a backup tab before overwrite", value=True, key="sym_push_backup")
+        dry_run_sym = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="sym_dry_run")
 
     # Undo stack controls
     if st.button("↩️ Undo last branch edit (session)"):
@@ -836,7 +883,6 @@ with tab4:
         # Data Quality Tools
         if not df.empty and validate_headers(df):
             with st.expander("🧼 Data quality tools (applies to this sheet)"):
-                # Branch Depth Validator
                 ok_p, total_p = compute_parent_depth_score(df)
                 ok_r, total_r = compute_row_path_score(df)
                 st.write(f"Parents with 5 children: **{ok_p}/{total_p}**")
@@ -985,22 +1031,14 @@ with tab4:
                 )
 
         with render_pdf_colB:
-            st.caption("Inline edit child branches and optionally push the **Source** or **Completed** dataset to Google Sheets.")
-
-        # Legend / Unsaved badge reference (compare to last_pushed_overrides)
-        last_pushed_all = ss_get("last_pushed_overrides", {})
-        last_pushed_sheet = last_pushed_all.get(sheet, {})
+            st.caption("Edit child branches and push **Raw+** (augmented) to Google Sheets when ready.")
 
         # Render entries with inline editing
         for parent_tuple, children, status in entries:
             keyname = level_key_tuple(level, parent_tuple)
             last_label = parent_tuple[-1] if parent_tuple else "<ROOT>"
             inconsistent_flag = (level, last_label) in inconsistent_labels
-            current_val = overrides_current.get(keyname, children)
-            last_val = last_pushed_sheet.get(keyname, None)
-            unsaved = (last_val is None) or (list(current_val) != list(last_val))
-            save_badge = "🟠 Unsaved" if unsaved else "🟢 Saved"
-            subtitle = f"{' > '.join(parent_tuple) or '<ROOT>'} — {status} {'⚠️' if inconsistent_flag else ''} — {save_badge}"
+            subtitle = f"{' > '.join(parent_tuple) or '<ROOT>'} — {status} {'⚠️' if inconsistent_flag else ''}"
 
             with st.expander(subtitle):
                 selected_vals = []
@@ -1061,83 +1099,69 @@ with tab4:
                     overrides_sheet[keyname] = fixed
                     overrides_all[sheet] = overrides_sheet
                     ss_set(override_root, overrides_all)
+                    mark_session_edit(sheet, keyname)
                     # update local view
-                    overrides_current = overrides_sheet
                     store[keyname] = fixed
                     st.success("Saved in-session. (Undo available above)")
 
-                # Sheets Push (per-parent) with dataset choice
-                if st.button("➡️ Sheets Push", type="primary", key=f"sym_push_{level}_{'__'.join(parent_tuple)}"):
-                    sid = ss_get("gs_spreadsheet_id", "")
-                    if not sid:
-                        st.error("Missing Spreadsheet ID. Enter it in Push Settings above.")
-                    else:
-                        fixed = build_final_values()
-                        overrides_all = ss_get(override_root, {})
-                        overrides_sheet = overrides_all.get(sheet, {}).copy()
-                        # undo snapshot
-                        stack = ss_get("undo_stack", [])
-                        stack.append({
-                            "context": "symptoms",
-                            "override_root": override_root,
-                            "sheet": sheet,
-                            "level": level,
-                            "parent": parent_tuple,
-                            "overrides_sheet_before": overrides_all.get(sheet, {}).copy()
-                        })
-                        ss_set("undo_stack", stack)
-                        # Save overrides first
-                        overrides_sheet[keyname] = fixed
-                        overrides_all[sheet] = overrides_sheet
-                        ss_set(override_root, overrides_all)
-                        # Choose dataset
-                        if push_dataset_sym == "Source (raw)":
-                            df_to_push = df.copy()
-                            target_tab = sheet  # keep same tab name
-                            if overrides_sheet:
-                                st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
-                        else:
-                            df_to_push = build_completed_sheet(df, overrides_sheet)
-                            target_tab = f"{sheet}{SHEET_COMPLETED_SUFFIX}"
-                        st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{target_tab}**.")
-                        if ss_get("sym_push_backup", True):
-                            backup_name = backup_sheet_copy(sid, target_tab)
-                            if backup_name: st.info(f"Backed up current '{target_tab}' to '{backup_name}'.")
-                        ok = push_to_google_sheets(sid, target_tab, df_to_push)
-                        if ok:
-                            # mark last pushed
-                            lp_all = ss_get("last_pushed_overrides", {})
-                            lp_sheet = lp_all.get(sheet, {}).copy(); lp_sheet[keyname] = fixed
-                            lp_all[sheet] = lp_sheet; ss_set("last_pushed_overrides", lp_all)
-                            st.success(f"Pushed {len(df_to_push)} rows to '{target_tab}'.")
-
-        # Bulk push + PDF already above
         st.markdown("---")
-        st.markdown("#### Bulk Push (from Symptoms)")
+        st.markdown("#### Bulk Push Raw+ for this sheet")
         colA, colB = st.columns([1,2])
         with colA:
-            if st.button("📤 Bulk Sheets Push (build/overwrite)", type="primary"):
-                sid = ss_get("gs_spreadsheet_id", "")
-                if not sid:
-                    st.error("Missing Spreadsheet ID. Enter it in 'Push Settings' above.")
+            sid = ss_get("gs_spreadsheet_id", "")
+            sid = st.text_input("Spreadsheet ID", value=sid, key="sym_sid_bulk") or sid
+            if sid: ss_set("gs_spreadsheet_id", sid)
+
+            default_tab = ss_get("saved_targets", {}).get(sheet, {}).get("tab", f"{sheet}")
+            target_tab = st.text_input("Target tab", value=default_tab, key="sym_target_tab")
+            scope_flag = "session" if include_scope_sym.endswith("session") else "all"
+            edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet, []))
+
+            if st.button("📤 Bulk Push Raw+ (build/overwrite)", type="primary"):
+                if not sid or not target_tab:
+                    st.error("Missing Spreadsheet ID or target tab.")
                 else:
-                    if push_dataset_sym == "Source (raw)":
-                        df_to_push = df.copy()
-                        target_tab = sheet
-                        if overrides_current:
-                            st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
+                    df_aug, stats = build_raw_plus(df, overrides_current, scope_flag, edited_keys_for_sheet)
+                    st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
+                    st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{target_tab}**.")
+                    if dry_run_sym:
+                        st.success("Dry-run complete. No changes written to Google Sheets.")
+                        st.dataframe(df_aug.head(50), use_container_width=True)
                     else:
-                        df_to_push = build_completed_sheet(df, overrides_current)
-                        target_tab = f"{sheet}{SHEET_COMPLETED_SUFFIX}"
-                    st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{target_tab}**.")
-                    if ss_get("sym_push_backup", True):
-                        backup_name = backup_sheet_copy(sid, target_tab)
-                        if backup_name: st.info(f"Backed up current '{target_tab}' to '{backup_name}'.")
-                    ok = push_to_google_sheets(sid, target_tab, df_to_push)
-                    if ok:
-                        lp_all = ss_get("last_pushed_overrides", {})
-                        lp_all[sheet] = overrides_current.copy()
-                        ss_set("last_pushed_overrides", lp_all)
-                        st.success(f"Pushed {len(df_to_push)} rows to '{target_tab}'.")
+                        if ss_get("sym_push_backup", True) and push_backup:
+                            backup_name = backup_sheet_copy(sid, target_tab)
+                            if backup_name: st.info(f"Backed up current '{target_tab}' to '{backup_name}'.")
+                        ok = push_to_google_sheets(sid, target_tab, df_aug)
+                        if ok:
+                            # push log + save target
+                            log = ss_get("push_log", [])
+                            log.append({
+                                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "sheet": sheet,
+                                "target_tab": target_tab,
+                                "spreadsheet_id": sid,
+                                "rows_written": len(df_aug),
+                                "new_rows_added": stats["new_added"],
+                                "scope": scope_flag
+                            })
+                            ss_set("push_log", log)
+                            saved = ss_get("saved_targets", {})
+                            saved.setdefault(sheet, {})
+                            saved[sheet]["tab"] = target_tab
+                            ss_set("saved_targets", saved)
+                            st.success(f"Pushed {len(df_aug)} rows to '{target_tab}'.")
         with colB:
-            st.caption("Bulk push respects your dataset choice (Source vs Completed).")
+            st.caption("Raw+ respects your Include Scope choice.")
+
+# ---------- Push Log ----------
+with tab5:
+    st.subheader("Push Log")
+    log = ss_get("push_log", [])
+    if not log:
+        st.info("No pushes recorded this session.")
+    else:
+        df_log = pd.DataFrame(log)
+        st.dataframe(df_log, use_container_width=True)
+        # Download log
+        csv = df_log.to_csv(index=False).encode("utf-8")
+        st.download_button("Download push log (CSV)", data=csv, file_name="push_log.csv", mime="text/csv")
