@@ -1,4 +1,4 @@
-# streamlit_app_upload.py — Version 6.1
+# streamlit_app_upload.py — Version 6.2
 
 import io
 import random
@@ -9,7 +9,7 @@ import streamlit as st
 from datetime import datetime
 
 # ============ VERSION / CONFIG ============
-APP_VERSION = "v6.1"
+APP_VERSION = "v6.2"
 CANON_HEADERS = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]
 LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
 SHEET_COMPLETED_SUFFIX = " (Completed)"
@@ -210,29 +210,49 @@ def branch_depth_badge_html(df: pd.DataFrame) -> str:
         f"</div>"
     )
 
-# ======== Google Sheets helpers ========
+# ======== Google Sheets helpers (RESIZE BEFORE UPDATE) ========
 def push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFrame) -> bool:
-    """Overwrite or create target sheet with df using service account in secrets."""
+    """Overwrite or create target sheet with df using service account in secrets.
+    Ensures the worksheet is resized so rows are never truncated.
+    """
     try:
         import gspread
         from google.oauth2.service_account import Credentials
         if "gcp_service_account" not in st.secrets:
             st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
             return False
+
         sa_info = st.secrets["gcp_service_account"]
-        scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         client = gspread.authorize(creds)
+
         sh = client.open_by_key(spreadsheet_id)
-        try:
-            ws = sh.worksheet(sheet_name); ws.clear()
-        except Exception:
-            ws = sh.add_worksheet(title=sheet_name, rows=max(len(df)+50, 200), cols=max(len(df.columns)+2, 10))
+
+        # Prepare data
         df = df.fillna("")
-        values = [list(df.columns)] + df.astype(str).values.tolist()
-        ws.update(values); return True
+        headers = list(df.columns)
+        values = [headers] + df.astype(str).values.tolist()
+        n_rows = len(values)  # includes header row
+        n_cols = max(1, len(headers))
+
+        try:
+            ws = sh.worksheet(sheet_name)
+            ws.clear()
+            ws.resize(rows=max(n_rows, 200), cols=max(n_cols, 8))
+        except Exception:
+            ws = sh.add_worksheet(
+                title=sheet_name,
+                rows=max(n_rows, 200),
+                cols=max(n_cols, 8)
+            )
+
+        ws.update('A1', values, value_input_option="RAW")
+        return True
+
     except Exception as e:
-        st.error(f"Push to Google Sheets failed: {e}"); return False
+        st.error(f"Push to Google Sheets failed: {e}")
+        return False
 
 def backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
     """Create a backup tab by copying values from source_sheet into a new '(backup YYYY-MM-DD HHMM)' tab."""
@@ -253,10 +273,14 @@ def backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
         values = ws.get_all_values()
         ts = datetime.now().strftime("%Y-%m-%d %H%M")
         backup_title_full = f"{source_sheet} (backup {ts})"
-        backup_title = backup_title_full[:31]
-        ws_bak = sh.add_worksheet(title=backup_title, rows=max(len(values),100), cols=max(len(values[0]) if values else 8, 8))
+        backup_title = backup_title_full[:99]  # Sheets allows up to 100 chars
+
+        rows = max(len(values), 100)
+        cols = max(len(values[0]) if values else 8, 8)
+
+        ws_bak = sh.add_worksheet(title=backup_title, rows=rows, cols=cols)
         if values:
-            ws_bak.update(values)
+            ws_bak.update('A1', values, value_input_option="RAW")
         return backup_title
     except Exception as e:
         st.error(f"Backup failed: {e}")
@@ -513,14 +537,19 @@ with tab1:
                             # Decide dataset
                             if push_dataset == "Source (raw)":
                                 df_to_push = df_in.copy()
+                                if overrides_upload:
+                                    st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
+                                target_tab = up_target_inline
                             else:
                                 df_to_push = build_completed_sheet(df_in, overrides_upload)
+                                target_tab = up_target_inline
+                            st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{target_tab}**.")
                             # Backup + Push
                             if up_backup_inline:
-                                backup = backup_sheet_copy(sid, up_target_inline)
-                                if backup: st.info(f"Backed up '{up_target_inline}' to '{backup}'.")
-                            ok = push_to_google_sheets(sid, up_target_inline, df_to_push)
-                            if ok: st.success(f"Pushed '{push_dataset}' to '{up_target_inline}'.")
+                                backup = backup_sheet_copy(sid, target_tab)
+                                if backup: st.info(f"Backed up '{target_tab}' to '{backup}'.")
+                            ok = push_to_google_sheets(sid, target_tab, df_to_push)
+                            if ok: st.success(f"Pushed '{push_dataset}' to '{target_tab}'.")
 
         # --- Symptom left out (<5 options) ---
         if incomplete:
@@ -568,14 +597,19 @@ with tab1:
                             # Decide dataset
                             if push_dataset == "Source (raw)":
                                 df_to_push = df_in.copy()
+                                if overrides_upload:
+                                    st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
+                                target_tab = up_target_inline
                             else:
                                 df_to_push = build_completed_sheet(df_in, overrides_upload)
+                                target_tab = up_target_inline
+                            st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{target_tab}**.")
                             # Backup + Push
                             if up_backup_inline:
-                                backup = backup_sheet_copy(sid, up_target_inline)
-                                if backup: st.info(f"Backed up '{up_target_inline}' to '{backup}'.")
-                            ok = push_to_google_sheets(sid, up_target_inline, df_to_push)
-                            if ok: st.success(f"Pushed '{push_dataset}' to '{up_target_inline}'.")
+                                backup = backup_sheet_copy(sid, target_tab)
+                                if backup: st.info(f"Backed up '{target_tab}' to '{backup}'.")
+                            ok = push_to_google_sheets(sid, target_tab, df_to_push)
+                            if ok: st.success(f"Pushed '{push_dataset}' to '{target_tab}'.")
 
         if overspec:
             st.error(f"Overspecified branches (>5 options): {len(overspec)} — choose exactly 5")
@@ -622,6 +656,8 @@ with tab1:
                         # Incomplete = any blank among canonical columns
                         mask = df_to_push[CANON_HEADERS].applymap(normalize_text).eq("").any(axis=1)
                         df_to_push = df_to_push[mask].copy()
+                    if overrides_upload:
+                        st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
                 else:
                     merged = {**overrides_upload, **user_fixes}
                     df_to_push = build_completed_sheet(df_in, merged)
@@ -630,6 +666,7 @@ with tab1:
                         tri_empty = df_to_push["Diagnostic Triage"].map(normalize_text) == ""
                         act_empty = df_to_push["Actions"].map(normalize_text) == ""
                         df_to_push = df_to_push[tri_empty | act_empty].copy()
+                st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{up_target_tab}**.")
                 if up_backup:
                     backup_name = backup_sheet_copy(up_spreadsheet_id, up_target_tab)
                     if backup_name: st.info(f"Backed up current '{up_target_tab}' to '{backup_name}'.")
@@ -732,7 +769,9 @@ with tab3:
                         sid = ss_get("gs_spreadsheet_id", "")
                         if not sid: st.error("Missing Spreadsheet ID in session. Reload in the Google Sheets tab.")
                         else:
-                            ok = push_to_google_sheets(sid, sheet_cur, wb[sheet_cur])
+                            df_to_push = wb[sheet_cur]
+                            st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{sheet_cur}**.")
+                            ok = push_to_google_sheets(sid, sheet_cur, df_to_push)
                             if ok: st.success("Changes pushed to Google Sheets.")
             else: st.info("Click 'Pick a random incomplete row' to begin.")
 
@@ -845,6 +884,7 @@ with tab4:
                         if not sid:
                             st.error("Missing Spreadsheet ID in session.")
                         else:
+                            st.caption(f"Will write **{len(df_norm)} rows × {len(df_norm.columns)} cols** to tab **{sheet}**.")
                             ok = push_to_google_sheets(sid, sheet, df_norm)
                             if ok: st.success("Normalized sheet pushed to Google Sheets.")
 
@@ -1054,9 +1094,15 @@ with tab4:
                         if push_dataset_sym == "Source (raw)":
                             df_to_push = df.copy()
                             target_tab = sheet  # keep same tab name
+                            if overrides_sheet:
+                                st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
                         else:
                             df_to_push = build_completed_sheet(df, overrides_sheet)
                             target_tab = f"{sheet}{SHEET_COMPLETED_SUFFIX}"
+                        st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{target_tab}**.")
+                        if ss_get("sym_push_backup", True):
+                            backup_name = backup_sheet_copy(sid, target_tab)
+                            if backup_name: st.info(f"Backed up current '{target_tab}' to '{backup_name}'.")
                         ok = push_to_google_sheets(sid, target_tab, df_to_push)
                         if ok:
                             # mark last pushed
@@ -1078,9 +1124,12 @@ with tab4:
                     if push_dataset_sym == "Source (raw)":
                         df_to_push = df.copy()
                         target_tab = sheet
+                        if overrides_current:
+                            st.info("Note: Branch overrides affect only the Completed (expanded) dataset, not Source (raw).")
                     else:
                         df_to_push = build_completed_sheet(df, overrides_current)
                         target_tab = f"{sheet}{SHEET_COMPLETED_SUFFIX}"
+                    st.caption(f"Will write **{len(df_to_push)} rows × {len(df_to_push.columns)} cols** to tab **{target_tab}**.")
                     if ss_get("sym_push_backup", True):
                         backup_name = backup_sheet_copy(sid, target_tab)
                         if backup_name: st.info(f"Backed up current '{target_tab}' to '{backup_name}'.")
