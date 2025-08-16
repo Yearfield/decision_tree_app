@@ -1,4 +1,4 @@
-# streamlit_app_upload.py — Version 6.2.7
+# streamlit_app_upload.py — Version 6.2.8
 
 import io
 import json
@@ -10,7 +10,7 @@ import streamlit as st
 from datetime import datetime
 
 # ============ VERSION / CONFIG ============
-APP_VERSION = "v6.2.7"
+APP_VERSION = "v6.2.8"
 CANON_HEADERS = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]
 LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
 MAX_LEVELS = 5
@@ -32,6 +32,18 @@ def mark_session_edit(sheet: str, keyname: str):
     cur.add(keyname)
     ek[sheet] = list(cur)
     ss_set("session_edited_keys", ek)
+
+def add_thumb(category: str, identifier: str):
+    # category in {"parent_keys","conflict_labels"}
+    thumbs = ss_get("thumb_marks", {"parent_keys": set(), "conflict_labels": set()})
+    s = set(thumbs.get(category, []))
+    s.add(identifier)
+    thumbs[category] = list(s)
+    ss_set("thumb_marks", thumbs)
+
+def has_thumb(category: str, identifier: str) -> bool:
+    thumbs = ss_get("thumb_marks", {"parent_keys": [], "conflict_labels": []})
+    return identifier in set(thumbs.get(category, []))
 
 # ============ Core helpers ============
 def normalize_text(x: str) -> str:
@@ -55,6 +67,9 @@ def parent_key_from_row_strict(row: pd.Series, upto_level: int) -> Optional[Tupl
 
 def level_key_tuple(level: int, parent: Tuple[str, ...]) -> str:
     return f"L{level}|" + (">".join(parent) if parent else "<ROOT>")
+
+def display_parent(parent: Tuple[str, ...]) -> str:
+    return "Root of tree" if not parent else " > ".join(parent)
 
 def infer_branch_options(df: pd.DataFrame) -> Dict[str, List[str]]:
     """
@@ -354,8 +369,8 @@ def cascade_anchor_reuse_full(
 
     return df, total
 
-# ============ Raw+ builder (v6.2.7) ============
-def build_raw_plus_v627(
+# ============ Raw+ builder (v6.2.8) ============
+def build_raw_plus_v628(
     df: pd.DataFrame,
     overrides: Dict[str, List[str]],
     include_scope: str,
@@ -494,7 +509,7 @@ def build_symptoms_pdf(store: Dict[str, List[str]], parents: List[Tuple[str,...]
     for parent in parents:
         key = level_key_tuple(level, parent)
         children = store.get(key, [])
-        parent_text = " > ".join(parent) if parent else "<ROOT>"
+        parent_text = display_parent(parent)
         c.setFont("Helvetica-Bold", 10)
         c.drawString(x, y, f"{parent_text}")
         y -= 0.5*cm
@@ -544,7 +559,8 @@ with st.sidebar:
     st.markdown("""
 - **Recursive deep cascade:** Uses a global label→children map to propagate entire subtrees; anchor-reuse prevents duplicates.
 - **VM Builder & Wizard:** Add a Vital Measurement and its branches; auto-cascade forward.
-- **Dictionary:** Filter/search + toggle **Red Flag** per symptom; export CSV.
+- **Dictionary:** Filter/search with highlight + toggle **Red Flag** per symptom; export CSV.
+- **Node 2 grouping:** Preview and export clustered view as CSV.
 - Use **Dry-run** to preview; keep **Backup** on for easy rollback.
 """)
 
@@ -684,7 +700,8 @@ with tab1:
                         df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vm_name], [tuple()])
                         df_in = df_new
                         wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
-                        st.success(f"VM '{vm_name}' created. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
+                        st.success(f"VM '{vm_name}' created. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors. 👍")
+                        add_thumb("parent_keys", level_key_tuple(1, tuple()))
 
             else:
                 vm_name = st.text_input("Vital Measurement name", key="vm2_new_name")
@@ -718,7 +735,8 @@ with tab1:
                         df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vm_name], [(n1,)])
                         df_in = df_new
                         wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
-                        st.success(f"VM '{vm_name}' with Node-1 '{n1}' created. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
+                        st.success(f"VM '{vm_name}' with Node-1 '{n1}' created. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors. 👍")
+                        add_thumb("parent_keys", level_key_tuple(2, (n1,)))
 
         # ===== 🧙 VM Build Wizard =====
         with st.expander("🧙 VM Build Wizard (step-by-step to Node 5)"):
@@ -739,7 +757,7 @@ with tab1:
                 else:
                     current_parent = wizard["queue"][0]
                     L = len(current_parent)+1
-                    st.write(f"**Current parent path:** `{ ' > '.join(current_parent) or '<ROOT>' }` — define children for **Node {L}**")
+                    st.write(f"**Current parent path:** `{ display_parent(current_parent) }` — define children for **Node {L}**")
                     cols = st.columns(5)
                     vals = [cols[i].text_input(f"Child {i+1}", key=f"wiz_{L}_{'__'.join(current_parent)}_{i}") for i in range(5)]
                     fill_other = st.checkbox("Fill remaining blanks with 'Other'", key=f"wiz_other_{L}_{'__'.join(current_parent)}")
@@ -777,6 +795,7 @@ with tab1:
                         for k,v in wizard["overrides"].items():
                             current_sheet_overrides[k] = enforce_k_five(v)
                             mark_session_edit(sheet_name, k)
+                            add_thumb("parent_keys", k)
                         overrides_upload_all[sheet_name] = current_sheet_overrides
                         ss_set("branch_overrides_upload", overrides_upload_all)
 
@@ -793,14 +812,14 @@ with tab1:
                         df_in = df_new
                         wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
 
-                        st.success(f"Wizard applied. Auto-cascade: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors filled.")
+                        st.success(f"Wizard applied. Auto-cascade: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors filled. 👍")
                         ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
                 with colB:
                     if st.button("Cancel & Reset Wizard"):
                         ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
                         st.experimental_rerun()
 
-# ---------- Google Sheets mode (NOW also central workspace for overrides, data quality, push, and Node 2 grouping) ----------
+# ---------- Google Sheets mode (central workspace) ----------
 with tab2:
     st.subheader("Google Sheets (workspace)")
 
@@ -847,7 +866,7 @@ with tab2:
     st.markdown("---")
     st.subheader("Workspace selection")
 
-    # Choose data source (moved here from Symptoms)
+    # Choose data source
     sources = []
     if ss_get("upload_workbook", {}): sources.append("Upload workbook")
     if ss_get("gs_workbook", {}): sources.append("Google Sheets workbook")
@@ -874,7 +893,7 @@ with tab2:
         if df_ws.empty:
             st.info("Selected sheet is empty or not loaded yet.")
         else:
-            # ========== 📦 Export / Import Overrides (JSON) — moved here ==========
+            # ========== 📦 Export / Import Overrides (JSON) ==========
             with st.expander("📦 Export / Import Overrides (JSON)"):
                 overrides_all = ss_get(override_root, {})
                 overrides_sheet = overrides_all.get(sheet_ws, {})
@@ -939,7 +958,7 @@ with tab2:
                         except Exception as e:
                             st.error(f"Import failed: {e}")
 
-            # ========== 🧼 Data quality tools — moved here ==========
+            # ========== 🧼 Data quality tools ==========
             with st.expander("🧼 Data quality tools (applies to this sheet)"):
                 ok_p, total_p = compute_parent_depth_score(df_ws)
                 ok_r, total_r = compute_row_path_score(df_ws)
@@ -995,7 +1014,7 @@ with tab2:
                             ok = push_to_google_sheets(sid, sheet_ws, df_norm)
                             if ok: st.success("Normalized sheet pushed to Google Sheets.")
 
-            # ========== 🧩 Node 2 grouping (NEW) ==========
+            # ========== 🧩 Group rows by Node 2 (cluster identical Node 2 labels together) ==========
             with st.expander("🧩 Group rows by Node 2 (cluster identical Node 2 labels together)"):
                 st.caption("Groups rows so identical **Node 2** values are contiguous. This is a stable grouping limited to Node 2.")
                 scope = st.radio("Grouping scope", ["Whole sheet", "Within Vital Measurement"], horizontal=True, key="ws_group_scope")
@@ -1007,7 +1026,6 @@ with tab2:
                     key_cols = []
                     if scope_mode == "Within Vital Measurement":
                         key_cols = ["Vital Measurement"]
-                    # Sort key: Node 2 (normalized) first, then scope keys, then original index to keep stability
                     df2["_node2_key"] = df2["Node 2"].map(lambda x: normalize_text(x).lower())
                     sort_by = key_cols + ["_node2_key", "_orig_idx"]
                     df2 = df2.sort_values(sort_by, kind="stable").drop(columns=["_node2_key","_orig_idx"])
@@ -1019,7 +1037,7 @@ with tab2:
                     csvprev = df_prev.to_csv(index=False).encode("utf-8")
                     st.download_button("Download grouped preview (CSV)", data=csvprev, file_name=f"{sheet_ws}_grouped_node2_preview.csv", mime="text/csv")
 
-                colg1, colg2 = st.columns([1,2])
+                colg1, colg2, colg3 = st.columns([1,1,2])
                 with colg1:
                     if st.button("Apply grouping (in-session)"):
                         df_grouped = grouped_by_node2(df_ws, scope)
@@ -1037,8 +1055,13 @@ with tab2:
                             df_grouped = grouped_by_node2(df_ws, scope)
                             ok = push_to_google_sheets(sid, sheet_ws, df_grouped)
                             if ok: st.success("Grouping pushed to Google Sheets.")
+                with colg3:
+                    # Extra export of the CURRENT grouped view (per v6.2.8 scope)
+                    df_grouped = grouped_by_node2(df_ws, scope)
+                    csvcur = df_grouped.to_csv(index=False).encode("utf-8")
+                    st.download_button("Export current grouped view (CSV)", data=csvcur, file_name=f"{sheet_ws}_grouped_node2_current.csv", mime="text/csv")
 
-            # ========== 🔧 Google Sheets Push Settings + Bulk Push — moved here ==========
+            # ========== 🔧 Google Sheets Push Settings + Bulk Push ==========
             with st.expander("🔧 Google Sheets Push Settings"):
                 sid = ss_get("gs_spreadsheet_id", "")
                 sid = st.text_input("Spreadsheet ID", value=sid, key="ws_push_sid") or sid
@@ -1058,7 +1081,7 @@ with tab2:
                     if not sid or not target_tab:
                         st.error("Missing Spreadsheet ID or target tab.")
                     else:
-                        df_aug, stats, dups_df = build_raw_plus_v627(df_ws, overrides_current, "session" if include_scope.endswith("session") else "all", edited_keys_for_sheet)
+                        df_aug, stats, dups_df = build_raw_plus_v628(df_ws, overrides_current, "session" if include_scope.endswith("session") else "all", edited_keys_for_sheet)
                         st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, In-place filled: **{stats['inplace_filled']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
                         st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{target_tab}**.")
                         if show_dups and not dups_df.empty:
@@ -1098,6 +1121,115 @@ with tab2:
                                 saved[sheet_ws]["tab"] = target_tab
                                 ss_set("saved_targets", saved)
                                 st.success(f"Pushed {len(df_aug)} rows to '{target_tab}'.")
+
+            # ========== ✅ Validation rules ==========
+            with st.expander("✅ Validation rules & health checks"):
+                overrides_all = ss_get(override_root, {})
+                overrides_current = overrides_all.get(sheet_ws, {})
+                store = infer_branch_options_with_overrides(df_ws, overrides_current)
+
+                # Build label graph for cycles & orphans
+                parent_labels = set()
+                child_labels = set()
+                edges: Dict[str, Set[str]] = {}
+
+                for key, children in store.items():
+                    if "|" not in key: continue
+                    lvl_s, path = key.split("|", 1)
+                    try: L = int(lvl_s[1:])
+                    except: continue
+                    parent_tuple = tuple([] if path=="<ROOT>" else path.split(">"))
+                    if parent_tuple:
+                        plabel = parent_tuple[-1]
+                        parent_labels.add(plabel)
+                    else:
+                        plabel = "__ROOT__"
+                    for c in [normalize_text(x) for x in children if normalize_text(x)!=""]:
+                        child_labels.add(c)
+                        edges.setdefault(plabel, set()).add(c)
+
+                # Orphans: appears as child but never as a parent
+                orphans = sorted(list(child_labels - parent_labels))
+                if orphans:
+                    st.warning(f"Orphan labels (appear as child, never as parent): {len(orphans)}")
+                    st.write(orphans[:200])
+                    csv_orphans = pd.DataFrame({"Orphan Label": orphans}).to_csv(index=False).encode("utf-8")
+                    st.download_button("Download orphans (CSV)", data=csv_orphans, file_name=f"{sheet_ws}_orphans.csv", mime="text/csv")
+                else:
+                    st.success("No orphan labels detected. 👍")
+
+                # Cycles: DFS on label graph
+                def find_cycles(graph: Dict[str, Set[str]], limit: int = 10) -> List[List[str]]:
+                    cycles = []
+                    temp_mark = set()
+                    perm_mark = set()
+                    stack: List[str] = []
+
+                    def visit(n: str):
+                        if len(cycles) >= limit:  # cap
+                            return
+                        if n in perm_mark:
+                            return
+                        if n in temp_mark:
+                            # Found a cycle; capture from first occurrence
+                            if n in stack:
+                                idx = stack.index(n)
+                                cycles.append(stack[idx:] + [n])
+                            return
+                        temp_mark.add(n)
+                        stack.append(n)
+                        for m in graph.get(n, []):
+                            visit(m)
+                            if len(cycles) >= limit:
+                                break
+                        stack.pop()
+                        temp_mark.remove(n)
+                        perm_mark.add(n)
+
+                    for node in list(graph.keys()):
+                        if len(cycles) >= limit:
+                            break
+                        if node not in perm_mark:
+                            visit(node)
+                    return cycles
+
+                cycles = find_cycles(edges, limit=10)
+                if cycles:
+                    st.error(f"Potential cycles detected: {len(cycles)} (showing up to 10)")
+                    for cyc in cycles:
+                        # hide the __ROOT__ helper node if present
+                        cyc_disp = [("Root of tree" if n=="__ROOT__" else n) for n in cyc]
+                        st.write(" → ".join(cyc_disp))
+                else:
+                    st.success("No cycles detected in label graph. 👍")
+
+                # Missing Red Flag coverage: every parent should have at least one flagged child
+                quality_map = ss_get("symptom_quality", {})
+                missing_rf = []
+                for key, children in store.items():
+                    if "|" not in key: continue
+                    lvl_s, path = key.split("|", 1)
+                    try: L = int(lvl_s[1:])
+                    except: continue
+                    if L >= MAX_LEVELS:  # Node 5 has no next-level children
+                        continue
+                    non_empty_children = [normalize_text(c) for c in children if normalize_text(c)!=""]
+                    if not non_empty_children:
+                        continue
+                    flagged = any(quality_map.get(c, "Normal") == "Red Flag" for c in non_empty_children)
+                    if not flagged:
+                        parent_tuple = tuple([] if path=="<ROOT>" else path.split(">"))
+                        missing_rf.append((L, display_parent(parent_tuple), non_empty_children))
+                if missing_rf:
+                    st.warning(f"Parents without any Red-Flag child: {len(missing_rf)}")
+                    df_mrf = pd.DataFrame([{"Level": f"Node {L}", "Parent": p, "Children": ", ".join(ch)} for (L,p,ch) in missing_rf])
+                    st.dataframe(df_mrf, use_container_width=True)
+                    st.download_button("Download missing Red-Flag coverage (CSV)",
+                                       data=df_mrf.to_csv(index=False).encode("utf-8"),
+                                       file_name=f"{sheet_ws}_missing_redflag_coverage.csv",
+                                       mime="text/csv")
+                else:
+                    st.success("All parents have at least one Red-Flag child. 👍")
 
 # ---------- Interactive completion tab ----------
 with tab3:
@@ -1159,7 +1291,7 @@ with tab3:
                             overrides_all = ss_get(override_root, {})
                             overrides_sheet = overrides_all.get(sheet_cur, {})
                             edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_cur, []))
-                            df_aug, stats, _ = build_raw_plus_v627(wb[sheet_cur], overrides_sheet, include_scope="all", edited_keys_for_sheet=edited_keys_for_sheet)
+                            df_aug, stats, _ = build_raw_plus_v628(wb[sheet_cur], overrides_sheet, include_scope="all", edited_keys_for_sheet=edited_keys_for_sheet)
                             st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{sheet_cur}**.")
                             ok = push_to_google_sheets(sid, sheet_cur, df_aug)
                             if ok:
@@ -1177,11 +1309,11 @@ with tab3:
                                 st.success("Changes pushed to Google Sheets (Raw+).")
             else: st.info("Click 'Pick a random incomplete row' to begin.")
 
-# ---------- Symptoms browser & editor (CLEANED: no push settings / overrides import / data quality here) ----------
+# ---------- Symptoms browser & editor ----------
 with tab4:
     st.subheader("Symptoms — browse, check consistency, edit child branches, auto-cascade, export PDF")
 
-    # Editing context is now selected in Google Sheets Mode
+    # Editing context is selected in Google Sheets Mode
     ctx = ss_get("work_context", {})
     if not ctx:
         st.info("Go to **Google Sheets Mode** to choose the data source & sheet. Then return here to edit symptoms.")
@@ -1207,7 +1339,7 @@ with tab4:
         st.info("Sheet is empty or headers mismatch.")
         st.stop()
 
-    # Undo stack controls (kept)
+    # Undo stack controls
     if st.button("↩️ Undo last branch edit (session)"):
         stack = ss_get("undo_stack", [])
         if not stack:
@@ -1217,11 +1349,9 @@ with tab4:
             ss_set("undo_stack", stack)
             context = last.get("context")
             if context in ["symptoms","workspace","upload"]:
-                # restore overrides
                 overrides_all = ss_get(last.get("override_root","branch_overrides_upload"), {})
                 overrides_all[last["sheet"]] = last["overrides_sheet_before"]
                 ss_set(last.get("override_root","branch_overrides_upload"), overrides_all)
-                # restore df if available (only for upload workbook editing)
                 if last.get("df_before") is not None and source_code == "upload":
                     src = ss_get("upload_workbook", {})
                     if last["sheet"] in src:
@@ -1231,7 +1361,6 @@ with tab4:
             else:
                 st.info("Last undo snapshot not applicable here.")
 
-    # Build store + parents
     overrides_current = ss_get(override_root, {}).get(sheet, {})
     store = infer_branch_options_with_overrides(df, overrides_current)
 
@@ -1274,7 +1403,7 @@ with tab4:
             for pt in sorted(parents_by_level.get(level, set())):
                 key = level_key_tuple(level, pt)
                 if len([x for x in store.get(key, []) if normalize_text(x)!=""]) == 0:
-                    st.session_state["sym_search_pending2"] = (" > ".join(pt) or "<ROOT>").lower()
+                    st.session_state["sym_search_pending2"] = (display_parent(pt)).lower()
                     st.rerun()
     with top_cols[2]:
         if st.button("Next Symptom left out"):
@@ -1282,7 +1411,7 @@ with tab4:
                 key = level_key_tuple(level, pt)
                 n = len([x for x in store.get(key, []) if normalize_text(x)!=""])
                 if 1 <= n < 5:
-                    st.session_state["sym_search_pending2"] = (" > ".join(pt) or "<ROOT>").lower()
+                    st.session_state["sym_search_pending2"] = (display_parent(pt)).lower()
                     st.rerun()
     with top_cols[3]:
         compact = st.checkbox("Compact mode", value=True, key="sym_compact2")
@@ -1293,7 +1422,7 @@ with tab4:
     entries = []
     label_childsets: Dict[Tuple[int,str], set] = {}
     for parent_tuple in sorted(parents_by_level.get(level, set())):
-        parent_text = " > ".join(parent_tuple)
+        parent_text = display_parent(parent_tuple)
         if search and (search not in parent_text.lower()):
             continue
         key = level_key_tuple(level, parent_tuple)
@@ -1304,7 +1433,7 @@ with tab4:
         elif n == 5: status = "OK"
         else: status = "Overspecified"
         entries.append((parent_tuple, children, status))
-        last_label = parent_tuple[-1] if parent_tuple else "<ROOT>"
+        last_label = parent_tuple[-1] if parent_tuple else "Root of tree"
         label_childsets.setdefault((level, last_label), set()).add(tuple(sorted([c for c in children])))
 
     inconsistent_labels = {k for k, v in label_childsets.items() if len(v) > 1}
@@ -1330,7 +1459,8 @@ with tab4:
     # Render entries with inline editing + auto-cascade
     for parent_tuple, children, status in entries:
         keyname = level_key_tuple(level, parent_tuple)
-        subtitle = f"{' > '.join(parent_tuple) or '<ROOT>'} — {status} {'⚠️' if (level, (parent_tuple[-1] if parent_tuple else '<ROOT>')) in inconsistent_labels else ''}"
+        thumb = " 👍" if has_thumb("parent_keys", keyname) else ""
+        subtitle = f"{display_parent(parent_tuple)} — {status}{thumb} {'⚠️' if (level, (parent_tuple[-1] if parent_tuple else 'Root of tree')) in inconsistent_labels else ''}"
 
         with st.expander(subtitle):
             selected_vals = []
@@ -1379,7 +1509,7 @@ with tab4:
                 stack = ss_get("undo_stack", [])
                 stack.append({
                     "context": "symptoms",
-                    "label": f"Save parent {(' > '.join(parent_tuple) or '<ROOT>')} (L{level})",
+                    "label": f"Save parent {display_parent(parent_tuple)} (L{level})",
                     "override_root": override_root,
                     "sheet": sheet,
                     "level": level,
@@ -1402,9 +1532,10 @@ with tab4:
                     ss_set("upload_workbook", wb)
                 else:
                     ss_set("gs_workbook", wb)
-                st.success(f"Saved and auto-cascaded: added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
+                add_thumb("parent_keys", keyname)
+                st.success(f"Saved and auto-cascaded: added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors. 👍")
 
-    # ---------- Conflicts Inspector ----------
+    # ---------- Conflicts Inspector (UPGRADED) ----------
     with st.expander("🧯 Conflicts Inspector (same parent label → different child sets)"):
         label_to_sets: Dict[str, List[Tuple[int, Tuple[str,...], Tuple[str,...]]]] = {}
         for key, children in store.items():
@@ -1425,62 +1556,72 @@ with tab4:
                 conflicts.append((label, variants, entries_list))
 
         if not conflicts:
-            st.success("No conflicts detected 🎉")
+            st.success("No conflicts detected — Root of tree: OK (no conflicts) 🎉")
         else:
             st.warning(f"Found {len(conflicts)} conflicting labels.")
-            resolve_ops = {}
+            overrides_all = ss_get(override_root, {})
+            overrides_sheet = overrides_all.get(sheet, {}).copy()
+
             for i, (label, variants, entries_list) in enumerate(conflicts, start=1):
-                with st.expander(f"{i}. '{label}' has {len(variants)} different child sets"):
-                    st.write("Variants:")
+                thumb = " 👍" if has_thumb("conflict_labels", label) else ""
+                with st.expander(f"{i}. '{label}' has {len(variants)} different child sets{thumb}"):
+                    st.write("Variants (child sets):")
                     for j, var in enumerate(variants, start=1):
                         st.code(f"{j}. {list(var)}")
-                    union_children = []
+
+                    # Build full set of unique children across variants
+                    unique_children = []
                     seen = set()
                     for var in variants:
                         for c in var:
                             if c not in seen and c!="":
-                                union_children.append(c); seen.add(c)
-                    union_children = enforce_k_five(union_children)
-                    sel = st.multiselect("Resolve to EXACTLY 5 children (choose up to 5)", union_children, default=union_children[:5], key=f"ci2_{label}")
-                    sel = enforce_k_five(sel)
-                    st.caption(f"Will apply to all occurrences of parent label '{label}' across levels (affecting next-level children).")
-                    resolve_ops[label] = sel
+                                unique_children.append(c); seen.add(c)
 
-            if st.button("Apply resolutions across this sheet", key="ci2_apply"):
-                overrides_all = ss_get(override_root, {})
-                overrides_sheet = overrides_all.get(sheet, {}).copy()
-                stack = ss_get("undo_stack", [])
-                stack.append({
-                    "context": "symptoms",
-                    "label": "Conflicts resolution",
-                    "override_root": override_root,
-                    "sheet": sheet,
-                    "overrides_sheet_before": overrides_all.get(sheet, {}).copy(),
-                    "df_before": df.copy() if source_code=="upload" else None
-                })
-                ss_set("undo_stack", stack)
-                for key in list(store.keys()):
-                    if "|" not in key: continue
-                    lvl_s, path = key.split("|", 1)
-                    if path == "<ROOT>": continue
-                    parent_tuple = tuple(path.split(">"))
-                    label = parent_tuple[-1]
-                    if label in resolve_ops:
-                        overrides_sheet[key] = enforce_k_five(resolve_ops[label])
-                        mark_session_edit(sheet, key)
-                overrides_all[sheet] = overrides_sheet
-                ss_set(override_root, overrides_all)
+                    st.caption("Choose EXACTLY 5 children to keep for ALL parents with this label.")
+                    cols = st.columns(5)
+                    # default: first 5 selected
+                    defaults = set(unique_children[:5])
+                    chosen_map = {}
+                    for idx, child in enumerate(unique_children):
+                        col = cols[idx % 5]
+                        chosen_map[child] = col.checkbox(child, value=(child in defaults), key=f"ci2_ck_{label}_{idx}")
 
-                store2 = infer_branch_options_with_overrides(df, overrides_sheet)
-                label_map2 = build_label_child_map(store2)
-                vms = sorted(set(df["Vital Measurement"].map(normalize_text).replace("", np.nan).dropna().unique().tolist()))
-                df_new, tstats = cascade_anchor_reuse_full(df, store2, label_map2, vms, [tuple()])
-                wb[sheet] = df_new
-                if source_code == "upload":
-                    ss_set("upload_workbook", wb)
-                else:
-                    ss_set("gs_workbook", wb)
-                st.success(f"Applied resolutions. Cascaded: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors.")
+                    # Build chosen set (max 5)
+                    chosen = [c for c, val in chosen_map.items() if val]
+                    if len(chosen) > 5:
+                        st.error(f"Selected {len(chosen)} children — please select **at most 5**.")
+                    else:
+                        st.info(f"Selected **{len(chosen)} / 5** children.")
+
+                    # Save per-conflict child set
+                    if st.button(f"Save child set for '{label}'", key=f"ci2_save_{label}"):
+                        if len(chosen) != 5:
+                            st.error("Please select exactly 5 children before saving.")
+                        else:
+                            # Apply to all occurrences of this label across levels
+                            for key in list(store.keys()):
+                                if "|" not in key: continue
+                                lvl_s, path = key.split("|", 1)
+                                if path == "<ROOT>": continue
+                                parent_tuple = tuple(path.split(">"))
+                                if parent_tuple and parent_tuple[-1] == label:
+                                    overrides_sheet[key] = enforce_k_five(chosen)
+                                    mark_session_edit(sheet, key)
+                            overrides_all[sheet] = overrides_sheet
+                            ss_set(override_root, overrides_all)
+
+                            # Cascade
+                            store2 = infer_branch_options_with_overrides(df, overrides_sheet)
+                            label_map2 = build_label_child_map(store2)
+                            vms = sorted(set(df["Vital Measurement"].map(normalize_text).replace("", np.nan).dropna().unique().tolist()))
+                            df_new, tstats = cascade_anchor_reuse_full(df, store2, label_map2, vms, [tuple()])
+                            wb[sheet] = df_new
+                            if source_code == "upload":
+                                ss_set("upload_workbook", wb)
+                            else:
+                                ss_set("gs_workbook", wb)
+                            add_thumb("conflict_labels", label)
+                            st.success(f"Saved resolution for '{label}'. Cascaded: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors. 👍")
 
 # ---------- Push Log ----------
 with tab5:
@@ -1546,7 +1687,7 @@ with tab6:
                 })
             dict_df = pd.DataFrame(rows).sort_values(["Symptom"]).reset_index(drop=True)
 
-            # Filters & Search
+            # Filters & Search (with highlighting)
             with st.expander("Filters / Search", expanded=True):
                 q = st.text_input("Search Symptom (substring, case-insensitive)", key="dict_search").strip().lower()
                 levels_all = sorted({i for s in levels_map.values() for i in s})
@@ -1565,7 +1706,26 @@ with tab6:
             if min_count > 0:
                 filtered = filtered[filtered["Count"] >= min_count]
 
-            st.markdown("#### Dictionary (editable Red Flag column)")
+            # ---- Highlight view (read-only) ----
+            def highlight_term(text: str, term: str) -> str:
+                if not term:
+                    return text
+                try:
+                    # Simple case-insensitive highlight
+                    import re
+                    return re.sub(f"({re.escape(term)})", r"<mark><b>\1</b></mark>", text, flags=re.IGNORECASE)
+                except Exception:
+                    return text
+
+            if q:
+                view_df = filtered.copy()
+                view_df["Symptom"] = view_df["Symptom"].map(lambda s: highlight_term(str(s), q))
+                st.markdown(view_df.to_html(escape=False, index=False), unsafe_allow_html=True)
+            else:
+                st.dataframe(filtered, use_container_width=True)
+
+            # ---- Editable grid for Red Flag toggles ----
+            st.markdown("#### Edit Red Flags")
             edited = st.data_editor(
                 filtered,
                 use_container_width=True,
