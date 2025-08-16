@@ -1,4 +1,4 @@
-# streamlit_app_upload.py — Version 6.2.4
+# streamlit_app_upload.py — Version 6.2.5
 
 import io
 import random
@@ -9,7 +9,7 @@ import streamlit as st
 from datetime import datetime
 
 # ============ VERSION / CONFIG ============
-APP_VERSION = "v6.2.4"
+APP_VERSION = "v6.2.5"
 CANON_HEADERS = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]
 LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
 MAX_LEVELS = 5
@@ -61,7 +61,7 @@ def infer_branch_options(df: pd.DataFrame) -> Dict[str, List[str]]:
         parent_to_children: Dict[Tuple[str, ...], List[str]] = {}
         for _, row in df.iterrows():
             child_col = LEVEL_COLS[level-1]
-            if child_col not in df.columns: 
+            if child_col not in df.columns:
                 continue
             child = normalize_text(row[child_col])
             if child == "":
@@ -94,6 +94,22 @@ def enforce_k_five(opts: List[str]) -> List[str]:
     elif len(clean) < 5:
         clean = clean + [""]*(5-len(clean))
     return clean
+
+# ===== Utilities for keying rows to detect duplicates & depth =====
+def _row_key_from_like(rowlike) -> Tuple[str, ...]:
+    return tuple(normalize_text(rowlike.get(c, "")) for c in ["Vital Measurement"] + LEVEL_COLS)
+
+def make_keyset(df: pd.DataFrame) -> Set[Tuple[str, ...]]:
+    ks = set()
+    for _, r in df.iterrows():
+        ks.add(_row_key_from_like(r))
+    return ks
+
+def compute_branch_depth(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    nodes = df[LEVEL_COLS].applymap(normalize_text)
+    return int(nodes.apply(lambda r: sum(1 for v in r if v != ""), axis=1).max())
 
 # ============ Google Sheets helpers (RESIZE BEFORE UPDATE) ============
 def push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFrame) -> bool:
@@ -160,7 +176,7 @@ def backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
         st.error(f"Backup failed: {e}")
         return None
 
-# ============ Expansion primitives (anchor-reuse, deep cascade) ============
+# ============ Expansion primitives (anchor-reuse, deep cascade, continuity) ============
 def _rows_match_parent(df: pd.DataFrame, vm: str, parent: Tuple[str,...], level: int) -> pd.DataFrame:
     mask = (df["Vital Measurement"].map(normalize_text) == vm)
     for i, val in enumerate(parent, 1):
@@ -179,7 +195,7 @@ def _find_anchor_index(df: pd.DataFrame, vm: str, parent: Tuple[str,...], level:
     sub_idx = _rows_match_parent(df, vm, parent, level).index.tolist()
     for ix in sub_idx:
         if normalize_text(df.at[ix, target_col]) == "":
-            # deeper nodes should be blank for a true anchor, but we’ll be lenient
+            # lenient anchor: accept if node L is blank (deeper nodes can be anything)
             return ix
     return None
 
@@ -266,6 +282,7 @@ def cascade_anchor_reuse_full(
     Deep cascade to Node 5 using anchor-reuse at EACH level.
     - Completes partial parents (adds rows for any defined missing options).
     - Proceeds deeper as long as child options are defined (non-empty) in the store.
+    - Continuity fix: if children exist anywhere in store for a parent label, they propagate across all VMs in scope.
     """
     total = {"new_rows":0, "inplace_filled":0}
     stack: List[Tuple[str,...]] = list(start_parents)
@@ -278,7 +295,6 @@ def cascade_anchor_reuse_full(
 
         children_defined = _children_from_store(store, L, parent)
         if not children_defined:
-            # nothing defined for next node; stop at this parent
             continue
 
         next_child_parents_all_vms: Set[Tuple[str,...]] = set()
@@ -293,21 +309,21 @@ def cascade_anchor_reuse_full(
         # Push deeper for each child that has next-level options defined (if any)
         for cp in sorted(next_child_parents_all_vms):
             next_level = len(cp) + 1
-            if next_level <= MAX_LEVELS:
-                if _children_from_store(store, next_level, cp):
-                    stack.append(cp)
+            if next_level <= MAX_LEVELS and _children_from_store(store, next_level, cp):
+                stack.append(cp)
 
     return df, total
 
-# ============ Raw+ builder (v6.2.4 – deep cascade anchor-reuse, universal) ============
-def build_raw_plus_v624(
+# ============ Raw+ builder (v6.2.5) ============
+def build_raw_plus_v625(
     df: pd.DataFrame,
     overrides: Dict[str, List[str]],
     include_scope: str,
     edited_keys_for_sheet: Set[str],
-) -> Tuple[pd.DataFrame, Dict[str,int]]:
+) -> Tuple[pd.DataFrame, Dict[str,int], pd.DataFrame]:
     """
     Always deep-cascade with anchor-reuse for selected scope.
+    Returns (df_aug, stats, duplicates_df_preview)
     """
     store = infer_branch_options_with_overrides(df, overrides)
     vms = sorted(set(df["Vital Measurement"].map(normalize_text).replace("", np.nan).dropna().unique().tolist()))
@@ -318,20 +334,24 @@ def build_raw_plus_v624(
     parent_keys: List[Tuple[int,Tuple[str,...]]] = []
     if include_scope == "session" and edited_keys_for_sheet:
         for keyname in edited_keys_for_sheet:
-            if "|" not in keyname: 
+            if "|" not in keyname:
                 continue
             lvl_s, path = keyname.split("|", 1)
-            try: L = int(lvl_s[1:])
-            except: continue
+            try:
+                L = int(lvl_s[1:])
+            except:
+                continue
             parent = tuple([] if path == "<ROOT>" else path.split(">"))
             parent_keys.append((L, parent))
     else:
         for key in list(store.keys()):
-            if "|" not in key: 
+            if "|" not in key:
                 continue
             lvl_s, path = key.split("|", 1)
-            try: L = int(lvl_s[1:])
-            except: continue
+            try:
+                L = int(lvl_s[1:])
+            except:
+                continue
             parent = tuple([] if path == "<ROOT>" else path.split(">"))
             parent_keys.append((L, parent))
 
@@ -342,18 +362,19 @@ def build_raw_plus_v624(
     stats_total["generated"] += (len(df_aug) - df_before) + stx["inplace_filled"]
 
     # Compute new_added / duplicates_skipped against original df
-    def make_key(rowlike) -> Tuple[str,...]:
-        return tuple(normalize_text(rowlike.get(c, "")) for c in ["Vital Measurement"] + LEVEL_COLS)
-    original_keys = set()
-    for _, r in df.iterrows():
-        original_keys.add(make_key(r))
-    now_keys = set()
-    for _, r in df_aug.iterrows():
-        now_keys.add(make_key(r))
+    original_keys = make_keyset(df)
+    now_keys = make_keyset(df_aug)
     stats_total["new_added"] = len(now_keys - original_keys)
     stats_total["duplicates_skipped"] = max(0, stats_total["generated"] - stats_total["new_added"])
     stats_total["final_total"] = len(df_aug)
-    return df_aug, stats_total
+
+    # Build duplicates preview DF
+    dup_mask = []
+    for _, r in df_aug.iterrows():
+        dup_mask.append(_row_key_from_like(r) in original_keys)
+    duplicates_df = df_aug[pd.Series(dup_mask, index=df_aug.index)].copy()
+
+    return df_aug, stats_total, duplicates_df
 
 # ======== Progress / depth metrics and badge ========
 def compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
@@ -382,6 +403,7 @@ def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
 def progress_badge_html(df: pd.DataFrame) -> str:
     ok_p, total_p = compute_parent_depth_score(df)
     ok_r, total_r = compute_row_path_score(df)
+    depth = compute_branch_depth(df)
     pct_p = 0 if total_p==0 else int(round(100*ok_p/total_p))
     pct_r = 0 if total_r==0 else int(round(100*ok_r/total_r))
     bar_css = """
@@ -394,6 +416,7 @@ def progress_badge_html(df: pd.DataFrame) -> str:
       .badge-top { display:flex; justify-content:space-between; }
       .muted { color:#334155; }
       .strong { font-weight:600; }
+      .depth { font-weight:600; color:#0e7490; }
     </style>
     """
     html = f"""
@@ -406,6 +429,9 @@ def progress_badge_html(df: pd.DataFrame) -> str:
       <div class='badge-row'>
         <div class='badge-top'><span class='muted'>Rows full path</span><span class='strong'>{ok_r}/{total_r}</span></div>
         <div class='bar'><div class='fill2' style='width:{pct_r}%;'></div></div>
+      </div>
+      <div class='badge-row'>
+        <span class='muted'>Branch depth</span> <span class='depth'>{depth}/{MAX_LEVELS}</span>
       </div>
     </div>
     """
@@ -568,15 +594,28 @@ with tab1:
             st.caption(f"Showing all {total_rows} rows.")
             st.dataframe(df_in, use_container_width=True)
         else:
-            start_1based = st.number_input(
-                "Start row (1-based)",
-                min_value=1,
-                max_value=max(1, total_rows-49),
-                value=1,
-                step=50,
-                help="Pick where to start the 50-row preview."
-            )
-            start_idx = int(start_1based) - 1
+            # Persisted start index with Next/Previous buttons
+            state_key = f"preview_start_{sheet_name}"
+            start_idx = int(ss_get(state_key, 0))
+            # Controls
+            cprev, cnum, cnext = st.columns([1,2,1])
+            with cprev:
+                if st.button("◀ Previous 50"):
+                    start_idx = max(0, start_idx - 50)
+            with cnum:
+                start_1based = st.number_input(
+                    "Start row (1-based)",
+                    min_value=1,
+                    max_value=max(1, total_rows-49),
+                    value=start_idx+1,
+                    step=50,
+                    help="Pick where to start the 50-row preview."
+                )
+                start_idx = int(start_1based) - 1
+            with cnext:
+                if st.button("Next 50 ▶"):
+                    start_idx = min(max(0, total_rows - 50), start_idx + 50)
+            ss_set(state_key, start_idx)
             end_idx = min(start_idx + 50, total_rows)
             st.caption(f"Showing rows **{start_idx+1}–{end_idx}** of **{total_rows}**.")
             st.dataframe(df_in.iloc[start_idx:end_idx], use_container_width=True)
@@ -815,6 +854,7 @@ with tab1:
                         stack = ss_get("undo_stack", [])
                         stack.append({
                             "context": "upload",
+                            "label": f"Save 5 (missing) L{level}",
                             "sheet": sheet_name,
                             "overrides_sheet_before": overrides_upload.copy(),
                             "df_before": df_in.copy()
@@ -853,6 +893,7 @@ with tab1:
                         stack = ss_get("undo_stack", [])
                         stack.append({
                             "context": "upload",
+                            "label": f"Save 5 (incomplete) L{level}",
                             "sheet": sheet_name,
                             "overrides_sheet_before": overrides_upload.copy(),
                             "df_before": df_in.copy()
@@ -879,6 +920,7 @@ with tab1:
                         stack = ss_get("undo_stack", [])
                         stack.append({
                             "context": "upload",
+                            "label": f"Save 5 (overspec) L{level}",
                             "sheet": sheet_name,
                             "overrides_sheet_before": overrides_upload.copy(),
                             "df_before": df_in.copy()
@@ -904,6 +946,7 @@ with tab1:
         up_confirm = st.checkbox("I confirm I want to overwrite the target tab.", key="up_confirm")
         up_backup = st.checkbox("Create a backup tab before overwriting", value=True, key="up_backup")
         up_dry = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="up_dry")
+        show_dups = st.checkbox("Show rows that already exist (duplicates that will be skipped)", value=False, key="up_show_dups")
 
         edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_name, []))
 
@@ -915,10 +958,16 @@ with tab1:
             else:
                 merged_overrides = {**overrides_upload, **user_fixes}
                 scope_flag = "session" if include_scope_main.endswith("session") else "all"
-                df_aug, stats = build_raw_plus_v624(df_in, merged_overrides, scope_flag, edited_keys_for_sheet)
+                df_aug, stats, dups_df = build_raw_plus_v625(df_in, merged_overrides, scope_flag, edited_keys_for_sheet)
 
                 st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, In-place filled: **{stats['inplace_filled']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
                 st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{up_target_tab}**.")
+
+                if show_dups and not dups_df.empty:
+                    st.warning(f"Previewing {len(dups_df)} rows that already exist and will be treated as duplicates.")
+                    st.dataframe(dups_df.head(200), use_container_width=True)
+                    csvd = dups_df.to_csv(index=False).encode("utf-8")
+                    st.download_button("Download duplicates (CSV)", data=csvd, file_name="duplicates_preview.csv", mime="text/csv")
 
                 if up_dry:
                     st.success("Dry-run complete. No changes written to Google Sheets.")
@@ -1053,7 +1102,7 @@ with tab3:
                             overrides_all = ss_get(override_root, {})
                             overrides_sheet = overrides_all.get(sheet_cur, {})
                             edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_cur, []))
-                            df_aug, stats = build_raw_plus_v624(wb[sheet_cur], overrides_sheet, include_scope="all", edited_keys_for_sheet=edited_keys_for_sheet)
+                            df_aug, stats, dups_df = build_raw_plus_v625(wb[sheet_cur], overrides_sheet, include_scope="all", edited_keys_for_sheet=edited_keys_for_sheet)
                             st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{sheet_cur}**.")
                             ok = push_to_google_sheets(sid, sheet_cur, df_aug)
                             if ok:
@@ -1085,6 +1134,7 @@ with tab4:
         st.caption("Deep cascade with anchor-reuse is the default and only strategy.")
         push_backup = st.checkbox("Create a backup tab before overwrite", value=True, key="sym_push_backup")
         dry_run_sym = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="sym_dry_run")
+        show_dups_sym = st.checkbox("Show duplicates preview after build", value=False, key="sym_show_dups")
 
     # Undo stack controls
     if st.button("↩️ Undo last branch edit (session)"):
@@ -1342,6 +1392,7 @@ with tab4:
                     stack = ss_get("undo_stack", [])
                     stack.append({
                         "context": "symptoms",
+                        "label": f"Save parent {(' > '.join(parent_tuple) or '<ROOT>')} (L{level})",
                         "override_root": override_root,
                         "sheet": sheet,
                         "level": level,
@@ -1364,6 +1415,7 @@ with tab4:
                     else:
                         ss_set("gs_workbook", wb)
                     st.success(f"Saved and auto-cascaded: added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
+                    st.caption("Tip: use Bulk Push below to write to Google Sheets.")
 
         st.markdown("---")
         st.markdown("#### Bulk Push Raw+ for this sheet")
@@ -1382,12 +1434,18 @@ with tab4:
                 if not sid or not target_tab:
                     st.error("Missing Spreadsheet ID or target tab.")
                 else:
-                    df_aug, stats = build_raw_plus_v624(df, overrides_current, scope_flag, edited_keys_for_sheet)
+                    df_aug, stats, dups_df = build_raw_plus_v625(df, overrides_current, scope_flag, edited_keys_for_sheet)
                     st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, In-place filled: **{stats['inplace_filled']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
                     st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{target_tab}**.")
                     if dry_run_sym:
                         st.success("Dry-run complete. No changes written to Google Sheets.")
                         st.dataframe(df_aug.head(50), use_container_width=True)
+                        buffer = io.BytesIO()
+                        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                            df_aug.to_excel(writer, index=False, sheet_name=sheet[:31] or "Sheet1")
+                        st.download_button("Download augmented (Raw+) workbook", data=buffer.getvalue(),
+                                           file_name="decision_tree_raw_plus.xlsx",
+                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                     else:
                         if ss_get("sym_push_backup", True) and push_backup:
                             backup_name = backup_sheet_copy(sid, target_tab)
@@ -1411,7 +1469,13 @@ with tab4:
                             ss_set("saved_targets", saved)
                             st.success(f"Pushed {len(df_aug)} rows to '{target_tab}'.")
         with colB:
-            st.caption("Raw+ always uses deep cascade with anchor-reuse in v6.2.4.")
+            st.caption("Raw+ always uses deep cascade with anchor-reuse in v6.2.5.")
+            if show_dups_sym and 'dups_df' in locals():
+                if not dups_df.empty:
+                    st.warning(f"Previewing {len(dups_df)} duplicate rows (already existed).")
+                    st.dataframe(dups_df.head(200), use_container_width=True)
+                    csvd = dups_df.to_csv(index=False).encode("utf-8")
+                    st.download_button("Download duplicates (CSV)", data=csvd, file_name="duplicates_preview.csv", mime="text/csv")
 
 # ---------- Push Log ----------
 with tab5:
@@ -1467,39 +1531,62 @@ with tab6:
 
             # Quality store (in-session)
             quality_map = ss_get("symptom_quality", {})  # {symptom: "Red Flag"|"Normal"}
-            # Build table
+
+            # Construct table
             rows = []
             for symptom, cnt in counts.items():
                 levels_list = sorted(list(levels_map.get(symptom, set())))
-                quality = quality_map.get(symptom, "Normal")
                 rows.append({
                     "Symptom": symptom,
                     "Count": cnt,
                     "Levels": ", ".join([f"Node {i}" for i in levels_list]),
-                    "Quality": quality
+                    "Red Flag": (quality_map.get(symptom, "Normal") == "Red Flag")
                 })
             dict_df = pd.DataFrame(rows).sort_values(["Symptom"]).reset_index(drop=True)
 
-            # Search and Red Flag tagging
-            q = st.text_input("Search Symptom (optional)", key="dict_search").strip().lower()
+            # --- Filters & Search ---
+            with st.expander("Filters / Search", expanded=True):
+                q = st.text_input("Search Symptom (substring, case-insensitive)", key="dict_search").strip().lower()
+                levels_all = sorted({i for s in levels_map.values() for i in s})
+                level_filter = st.multiselect("Filter by Levels (optional)", [f"Node {i}" for i in levels_all], default=[], key="dict_level_filter")
+                red_only = st.checkbox("Show only Red Flags", value=False, key="dict_red_only")
+                min_count = st.number_input("Min Count", min_value=0, max_value=int(dict_df["Count"].max() if not dict_df.empty else 0), value=0, step=1)
+
+            filtered = dict_df.copy()
             if q:
-                dict_df = dict_df[dict_df["Symptom"].str.lower().str.contains(q)]
+                filtered = filtered[filtered["Symptom"].str.lower().str.contains(q)]
+            if level_filter:
+                mask = filtered["Levels"].apply(lambda s: any(lv in s for lv in level_filter))
+                filtered = filtered[mask]
+            if red_only:
+                filtered = filtered[filtered["Red Flag"] == True]
+            if min_count > 0:
+                filtered = filtered[filtered["Count"] >= min_count]
 
-            st.dataframe(dict_df, use_container_width=True, height=480)
+            st.markdown("#### Dictionary (editable Red Flag column)")
+            edited = st.data_editor(
+                filtered,
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config={
+                    "Symptom": st.column_config.TextColumn(disabled=True),
+                    "Count": st.column_config.NumberColumn(disabled=True),
+                    "Levels": st.column_config.TextColumn(disabled=True),
+                    "Red Flag": st.column_config.CheckboxColumn(help="Toggle to mark/unmark this symptom as a Red Flag")
+                },
+                hide_index=True,
+                key="dict_editor"
+            )
 
-            st.markdown("**Tag Red Flags**")
-            all_symptoms_sorted = sorted(counts.keys())
-            red_flags_now = [s for s,qv in quality_map.items() if qv=="Red Flag"]
-            red_flags_sel = st.multiselect("Select symptoms to mark as Red Flag", all_symptoms_sorted, default=red_flags_now, key="dict_redflags")
+            # Persist Red Flag changes back to session map
+            if st.button("💾 Save Red Flag changes"):
+                # Build a unified edited view to update entire set shown (only for symptoms present in the editor)
+                edited_map = quality_map.copy()
+                for _, row in edited.iterrows():
+                    edited_map[row["Symptom"]] = "Red Flag" if bool(row["Red Flag"]) else "Normal"
+                ss_set("symptom_quality", edited_map)
+                st.success("Symptom Red Flags saved for this session.")
 
-            # Save quality map
-            if st.button("Save Symptom Quality"):
-                new_map = {}
-                for s in all_symptoms_sorted:
-                    new_map[s] = "Red Flag" if s in red_flags_sel else "Normal"
-                ss_set("symptom_quality", new_map)
-                st.success("Symptom Quality saved for this session.")
-
-            # Download CSV
-            csv = dict_df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download dictionary (CSV)", data=csv, file_name="symptom_dictionary.csv", mime="text/csv")
+            # Download CSV (with current filter view and Red Flag boolean)
+            csv = filtered.to_csv(index=False).encode("utf-8")
+            st.download_button("Download current view (CSV)", data=csv, file_name="symptom_dictionary.csv", mime="text/csv")
