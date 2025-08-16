@@ -1,264 +1,270 @@
-from typing import Dict, List, Tuple, Optional
+# ui_visualizer.py
+
+from typing import Dict, List, Tuple, Optional, Set
+import json
 import pandas as pd
-import numpy as np
 import streamlit as st
+from pyvis.network import Network
 
-# ----------------- constants & helpers -----------------
+from utils import (
+    CANON_HEADERS, LEVEL_COLS, MAX_LEVELS,
+    normalize_text, validate_headers,
+)
 
-CANON_HEADERS = [
-    "Vital Measurement", "Node 1", "Node 2", "Node 3", "Node 4", "Node 5",
-    "Diagnostic Triage", "Actions"
-]
-LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
-MAX_LEVELS = 5
+# -----------------------------
+# Helpers
+# -----------------------------
 
-
-def normalize_text(x: str) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def validate_headers(df: pd.DataFrame) -> bool:
-    return list(df.columns[:len(CANON_HEADERS)]) == CANON_HEADERS
+def _ss_get(key, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.session_state[key]
 
 
-def level_key_tuple(level: int, parent: Tuple[str, ...]) -> str:
-    return f"L{level}|" + (">".join(parent) if parent else "<ROOT>")
+def _get_current_df() -> Tuple[Optional[pd.DataFrame], str]:
+    """
+    Picks the active sheet from the 'work_context' if available,
+    otherwise tries Upload -> Google Sheets as a fallback.
+    Returns (df, sheet_name or hint).
+    """
+    ctx = st.session_state.get("work_context", {})
+    src = ctx.get("source")
+    sheet = ctx.get("sheet")
+
+    if src == "upload":
+        wb = st.session_state.get("upload_workbook", {})
+        if sheet in wb:
+            return wb[sheet], sheet
+    elif src == "gs":
+        wb = st.session_state.get("gs_workbook", {})
+        if sheet in wb:
+            return wb[sheet], sheet
+
+    # Fallbacks
+    wb_u = st.session_state.get("upload_workbook", {})
+    if wb_u:
+        name = next(iter(wb_u))
+        return wb_u[name], name
+
+    wb_g = st.session_state.get("gs_workbook", {})
+    if wb_g:
+        name = next(iter(wb_g))
+        return wb_g[name], name
+
+    return None, "(no sheet loaded)"
 
 
-def parent_key_from_row_strict(row: pd.Series, upto_level: int) -> Optional[Tuple[str, ...]]:
-    if upto_level <= 1:
-        return tuple()
-    parent = []
-    for c in LEVEL_COLS[:upto_level-1]:
-        v = normalize_text(row[c])
-        if v == "":
-            return None
-        parent.append(v)
-    return tuple(parent)
+def _unique_vm_values(df: pd.DataFrame) -> List[str]:
+    if "Vital Measurement" not in df.columns:
+        return []
+    vals = [normalize_text(x) for x in df["Vital Measurement"].dropna().astype(str)]
+    uniq = []
+    seen = set()
+    for v in vals:
+        if v and v not in seen:
+            seen.add(v); uniq.append(v)
+    return sorted(uniq)
 
 
-def infer_branch_options(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """Build parent->children map for all levels from the dataframe (no overrides)."""
-    store: Dict[str, List[str]] = {}
-    for level in range(1, MAX_LEVELS+1):
-        parent_to_children: Dict[Tuple[str, ...], List[str]] = {}
-        for _, row in df.iterrows():
-            child_col = LEVEL_COLS[level-1]
-            if child_col not in df.columns:
-                continue
-            child = normalize_text(row[child_col])
-            if child == "":
-                continue
-            parent = parent_key_from_row_strict(row, level)
-            if parent is None:
-                continue
-            parent_to_children.setdefault(parent, [])
-            parent_to_children[parent].append(child)
-        for parent, children in parent_to_children.items():
-            uniq, seen = [], set()
-            for c in children:
-                if c not in seen:
-                    seen.add(c); uniq.append(c)
-            store[level_key_tuple(level, parent)] = uniq
-    return store
+def _build_edges(
+    df: pd.DataFrame,
+    limit_rows: int = 20000,
+    scope_vm: Optional[str] = None,
+    collapse_by_label_per_level: bool = True,
+) -> Tuple[Set[str], List[Tuple[str, str]], Dict[str, Dict[str, str]]]:
+    """
+    Build a set of unique node ids and list of edges for the tree.
+    If collapse_by_label_per_level=True, all identical labels at a given level
+    are merged to one node (per level). Node id becomes f"L{level}:{label}".
+
+    Returns:
+      (nodes, edges, node_attrs)
+        nodes: set of node ids (str)
+        edges: list of (src_id, dst_id)
+        node_attrs: node_id -> {"label": <display text>, "title": <tooltip>}
+    """
+    nodes: Set[str] = set()
+    edges: List[Tuple[str, str]] = []
+    node_attrs: Dict[str, Dict[str, str]] = {}
+
+    if df is None or df.empty or not validate_headers(df):
+        return nodes, edges, node_attrs
+
+    # Filter by VM if selected
+    df2 = df.copy()
+    if scope_vm:
+        df2 = df2[df2["Vital Measurement"].astype(str).map(normalize_text) == normalize_text(scope_vm)]
+
+    # Iterate rows (respect a hard cap)
+    for i, (_, row) in enumerate(df2.iterrows()):
+        if i >= limit_rows:
+            break
+
+        vm = normalize_text(row.get("Vital Measurement", ""))
+        path = [normalize_text(row.get(c, "")) for c in LEVEL_COLS]
+        # Create edges from VM -> Node1, Node1 -> Node2, ... only when both sides exist
+        prev_id = None
+        if vm:
+            vm_id = f"L0:{vm}" if collapse_by_label_per_level else f"L0:{vm}:{i}"
+            if vm_id not in nodes:
+                nodes.add(vm_id)
+                node_attrs[vm_id] = {"label": vm, "title": f"Vital Measurement: {vm}"}
+            prev_id = vm_id
+
+        for li, label in enumerate(path, start=1):
+            if not label:
+                break
+            node_id = f"L{li}:{label}" if collapse_by_label_per_level else f"L{li}:{label}:{i}"
+            if node_id not in nodes:
+                nodes.add(node_id)
+                node_attrs[node_id] = {"label": label, "title": f"Node {li}: {label}"}
+
+            if prev_id is not None:
+                edges.append((prev_id, node_id))
+            prev_id = node_id
+
+    # De-duplicate edges
+    edges = list({(a, b) for (a, b) in edges})
+    return nodes, edges, node_attrs
 
 
-def infer_branch_options_with_overrides(df: pd.DataFrame, overrides: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """Merge dataframe-derived store with overrides for visualization."""
-    base = infer_branch_options(df)
-    merged = dict(base)
-    for k, v in (overrides or {}).items():
-        vals = [normalize_text(x) for x in (v if isinstance(v, list) else [v])]
-        merged[k] = vals
-    return merged
+def _apply_pyvis_options(net: Network, hierarchical: bool):
+    """
+    Set pyvis options with valid JSON (NOT JavaScript).
+    We build JSON via json.dumps to avoid JSONDecode errors in pyvis/options.py.
+    """
+    if hierarchical:
+        options = {
+            "layout": {
+                "hierarchical": {
+                    "enabled": True,
+                    "direction": "UD",
+                    "sortMethod": "directed"
+                }
+            },
+            "physics": {"enabled": False},
+            "nodes": {"shape": "dot", "size": 12},
+            "edges": {"arrows": {"to": {"enabled": True}}}
+        }
+    else:
+        options = {
+            "physics": {"enabled": True, "stabilization": {"enabled": True}},
+            "nodes": {"shape": "dot", "size": 12},
+            "edges": {"arrows": {"to": {"enabled": True}}}
+        }
+    net.set_options(json.dumps(options))
 
 
-def children_counts(df: pd.DataFrame, vm: str, parent: Tuple[str, ...], next_level: int) -> Dict[str, int]:
-    """Return counts for Node {next_level} children under (vm, parent)."""
-    if df is None or df.empty or not (1 <= next_level <= MAX_LEVELS):
-        return {}
-    m = (df["Vital Measurement"].map(normalize_text) == normalize_text(vm))
-    for i, val in enumerate(parent, 1):
-        m = m & (df[f"Node {i}"].map(normalize_text) == normalize_text(val))
-    sub = df[m].copy()
-    if sub.empty:
-        return {}
-    col = f"Node {next_level}"
-    s = sub[col].map(normalize_text)
-    vc = s[s != ""].value_counts(dropna=True)
-    return {k: int(v) for k, v in vc.items()}
-
-
-def friendly_parent_label(level: int, parent_tuple: Tuple[str, ...]) -> str:
-    """Human-friendly name for the parent path feeding Node {level} children."""
-    if level == 1 and not parent_tuple:
-        return "Top-level (Node 1) options"
-    return " > ".join(parent_tuple) if parent_tuple else "Top-level (Node 1) options"
-
-
-# ----------------- UI: Visualizer -----------------
+# -----------------------------
+# UI
+# -----------------------------
 
 def render():
-    st.header("🌐 Visualizer")
+    st.header("🌳 Visualizer")
 
-    # Workspace context (set in Workspace Selection)
-    ctx = st.session_state.get("work_context")
-    if not ctx:
-        st.info("Select a sheet in **Workspace Selection** first.")
-        return
-
-    source = ctx.get("source")  # "upload" | "gs"
-    sheet = ctx.get("sheet")
-    if not sheet:
-        st.info("Select a sheet in **Workspace Selection** first.")
-        return
-
-    if source == "upload":
-        wb = st.session_state.get("upload_workbook", {})
-        override_root = "branch_overrides_upload"
-    else:
-        wb = st.session_state.get("gs_workbook", {})
-        override_root = "branch_overrides_gs"
-
-    df = wb.get(sheet, pd.DataFrame())
+    df, sheet_name = _get_current_df()
     if df is None or df.empty or not validate_headers(df):
-        st.info("Current sheet is empty or headers mismatch.")
+        st.info("No valid sheet found. Load data in **Source** and select a sheet in **Workspace**.")
         return
 
-    # Optional: overrides & red flag map (from Dictionary)
-    overrides_all = st.session_state.get(override_root, {})
-    overrides_sheet = overrides_all.get(sheet, {})
-    redflag_map = st.session_state.get("symptom_quality", {})  # {symptom: "Red Flag"|"Normal"}
+    st.caption(f"Showing sheet: **{sheet_name}**")
 
-    # Build store for visualization
-    store = infer_branch_options_with_overrides(df, overrides_sheet)
+    # Controls
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
 
-    # Vital Measurements
-    vms = sorted(set(df["Vital Measurement"].map(normalize_text).replace("", np.nan).dropna().tolist()))
-    if not vms:
-        st.info("No Vital Measurements found.")
-        return
-
-    c1, c2, c3, c4 = st.columns([2,1,1,1])
     with c1:
-        vm = st.selectbox("Vital Measurement", vms, key="viz_vm")
+        hierarchical = st.checkbox("Hierarchical layout", value=True, help="Top-to-bottom layered view.")
+
     with c2:
-        depth = st.selectbox("Depth", ["Node 1 only","Node 1 → Node 2"], index=1, key="viz_depth")
+        collapse = st.checkbox(
+            "Merge same labels per level",
+            value=True,
+            help="If ON, identical labels at the same level are merged to one node."
+        )
+
     with c3:
-        physics = st.checkbox("Physics layout", value=True, key="viz_physics")
+        vms = _unique_vm_values(df)
+        vm_scope = st.selectbox(
+            "Filter by Vital Measurement",
+            options=["(All)"] + vms,
+            index=0,
+        )
+        vm_sel = None if vm_scope == "(All)" else vm_scope
+
     with c4:
-        hierarchical = st.checkbox("Hierarchical top-down", value=True, key="viz_hier")
+        limit = st.number_input(
+            "Row limit",
+            min_value=100,
+            max_value=100000,
+            value=5000,
+            step=500,
+            help="Maximum rows to scan when building the graph."
+        )
 
-    if not vm:
-        return
+    st.markdown("---")
 
-    # Try to import pyvis
-    try:
-        from pyvis.network import Network
-    except Exception:
-        st.warning("PyVis is not installed. Run: `pip install pyvis`")
-        return
-
-    # Build a PyVis network
-    net = Network(height="650px", width="100%", directed=True, notebook=False)
-    if hierarchical:
-        # Basic hierarchical options (top to bottom)
-        net.set_options("""
-        const options = {
-          layout: { hierarchical: { enabled: true, direction: "UD", sortMethod: "hubsize", nodeSpacing: 200, levelSeparation: 200 } },
-          physics: { enabled: false }
-        }
-        """)
-    else:
-        # Physics toggle
-        net.set_options(f"""
-        const options = {{
-          physics: {{ enabled: {str(physics).lower()}, stabilization: {{ iterations: 200 }} }},
-          nodes: {{ shape: "dot", size: 18 }}
-        }}
-        """)
-
-    # Colors
-    COLOR_VM = "#1f2937"           # charcoal
-    COLOR_NODE = "#2563eb"         # blue
-    COLOR_NODE_RF = "#ef4444"      # red
-    COLOR_EDGE = "#94a3b8"         # slate
-    COLOR_BG = "#ffffff"
-
-    # Helper: add node with style
-    def add_node(node_id: str, label: str, is_rf: bool = False, level_tag: str = ""):
-        color = COLOR_NODE_RF if is_rf else COLOR_NODE
-        title = label
-        if level_tag:
-            title = f"{level_tag} | {label}"
-        net.add_node(node_id, label=label, title=title, color=color)
-
-    def add_edge(src: str, dst: str, label: Optional[str] = None):
-        if label:
-            net.add_edge(src, dst, label=label, color=COLOR_EDGE, arrows="to", font={"align": "middle"})
-        else:
-            net.add_edge(src, dst, color=COLOR_EDGE, arrows="to")
-
-    # Root node is the VM
-    vm_node_id = f"VM::{vm}"
-    net.add_node(vm_node_id, label=f"VM: {vm}", shape="box", color=COLOR_VM)
-
-    # Node 1 children under root per VM
-    # We prefer overrides if present in store; fallback to counting in df
-    key_root = level_key_tuple(1, tuple())
-    n1_children = [c for c in store.get(key_root, []) if normalize_text(c) != ""]
-    # counts for Node 1 under VM
-    counts_n1 = children_counts(df, vm=vm, parent=tuple(), next_level=1)
-
-    # If empty, try from df directly (possible when overrides empty & no implicit rows)
-    if not n1_children:
-        n1_children = list(counts_n1.keys())
-
-    # Add Node 1 nodes and edges
-    for n1 in n1_children:
-        is_rf = (redflag_map.get(n1, "Normal") == "Red Flag")
-        cnt = counts_n1.get(n1, 0)
-        label = f"{n1} ({cnt})" if cnt else n1
-        n1_id = f"N1::{vm}::{n1}"
-        add_node(n1_id, label, is_rf=is_rf, level_tag="Node 1")
-        add_edge(vm_node_id, n1_id)
-
-    # Depth 2: Node 2 children under each Node 1
-    if depth.endswith("Node 2"):
-        for n1 in n1_children:
-            parent = (n1,)
-            # store-based children first
-            key_p = level_key_tuple(2, parent)
-            n2_children = [c for c in store.get(key_p, []) if normalize_text(c) != ""]
-            counts_n2 = children_counts(df, vm=vm, parent=parent, next_level=2)
-            if not n2_children:
-                n2_children = list(counts_n2.keys())
-            for n2 in n2_children:
-                is_rf2 = (redflag_map.get(n2, "Normal") == "Red Flag")
-                cnt2 = counts_n2.get(n2, 0)
-                label2 = f"{n2} ({cnt2})" if cnt2 else n2
-                n2_id = f"N2::{vm}::{n1}::{n2}"
-                add_node(n2_id, label2, is_rf=is_rf2, level_tag="Node 2")
-                add_edge(f"N1::{vm}::{n1}", n2_id)
-
-    # Render in Streamlit
-    # We write to a temp html and load it back
-    import os, tempfile
-    with tempfile.TemporaryDirectory() as tmpd:
-        out_path = os.path.join(tmpd, "tree_viz.html")
-        net.write_html(out_path)
-        with open(out_path, "r", encoding="utf-8") as f:
-            html = f.read()
-    st.components.v1.html(html, height=680, scrolling=True)
-
-    # Download HTML artifact
-    st.download_button(
-        "Download this graph (HTML)",
-        data=html.encode("utf-8"),
-        file_name=f"viz_{vm.replace(' ','_')}_{'n1' if depth.startswith('Node 1') else 'n1_n2'}.html",
-        mime="text/html"
+    # Build graph data
+    nodes, edges, node_attrs = _build_edges(
+        df,
+        limit_rows=int(limit),
+        scope_vm=vm_sel,
+        collapse_by_label_per_level=collapse,
     )
 
-    st.caption("Tip: Toggle **Physics** for a free-form layout or use **Hierarchical** for a top-down tree.")
+    if not nodes:
+        st.info("No nodes to visualize with the current filters.")
+        return
+
+    # Pyvis network
+    net = Network(height="650px", width="100%", directed=True, notebook=False)
+    _apply_pyvis_options(net, hierarchical=hierarchical)
+
+    # Add nodes
+    for nid in nodes:
+        info = node_attrs.get(nid, {})
+        label = info.get("label", nid)
+        title = info.get("title", label)
+        # Choose color lightly by level
+        try:
+            level_prefix = nid.split(":")[0]  # like "L2"
+            level_num = int(level_prefix[1:])
+        except Exception:
+            level_num = 0
+        color = [
+            "#4f46e5",  # L0
+            "#2563eb",  # L1
+            "#059669",  # L2
+            "#16a34a",  # L3
+            "#d97706",  # L4
+            "#dc2626",  # L5
+        ][min(level_num, 5)]
+
+        net.add_node(nid, label=label, title=title, color=color)
+
+    # Add edges
+    for (src, dst) in edges:
+        net.add_edge(src, dst)
+
+    # Render to Streamlit
+    try:
+        html = net.generate_html()  # returns full HTML string
+        st.components.v1.html(html, height=680, scrolling=True)
+    except Exception:
+        # Fallback: write to a temporary file then read it back
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmpd:
+            out = os.path.join(tmpd, "graph.html")
+            net.write_html(out)
+            with open(out, "r", encoding="utf-8") as f:
+                st.components.v1.html(f.read(), height=680, scrolling=True)
+
+    # Small legend / tips
+    with st.expander("Legend & Tips", expanded=False):
+        st.markdown(
+            """
+            - **Colors by level** (VM → Node 1 → Node 2 → Node 3 → Node 4 → Node 5).
+            - Turn **Merge same labels per level** OFF to see every occurrence (more crowded).
+            - Use **Filter by Vital Measurement** to focus a single tree.
+            - Increase **Row limit** if your sheet is large and you need deeper coverage.
+            """
+        )

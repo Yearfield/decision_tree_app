@@ -1,331 +1,369 @@
-from typing import Dict, List, Tuple, Optional, Set
+# ui_validation.py
+
+from typing import Dict, List, Tuple, Any
 import pandas as pd
 import numpy as np
+import streamlit as st
 
-# ----------------- constants -----------------
+from utils import (
+    CANON_HEADERS, LEVEL_COLS, MAX_LEVELS,
+    normalize_text, validate_headers, friendly_parent_label,
+    level_key_tuple,
+)
 
-CANON_HEADERS = [
-    "Vital Measurement", "Node 1", "Node 2", "Node 3", "Node 4", "Node 5",
-    "Diagnostic Triage", "Actions"
-]
-LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
-MAX_LEVELS = 5
+# ----------------- Import logic functions (robust to naming variants) -----------------
 
+API_MODE = "none"
 
-# ----------------- basic helpers -----------------
+_detect_orphan_nodes = None
+_detect_loops = None
+_detect_missing_red_flags = None
+_validate_workbook = None
+_compute_validation_report = None
+_detect_missing_redflag_coverage = None
+_detect_orphans_legacy = None
 
-def normalize_text(x: str) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def validate_headers(df: pd.DataFrame) -> bool:
-    return list(df.columns[:len(CANON_HEADERS)]) == CANON_HEADERS
-
-
-def level_key_tuple(level: int, parent: Tuple[str, ...]) -> str:
-    return f"L{level}|" + (">".join(parent) if parent else "<ROOT>")
-
-
-def parent_key_from_row_strict(row: pd.Series, upto_level: int) -> Optional[Tuple[str, ...]]:
-    """
-    For a row and a target 'upto_level', return the parent tuple of length (upto_level-1).
-    If any required Node column is blank, return None.
-    L=1 => parent is () (root).
-    """
-    if upto_level <= 1:
-        return tuple()
-    parent: List[str] = []
-    for c in LEVEL_COLS[:upto_level-1]:
-        v = normalize_text(row.get(c, ""))
-        if v == "":
-            return None
-        parent.append(v)
-    return tuple(parent)
-
-
-def enforce_k_five(opts: List[str]) -> List[str]:
-    """Trim/pad to exactly 5 (blank padded)."""
-    clean = [normalize_text(o) for o in opts if normalize_text(o) != ""]
-    if len(clean) > 5:
-        clean = clean[:5]
-    elif len(clean) < 5:
-        clean = clean + [""]*(5-len(clean))
-    return clean
-
-
-def friendly_parent_label(level: int, parent_tuple: Tuple[str, ...]) -> str:
-    """Human-friendly label for the parent path feeding Node {level} children."""
-    if level == 1 and not parent_tuple:
-        return "Top-level (Node 1) options"
-    return " > ".join(parent_tuple) if parent_tuple else "Top-level (Node 1) options"
-
-
-# ----------------- store (parent->children) -----------------
-
-def infer_branch_options(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """
-    Build a map: "L{level}|{parent_path or <ROOT>}" -> [children].
-    Deduplicates while preserving first-seen order.
-    """
-    store: Dict[str, List[str]] = {}
-    if df is None or df.empty:
-        return store
-
-    for level in range(1, MAX_LEVELS+1):
-        parent_to_children: Dict[Tuple[str, ...], List[str]] = {}
-        child_col = LEVEL_COLS[level-1]
-        for _, row in df.iterrows():
-            child = normalize_text(row.get(child_col, ""))
-            if child == "":
-                continue
-            parent = parent_key_from_row_strict(row, level)
-            if parent is None:
-                continue
-            parent_to_children.setdefault(parent, []).append(child)
-
-        for parent, children in parent_to_children.items():
-            uniq, seen = [], set()
-            for c in children:
-                if c not in seen:
-                    seen.add(c); uniq.append(c)
-            store[level_key_tuple(level, parent)] = uniq
-
-    return store
-
-
-def infer_branch_options_with_overrides(df: pd.DataFrame, overrides: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """Merge inferred store with overrides (overrides win)."""
-    base = infer_branch_options(df)
-    merged = dict(base)
-    if overrides:
-        for k, v in overrides.items():
-            if not isinstance(v, list):
-                vals = [normalize_text(v)]
-            else:
-                vals = [normalize_text(x) for x in v]
-            merged[k] = vals
-    return merged
-
-
-def build_label_children_index(store: Dict[str, List[str]]) -> Dict[Tuple[int, str], List[str]]:
-    """
-    Build (level, parent_label) -> children list.
-
-    Interpretation:
-      - For key "L{L}|{parent_tuple}", the children in 'store[key]' are the options for Node L.
-      - The "parent label" for level L is:
-          * "<ROOT>" when L==1
-          * the last element of parent_tuple when L>1
-    """
-    idx: Dict[Tuple[int, str], List[str]] = {}
-    for key, children in store.items():
-        if "|" not in key:
-            continue
-        lvl_s, path = key.split("|", 1)
+# Try the "new" API we proposed in the fix
+try:
+    from logic_validation import (
+        detect_orphan_nodes as _detect_orphan_nodes,
+        detect_loops as _detect_loops,
+        detect_missing_red_flags as _detect_missing_red_flags,
+        validate_workbook as _validate_workbook,
+    )
+    API_MODE = "new"
+except Exception:
+    # Fallback 1: try older combined report
+    try:
+        from logic_validation import compute_validation_report as _compute_validation_report
+        API_MODE = "combined"
+    except Exception:
+        # Fallback 2: try older individual functions (legacy names)
         try:
-            L = int(lvl_s[1:])
+            from logic_validation import detect_orphans as _detect_orphans_legacy
         except Exception:
-            continue
-        if not (1 <= L <= MAX_LEVELS):
-            continue
-        if path == "<ROOT>":
-            parent_label = "<ROOT>"
+            _detect_orphans_legacy = None
+        try:
+            from logic_validation import detect_loops as _detect_loops
+        except Exception:
+            _detect_loops = None
+        try:
+            from logic_validation import detect_missing_redflag_coverage as _detect_missing_redflag_coverage
+        except Exception:
+            _detect_missing_redflag_coverage = None
+
+        if _detect_orphans_legacy or _detect_loops or _detect_missing_redflag_coverage:
+            API_MODE = "legacy"
+
+
+# ----------------- session helpers -----------------
+
+def _ss_get(key, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.session_state[key]
+
+
+def _jump_to_symptoms(level: int, parent_tuple: Tuple[str, ...]):
+    """
+    Prime Symptoms tab filters so the user can quickly land on the parent they need.
+    """
+    st.session_state["sym_level_sel"] = level
+    pretty = " > ".join(parent_tuple) if parent_tuple else friendly_parent_label(level, tuple())
+    st.session_state["sym_search_pending"] = pretty.lower()
+    st.success("Primed the Symptoms tab search for this parent. Switch to the 🧬 Symptoms tab.")
+
+
+# ----------------- render helpers (normalize outputs to tables) -----------------
+
+def _render_orphans_any(orphans: Any):
+    st.subheader("🧩 Orphan nodes")
+    st.caption("A child label appears but never as a parent at the next level, where a branch might reasonably continue.")
+
+    # Accept list[str], list[dict], or None
+    if not orphans:
+        st.success("No orphans detected. 🎉")
+        return
+
+    rows = []
+    # If new-API (list[str]) or arbitrary strings
+    if isinstance(orphans, list) and (len(orphans) == 0 or isinstance(orphans[0], str)):
+        for s in orphans:
+            rows.append({"Issue": s})
+        df_orph = pd.DataFrame(rows)
+        st.dataframe(df_orph, use_container_width=True, height=260)
+        st.download_button(
+            "Download orphans (CSV)",
+            data=df_orph.to_csv(index=False).encode("utf-8"),
+            file_name="validation_orphans.csv",
+            mime="text/csv",
+        )
+        return
+
+    # If structured (list[dict])
+    for item in orphans:
+        # Try to read our richer schema; fallback to generic
+        label = item.get("child") or item.get("label") or item.get("node") or ""
+        level = item.get("level") or ""
+        parent_tuple = tuple(item.get("parent", [])) if isinstance(item.get("parent"), (list, tuple)) else ()
+        mode = item.get("mode", "")
+        example = " > ".join(parent_tuple) if parent_tuple else friendly_parent_label(int(level or 1), tuple())
+        rows.append({
+            "Node Label": label,
+            "At Level": f"Node {level}" if level else "",
+            "Mode": mode,
+            "Example parent (where used as child)": example,
+        })
+
+    df_orph = pd.DataFrame(rows)
+    if not df_orph.empty:
+        df_orph = df_orph.sort_values(["At Level", "Node Label"])
+    st.dataframe(df_orph, use_container_width=True, height=260)
+    st.download_button(
+        "Download orphans (CSV)",
+        data=df_orph.to_csv(index=False).encode("utf-8"),
+        file_name="validation_orphans.csv",
+        mime="text/csv",
+    )
+
+
+def _render_loops_any(loops: Any):
+    st.subheader("🔁 Loops (cycles)")
+
+    if not loops:
+        st.success("No cycles detected. 🎉")
+        return
+
+    rows = []
+    # new-API returns list[str] with paths; legacy may return list[dict]
+    if isinstance(loops, list) and (len(loops) == 0 or isinstance(loops[0], str)):
+        for s in loops:
+            rows.append({"Cycle": s})
+    else:
+        for item in loops:
+            cycle = item.get("cycle") or item.get("path") or []
+            if isinstance(cycle, list):
+                if cycle and (len(cycle) > 1 and cycle[0] != cycle[-1]):
+                    display = " → ".join(cycle + [cycle[0]])
+                else:
+                    display = " → ".join(cycle)
+            else:
+                display = str(cycle)
+            rows.append({"Cycle": display})
+
+    df_loops = pd.DataFrame(rows)
+    st.dataframe(df_loops, use_container_width=True, height=220)
+    st.download_button(
+        "Download loops (CSV)",
+        data=df_loops.to_csv(index=False).encode("utf-8"),
+        file_name="validation_loops.csv",
+        mime="text/csv",
+    )
+
+
+def _render_missing_rf_any(miss_rf: Any):
+    st.subheader("🚩 Missing Red Flag coverage")
+    st.caption("Parents that have children but none marked as Red Flag. Fix in Dictionary (flag the child) or edit branches.")
+
+    if not miss_rf:
+        st.success("All parents with children have Red Flag coverage. 🎉")
+        return
+
+    rows = []
+    # new-API returns list[str]; legacy may return structured list[dict]
+    if isinstance(miss_rf, list) and (len(miss_rf) == 0 or isinstance(miss_rf[0], str)):
+        for s in miss_rf:
+            rows.append({"Issue": s})
+        df_rf = pd.DataFrame(rows)
+        st.dataframe(df_rf, use_container_width=True, height=260)
+        st.download_button(
+            "Download missing Red Flag coverage (CSV)",
+            data=df_rf.to_csv(index=False).encode("utf-8"),
+            file_name="validation_missing_redflags.csv",
+            mime="text/csv",
+        )
+        return
+
+    # structured (preferred)
+    for item in miss_rf:
+        level = int(item.get("level", 1))
+        parent_tuple = tuple(item.get("parent", []))
+        children = item.get("children", [])
+        rf_children = item.get("rf_children", [])
+        parent_pretty = " > ".join(parent_tuple) if parent_tuple else friendly_parent_label(level, tuple())
+        rows.append({
+            "Parent (path)": parent_pretty,
+            "At Level": f"Node {level}",
+            "Children": ", ".join(children) if children else "(none)",
+            "Red Flag children": ", ".join(rf_children) if rf_children else "(none)",
+            "parent_tuple": parent_tuple,   # keep for jump
+            "level_int": level,
+        })
+
+    df_rf = pd.DataFrame(rows)
+    if not df_rf.empty:
+        df_rf = df_rf.sort_values(["At Level", "Parent (path)"])
+        st.dataframe(df_rf[["Parent (path)", "At Level", "Children", "Red Flag children"]],
+                     use_container_width=True, height=280)
+
+        # Quick jump buttons (paged)
+        st.caption("Quick-jump: focus a parent in the Symptoms tab for editing.")
+        page_size = st.selectbox("Rows per page", [10, 25, 50, 100], index=1, key="val_rf_pagesize")
+        total = len(df_rf)
+        max_page = max(1, int(np.ceil(total / page_size)))
+        page = st.number_input("Page", min_value=1, max_value=max_page, value=1, step=1, key="val_rf_page")
+        start = (page - 1) * page_size
+        end = min(start + page_size, total)
+        for idx in range(start, end):
+            row = df_rf.iloc[idx]
+            c1, c2 = st.columns([6, 1])
+            with c1:
+                st.write(f"• **{row['Parent (path)']}** — children: {row['Children'] or '(none)'}")
+            with c2:
+                if st.button("Find in Symptoms", key=f"val_rf_jump_{idx}"):
+                    _jump_to_symptoms(int(row["level_int"]), tuple(row["parent_tuple"]))
+
+        st.download_button(
+            "Download missing Red Flag coverage (CSV)",
+            data=df_rf.drop(columns=["parent_tuple", "level_int"]).to_csv(index=False).encode("utf-8"),
+            file_name="validation_missing_redflags.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No detailed rows to display.")
+
+
+# ----------------- main render -----------------
+
+def render():
+    st.header("🔎 Validation")
+
+    # Choose data source
+    sources = []
+    if _ss_get("upload_workbook", {}):
+        sources.append("Upload workbook")
+    if _ss_get("gs_workbook", {}):
+        sources.append("Google Sheets workbook")
+
+    if not sources:
+        st.info("Load a workbook first in the **Source** tab.")
+        return
+
+    source = st.radio("Choose data source", sources, horizontal=True, key="val_source_sel")
+
+    if source == "Upload workbook":
+        wb = _ss_get("upload_workbook", {})
+        override_root = "branch_overrides_upload"
+    else:
+        wb = _ss_get("gs_workbook", {})
+        override_root = "branch_overrides_gs"
+
+    if not wb:
+        st.warning("No sheets found in the selected source.")
+        return
+
+    # Sheet selector
+    sheet = st.selectbox("Sheet", list(wb.keys()), key="val_sheet_sel")
+    df = wb.get(sheet, pd.DataFrame())
+    if df.empty or not validate_headers(df):
+        st.info("Selected sheet is empty or headers mismatch.")
+        return
+
+    # Options
+    st.markdown("#### Checks to run")
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        chk_orphans = st.checkbox("Orphan nodes", value=True, key="val_chk_orphans")
+    with c2:
+        chk_loops = st.checkbox("Loops", value=True, key="val_chk_loops")
+    with c3:
+        chk_rf = st.checkbox("Missing Red Flag coverage", value=True, key="val_chk_rf")
+
+    # Pull overrides + symptom quality map (used by legacy API)
+    overrides_sheet = _ss_get(override_root, {}).get(sheet, {})
+    quality_map = _ss_get("symptom_quality", {})  # {symptom: "Red Flag"|"Normal"}
+
+    st.markdown("---")
+    if st.button("▶ Run validation", type="primary", key="val_run_btn"):
+        st.session_state["val_run_requested"] = True
+
+    if not _ss_get("val_run_requested", True):
+        st.info("Click **Run validation** to generate the report.")
+        return
+
+    # ---- Run checks according to available API ----
+    try:
+        if API_MODE == "new":
+            # New API returns simple lists of strings
+            orphans = _detect_orphan_nodes(df) if chk_orphans and _detect_orphan_nodes else []
+            loops = _detect_loops(df) if chk_loops and _detect_loops else []
+            miss_rf = _detect_missing_red_flags(df) if chk_rf and _detect_missing_red_flags else []
+
+        elif API_MODE == "combined":
+            # Combined report -> attempt to map to our 3 sections
+            report = _compute_validation_report(df)
+            # Best-effort mapping
+            orphans = report.get("orphans") or report.get("orphans_loose") or []
+            loops = report.get("loops") or []
+            miss_rf = report.get("missing_red_flags") or report.get("missing_redflag") or []
+
+        elif API_MODE == "legacy":
+            orphans = _detect_orphans_legacy(df, overrides=overrides_sheet, strict=False) if (chk_orphans and _detect_orphans_legacy) else []
+            loops = _detect_loops(df) if (chk_loops and _detect_loops) else []
+            miss_rf = _detect_missing_redflag_coverage(df, overrides=overrides_sheet, redflag_map=quality_map) if (chk_rf and _detect_missing_redflag_coverage) else []
+
         else:
-            parent_tuple = tuple(path.split(">"))
-            parent_label = parent_tuple[-1] if parent_tuple else "<ROOT>"
-        idx[(L, parent_label)] = [normalize_text(c) for c in children if normalize_text(c) != ""]
-    return idx
+            st.error("No validation functions available. Please ensure logic_validation.py is present.")
+            return
 
+    except AssertionError as e:
+        st.error(str(e))
+        return
+    except Exception as e:
+        st.error(f"Validation failed: {e}")
+        return
 
-# ----------------- validations -----------------
+    # ---- Summary metrics ----
+    st.markdown("#### Summary")
+    chip_cols = st.columns([1, 1, 1])
+    with chip_cols[0]:
+        st.metric("Orphan nodes", len(orphans) if isinstance(orphans, list) else 0)
+    with chip_cols[1]:
+        st.metric("Loops found", len(loops) if isinstance(loops, list) else 0)
+    with chip_cols[2]:
+        st.metric("Missing Red Flag (parents)", len(miss_rf) if isinstance(miss_rf, list) else 0)
 
-def detect_orphans(
-    df: pd.DataFrame,
-    overrides: Optional[Dict[str, List[str]]] = None,
-    strict: bool = False
-) -> List[Dict[str, object]]:
-    """
-    Detect orphans: children that never appear as parents.
+    st.markdown("---")
 
-    Modes:
-      - strict=False (default, 'loose'): a child label 'c' at Node L is an orphan if
-        there is NO entry anywhere for (L+1, parent_label == 'c') in the label index.
-      - strict=True: a child is orphan if there is NO exact parent-tuple (parent + (c,))
-        defined at Node (L+1) in the store.
+    # ---- Render sections ----
+    if chk_orphans:
+        _render_orphans_any(orphans)
+        st.markdown("---")
+    if chk_loops:
+        _render_loops_any(loops)
+        st.markdown("---")
+    if chk_rf:
+        _render_missing_rf_any(miss_rf)
+        st.markdown("---")
 
-    Returns list of dicts:
-      {
-        "level": L,
-        "parent": parent_tuple,
-        "child": child_label,
-        "mode": "loose" | "strict"
-      }
-    """
-    assert validate_headers(df), "Headers must match canonical schema."
-    store = infer_branch_options_with_overrides(df, overrides or {})
-    label_idx = build_label_children_index(store)
-
-    results: List[Dict[str, object]] = []
-
-    for key, children in store.items():
-        if "|" not in key:
-            continue
-        lvl_s, path = key.split("|", 1)
-        try:
-            L = int(lvl_s[1:])
-        except Exception:
-            continue
-        if not (1 <= L <= MAX_LEVELS-1):  # only levels that can have children below
-            continue
-
-        parent_tuple = tuple([] if path == "<ROOT>" else path.split(">"))
-        next_level = L + 1
-
-        for c in [normalize_text(x) for x in children if normalize_text(x) != ""]:
-            if strict:
-                # exact parent tuple must exist at next level
-                k_exact = level_key_tuple(next_level, parent_tuple + (c,))
-                if k_exact not in store:
-                    results.append({"level": L, "parent": parent_tuple, "child": c, "mode": "strict"})
-            else:
-                # loose by label: label 'c' must appear as a parent label at next level
-                if len(label_idx.get((next_level, c), [])) == 0:
-                    results.append({"level": L, "parent": parent_tuple, "child": c, "mode": "loose"})
-
-    return results
-
-
-def detect_loops(df: pd.DataFrame) -> List[Dict[str, object]]:
-    """
-    Detect circular branches within a single row:
-    i.e., a label that repeats later in the same path (Node 1..5).
-    Returns a list of dicts:
-      {
-        "row_index": idx,
-        "vm": <Vital Measurement>,
-        "path": [Node 1..5 values],
-        "repeats": [(label, first_pos, later_pos), ...]
-      }
-    """
-    assert validate_headers(df), "Headers must match canonical schema."
-    results: List[Dict[str, object]] = []
-
-    nodes = df[LEVEL_COLS].applymap(normalize_text)
-    for idx, row in nodes.iterrows():
-        path = [row[c] for c in LEVEL_COLS if normalize_text(row[c]) != ""]
-        if not path:
-            continue
-        seen_pos: Dict[str, int] = {}
-        repeats: List[Tuple[str, int, int]] = []
-        for i, label in enumerate(path):
-            if label in seen_pos:
-                repeats.append((label, seen_pos[label]+1, i+1))  # 1-based positions
-            else:
-                seen_pos[label] = i
-        if repeats:
-            results.append({
-                "row_index": idx,
-                "vm": normalize_text(df.at[idx, "Vital Measurement"]),
-                "path": path,
-                "repeats": repeats
-            })
-    return results
-
-
-def detect_missing_redflag_coverage(
-    df: pd.DataFrame,
-    overrides: Optional[Dict[str, List[str]]] = None,
-    redflag_map: Optional[Dict[str, str]] = None
-) -> List[Dict[str, object]]:
-    """
-    For every parent (Node L) with non-empty children, verify at least one child is flagged 'Red Flag'.
-    redflag_map format: {label: "Red Flag"|"Normal"} (case-insensitive on lookup).
-    Returns list of dicts:
-      {
-        "level": L,
-        "parent": parent_tuple,
-        "children": [list_of_children],
-        "redflag_present": False
-      }
-    """
-    assert validate_headers(df), "Headers must match canonical schema."
-    store = infer_branch_options_with_overrides(df, overrides or {})
-    results: List[Dict[str, object]] = []
-
-    if not redflag_map:
-        return results  # nothing to check against
-
-    # normalize RF map keys once
-    rf = {normalize_text(k): ("Red Flag" if str(v).lower().strip() == "red flag" else "Normal")
-          for k, v in redflag_map.items()}
-
-    for key, children in store.items():
-        if "|" not in key:
-            continue
-        lvl_s, path = key.split("|", 1)
-        try:
-            L = int(lvl_s[1:])
-        except Exception:
-            continue
-        if not (1 <= L <= MAX_LEVELS):
-            continue
-        non_empty = [normalize_text(x) for x in children if normalize_text(x) != ""]
-        if not non_empty:
-            continue
-        has_rf = any(rf.get(x, "Normal") == "Red Flag" for x in non_empty)
-        if not has_rf:
-            parent_tuple = tuple([] if path == "<ROOT>" else path.split(">"))
-            results.append({
-                "level": L,
-                "parent": parent_tuple,
-                "children": non_empty,
-                "redflag_present": False
-            })
-
-    return results
-
-
-# ----------------- aggregator -----------------
-
-def compute_validation_report(
-    df: pd.DataFrame,
-    overrides: Optional[Dict[str, List[str]]] = None,
-    redflag_map: Optional[Dict[str, str]] = None
-) -> Dict[str, object]:
-    """
-    Run all validations and return a structured report:
-      {
-        "orphans_loose": [...],
-        "orphans_strict": [...],
-        "loops": [...],
-        "missing_redflag": [...],
-        "counts": {
-            "orphans_loose": N,
-            "orphans_strict": N,
-            "loops": N,
-            "missing_redflag": N
-        }
-      }
-    """
-    assert validate_headers(df), "Headers must match canonical schema."
-
-    orphans_loose = detect_orphans(df, overrides=overrides, strict=False)
-    orphans_strict = detect_orphans(df, overrides=overrides, strict=True)
-    loops = detect_loops(df)
-    missing_rf = detect_missing_redflag_coverage(df, overrides=overrides, redflag_map=redflag_map)
-
-    report = {
-        "orphans_loose": orphans_loose,
-        "orphans_strict": orphans_strict,
-        "loops": loops,
-        "missing_redflag": missing_rf,
-        "counts": {
-            "orphans_loose": len(orphans_loose),
-            "orphans_strict": len(orphans_strict),
-            "loops": len(loops),
-            "missing_redflag": len(missing_rf),
-        }
+    # ---- Combined export (JSON) ----
+    combined = {
+        "sheet": sheet,
+        "orphans": orphans if chk_orphans else [],
+        "loops": loops if chk_loops else [],
+        "missing_redflag": miss_rf if chk_rf else [],
+        "api_mode": API_MODE,
     }
-    return report
+    try:
+        import json
+        json_bytes = json.dumps(combined, indent=2).encode("utf-8")
+        st.download_button(
+            "Download full validation report (JSON)",
+            data=json_bytes,
+            file_name=f"{sheet}_validation_report.json",
+            mime="application/json",
+        )
+    except Exception:
+        pass
+
+    st.caption("Tip: Use **Find in Symptoms** (where available) to jump to a parent for editing; then re-run validation here.")
