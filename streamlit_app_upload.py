@@ -1,6 +1,7 @@
-# streamlit_app_upload.py — Version 6.2.5
+# streamlit_app_upload.py — Version 6.2.6
 
 import io
+import json
 import random
 from typing import Dict, List, Tuple, Optional, Set
 import pandas as pd
@@ -9,7 +10,7 @@ import streamlit as st
 from datetime import datetime
 
 # ============ VERSION / CONFIG ============
-APP_VERSION = "v6.2.5"
+APP_VERSION = "v6.2.6"
 CANON_HEADERS = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]
 LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
 MAX_LEVELS = 5
@@ -56,6 +57,10 @@ def level_key_tuple(level: int, parent: Tuple[str, ...]) -> str:
     return f"L{level}|" + (">".join(parent) if parent else "<ROOT>")
 
 def infer_branch_options(df: pd.DataFrame) -> Dict[str, List[str]]:
+    """
+    Build a store of explicit parent->children from the dataframe.
+    Keys are level-specific:  f"L{level}|{'>'.join(parent_tuple) or '<ROOT>'}"
+    """
     store: Dict[str, List[str]] = {}
     for level in range(1, MAX_LEVELS+1):
         parent_to_children: Dict[Tuple[str, ...], List[str]] = {}
@@ -176,7 +181,56 @@ def backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
         st.error(f"Backup failed: {e}")
         return None
 
-# ============ Expansion primitives (anchor-reuse, deep cascade, continuity) ============
+# ============ Global label→children map (for recursive cascade) ============
+def build_label_child_map(store: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """
+    Build a global mapping of label -> children across all contexts.
+    For each parent tuple (at any level), we take its last label and collect its children.
+    Excludes ROOT.
+    """
+    label_to_children: Dict[str, List[str]] = {}
+    for key, children in store.items():
+        # key like "L2|parent1>parent2" OR "L1|<ROOT>"
+        try:
+            lvl_s, path = key.split("|", 1)
+        except ValueError:
+            continue
+        if path == "<ROOT>":
+            continue
+        parent_tuple = tuple(path.split(">"))
+        parent_label = parent_tuple[-1] if parent_tuple else None
+        if not parent_label:
+            continue
+        cur = label_to_children.get(parent_label, [])
+        # keep order & dedupe
+        seen = set(cur)
+        for c in children:
+            c = normalize_text(c)
+            if c and c not in seen:
+                cur.append(c); seen.add(c)
+        label_to_children[parent_label] = cur[:5]  # keep max 5 consistently
+    return label_to_children
+
+def union_children_for_parent(parent: Tuple[str, ...],
+                              level: int,
+                              store: Dict[str, List[str]],
+                              label_map: Dict[str, List[str]]) -> List[str]:
+    """Union of:
+      - store-defined children for this (level, parent)
+      - global label_map for the last label of this parent (if parent non-root)
+    """
+    opts_store = store.get(level_key_tuple(level, parent), []) if level <= MAX_LEVELS else []
+    opts_label = label_map.get(parent[-1], []) if parent else []
+    # Keep order: store first, then label additions
+    merged, seen = [], set()
+    for src in (opts_store, opts_label):
+        for x in src:
+            x = normalize_text(x)
+            if x and x not in seen:
+                merged.append(x); seen.add(x)
+    return enforce_k_five(merged)
+
+# ============ Expansion primitives (anchor-reuse, deep cascade, recursive) ============
 def _rows_match_parent(df: pd.DataFrame, vm: str, parent: Tuple[str,...], level: int) -> pd.DataFrame:
     mask = (df["Vital Measurement"].map(normalize_text) == vm)
     for i, val in enumerate(parent, 1):
@@ -209,18 +263,16 @@ def _emit_row_from_prefix(vm_val: str, pref: Tuple[str,...]) -> Dict[str,str]:
     row["Actions"] = ""
     return row
 
-def _children_from_store(store: Dict[str, List[str]], level: int, parent: Tuple[str,...]) -> List[str]:
-    opts_raw = store.get(level_key_tuple(level, parent), [])
-    return [normalize_text(o) for o in opts_raw if normalize_text(o)!=""]
-
 def expand_parent_nextnode_anchor_reuse_for_vm(
     df: pd.DataFrame,
     store: Dict[str, List[str]],
+    label_map: Dict[str, List[str]],
     vm: str,
     parent: Tuple[str,...]
 ) -> Tuple[pd.DataFrame, Dict[str,int], List[Tuple[str,...]]]:
     """
     Ensure next-node children exist under 'parent' for a single VM, using anchor-reuse:
+    - compute union children from (store for this parent) U (label_map for last label)
     - reuse one anchor row (Node L blank) to fill the first missing option
     - create rows for the remaining missing options
     Returns updated df, stats {'new_rows','inplace_filled'}, and list of child parent-tuples we created/confirmed.
@@ -230,7 +282,10 @@ def expand_parent_nextnode_anchor_reuse_for_vm(
     if L > MAX_LEVELS:
         return df, stats, []
 
-    children = _children_from_store(store, L, parent)
+    # union children
+    children = union_children_for_parent(parent, L, store, label_map)
+    children = [c for c in children if c]  # remove blanks
+
     if not children:
         return df, stats, []
 
@@ -275,14 +330,15 @@ def expand_parent_nextnode_anchor_reuse_for_vm(
 def cascade_anchor_reuse_full(
     df: pd.DataFrame,
     store: Dict[str, List[str]],
+    label_map: Dict[str, List[str]],
     vm_scope: List[str],
     start_parents: List[Tuple[str,...]],
 ) -> Tuple[pd.DataFrame, Dict[str,int]]:
     """
     Deep cascade to Node 5 using anchor-reuse at EACH level.
     - Completes partial parents (adds rows for any defined missing options).
-    - Proceeds deeper as long as child options are defined (non-empty) in the store.
-    - Continuity fix: if children exist anywhere in store for a parent label, they propagate across all VMs in scope.
+    - Proceeds deeper as long as child options are defined in the store OR label_map for the child's label.
+    - Recursive effect: label_map ensures entire subtrees propagate wherever a label appears.
     """
     total = {"new_rows":0, "inplace_filled":0}
     stack: List[Tuple[str,...]] = list(start_parents)
@@ -293,29 +349,34 @@ def cascade_anchor_reuse_full(
         if L > MAX_LEVELS:
             continue
 
-        children_defined = _children_from_store(store, L, parent)
-        if not children_defined:
+        # union to decide whether to proceed at this level
+        children_defined = union_children_for_parent(parent, L, store, label_map)
+        if not [x for x in children_defined if x]:
             continue
 
         next_child_parents_all_vms: Set[Tuple[str,...]] = set()
 
         for vm in vm_scope:
-            df, stats, child_parents = expand_parent_nextnode_anchor_reuse_for_vm(df, store, vm, parent)
+            df, stats, child_parents = expand_parent_nextnode_anchor_reuse_for_vm(df, store, label_map, vm, parent)
             total["new_rows"] += stats["new_rows"]
             total["inplace_filled"] += stats["inplace_filled"]
             for cp in child_parents:
                 next_child_parents_all_vms.add(cp)
 
-        # Push deeper for each child that has next-level options defined (if any)
+        # Push deeper for each child that has next-level options defined via store or label_map
         for cp in sorted(next_child_parents_all_vms):
             next_level = len(cp) + 1
-            if next_level <= MAX_LEVELS and _children_from_store(store, next_level, cp):
-                stack.append(cp)
+            if next_level <= MAX_LEVELS:
+                # If store has next-level options OR the child's label has known children, keep cascading
+                has_next_store = bool([x for x in store.get(level_key_tuple(next_level, cp), []) if normalize_text(x)!=""])
+                has_next_label = bool(label_map.get(cp[-1], []))
+                if has_next_store or has_next_label:
+                    stack.append(cp)
 
     return df, total
 
-# ============ Raw+ builder (v6.2.5) ============
-def build_raw_plus_v625(
+# ============ Raw+ builder (v6.2.6) ============
+def build_raw_plus_v626(
     df: pd.DataFrame,
     overrides: Dict[str, List[str]],
     include_scope: str,
@@ -326,6 +387,7 @@ def build_raw_plus_v625(
     Returns (df_aug, stats, duplicates_df_preview)
     """
     store = infer_branch_options_with_overrides(df, overrides)
+    label_map = build_label_child_map(store)
     vms = sorted(set(df["Vital Measurement"].map(normalize_text).replace("", np.nan).dropna().unique().tolist()))
     df_aug = df.copy()
     stats_total = {"generated":0, "new_added":0, "duplicates_skipped":0, "final_total":len(df_aug), "inplace_filled":0}
@@ -357,7 +419,7 @@ def build_raw_plus_v625(
 
     start_parents = sorted({p for (_, p) in parent_keys})
     df_before = len(df_aug)
-    df_aug, stx = cascade_anchor_reuse_full(df_aug, store, vms, start_parents)
+    df_aug, stx = cascade_anchor_reuse_full(df_aug, store, label_map, vms, start_parents)
     stats_total["inplace_filled"] += stx["inplace_filled"]
     stats_total["generated"] += (len(df_aug) - df_before) + stx["inplace_filled"]
 
@@ -507,8 +569,8 @@ st.caption("Canonical headers: Vital Measurement, Node 1, Node 2, Node 3, Node 4
 with st.sidebar:
     st.header("❓ Tips")
     st.markdown("""
-- **Deep cascade (default):** Anchor-reuse at every level → always **5 rows per parent**, cascades to **Node 5**, and completes 3/5 or 4/5 parents automatically (using defined options).
-- **VM Builder:** Add a Vital Measurement and its branches; auto-cascade forward.
+- **Recursive deep cascade:** Uses a global label→children map to propagate entire subtrees; anchor-reuse prevents duplicates.
+- **VM Builder & Wizard:** Add a Vital Measurement and its branches; auto-cascade forward.
 - **Dictionary:** Tag symptoms as **Red Flag**; exported in CSV.
 - Use **Dry-run** to preview; keep **Backup** on for easy rollback.
 """)
@@ -620,7 +682,7 @@ with tab1:
             st.caption(f"Showing rows **{start_idx+1}–{end_idx}** of **{total_rows}**.")
             st.dataframe(df_in.iloc[start_idx:end_idx], use_container_width=True)
 
-        # ===== VM builder (new) =====
+        # ===== VM builder (quick) =====
         with st.expander("🧩 VM Builder (create Vital Measurements and auto-cascade)"):
             vm_mode = st.radio("Mode", ["Create VM with 5 Node-1 options","Create VM with one Node-1 and its 5 Node-2 options"], horizontal=False)
             overrides_upload_all = ss_get("branch_overrides_upload", {})
@@ -651,7 +713,8 @@ with tab1:
 
                         # Auto-cascade from <ROOT> limited to this VM
                         store = infer_branch_options_with_overrides(df_in, overrides_upload)
-                        df_new, tstats = cascade_anchor_reuse_full(df_in, store, [vm_name], [tuple()])
+                        label_map = build_label_child_map(store)
+                        df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vm_name], [tuple()])
                         df_in = df_new
                         wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
                         st.success(f"VM '{vm_name}' created. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
@@ -675,7 +738,7 @@ with tab1:
                         # L1|<ROOT>
                         k1 = level_key_tuple(1, tuple())
                         existing = [x for x in overrides_upload.get(k1, []) if normalize_text(x)!=""]
-                        if n1 not in existing:
+                        if n1 and n1 not in existing:
                             existing.append(n1)
                         overrides_upload[k1] = enforce_k_five(existing)
                         # L2|<n1>
@@ -688,63 +751,98 @@ with tab1:
 
                         # Auto-cascade from parent=(n1) limited to this VM
                         store = infer_branch_options_with_overrides(df_in, overrides_upload)
-                        df_new, tstats = cascade_anchor_reuse_full(df_in, store, [vm_name], [(n1,)])
+                        label_map = build_label_child_map(store)
+                        df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vm_name], [(n1,)])
                         df_in = df_new
                         wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
                         st.success(f"VM '{vm_name}' with Node-1 '{n1}' created. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
 
-        # ===== Root builder (as before, now using deep cascade) =====
-        with st.expander("➕ Root builder (create Node-1 / Node-2 groups and auto-cascade)"):
-            vms_all = sorted(set(df_in["Vital Measurement"].map(normalize_text).replace("", np.nan).dropna().unique().tolist()))
-            vm_scope_mode = st.radio("Apply to", ["All VMs","Select VMs"], horizontal=True, key="root_vm_scope")
-            if vm_scope_mode == "Select VMs":
-                vm_scope = st.multiselect("Select Vital Measurements", vms_all, default=vms_all[:1])
+        # ===== 🧙 VM Build Wizard (end-to-end) =====
+        with st.expander("🧙 VM Build Wizard (step-by-step to Node 5)"):
+            wizard = ss_get("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
+            vm_input = st.text_input("VM name (applies cascade/rows for this VM only)", value=wizard.get("vm",""))
+            if not wizard["active"]:
+                if st.button("Start Wizard"):
+                    wizard = {"vm": vm_input.strip(), "queue":[()], "overrides":{}, "active": True}
+                    ss_set("vm_wizard", wizard)
+                    st.rerun()
             else:
-                vm_scope = vms_all
+                if vm_input.strip() != wizard["vm"]:
+                    wizard["vm"] = vm_input.strip()
+                    ss_set("vm_wizard", wizard)
 
-            root_mode = st.radio("Root builder mode", ["Set 5 Node-1 options", "Add one Node-1 with its 5 Node-2 options"], horizontal=False)
+                if not wizard["queue"]:
+                    st.success("Wizard queue is empty. You can Finish & Apply or Reset.")
+                else:
+                    current_parent = wizard["queue"][0]
+                    L = len(current_parent)+1
+                    st.write(f"**Current parent path:** `{ ' > '.join(current_parent) or '<ROOT>' }` — define children for **Node {L}**")
+                    cols = st.columns(5)
+                    vals = [cols[i].text_input(f"Child {i+1}", key=f"wiz_{L}_{'__'.join(current_parent)}_{i}") for i in range(5)]
+                    fill_other = st.checkbox("Fill remaining blanks with 'Other'", key=f"wiz_other_{L}_{'__'.join(current_parent)}")
+                    if fill_other:
+                        vals = [v if v.strip() else "Other" for v in vals]
+                    vals = enforce_k_five(vals)
 
-            overrides_upload_all = ss_get("branch_overrides_upload", {})
-            overrides_upload = overrides_upload_all.get(sheet_name, {}).copy()
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        if st.button("Save children & Next"):
+                            key = level_key_tuple(L, current_parent)
+                            wizard["overrides"][key] = vals
+                            # extend queue with next parents
+                            if L < MAX_LEVELS:
+                                for v in [normalize_text(x) for x in vals if normalize_text(x)!=""]:
+                                    wizard["queue"].append(current_parent + (v,))
+                            # pop current
+                            wizard["queue"].pop(0)
+                            ss_set("vm_wizard", wizard)
+                            st.rerun()
+                    with c2:
+                        if st.button("Skip this parent"):
+                            wizard["queue"].pop(0)
+                            ss_set("vm_wizard", wizard)
+                            st.rerun()
+                    with c3:
+                        if st.button("Reset Wizard"):
+                            ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
+                            st.experimental_rerun()
 
-            if root_mode == "Set 5 Node-1 options":
-                cols = st.columns(5)
-                vals = [cols[i].text_input(f"Node-1 option {i+1}", key=f"root_n1_{i}") for i in range(5)]
-                if st.button("Save Root 5 and Auto-cascade", key="root_save_n1"):
-                    key = level_key_tuple(1, tuple())
-                    overrides_upload[key] = enforce_k_five(vals)
-                    overrides_upload_all[sheet_name] = overrides_upload
-                    ss_set("branch_overrides_upload", overrides_upload_all)
-                    mark_session_edit(sheet_name, key)
+                st.markdown("---")
+                colA, colB = st.columns(2)
+                with colA:
+                    if st.button("Finish & Apply to this sheet"):
+                        # merge into sheet overrides and cascade for this VM
+                        overrides_upload_all = ss_get("branch_overrides_upload", {})
+                        current_sheet_overrides = overrides_upload_all.get(sheet_name, {}).copy()
+                        # L1|<ROOT> must exist to ensure Node-1 options; if user only defined deeper, it's still fine
+                        for k,v in wizard["overrides"].items():
+                            current_sheet_overrides[k] = enforce_k_five(v)
+                            mark_session_edit(sheet_name, k)
+                        overrides_upload_all[sheet_name] = current_sheet_overrides
+                        ss_set("branch_overrides_upload", overrides_upload_all)
 
-                    store = infer_branch_options_with_overrides(df_in, overrides_upload)
-                    df_new, tstats = cascade_anchor_reuse_full(df_in, store, vm_scope, [tuple()])
-                    df_in = df_new
-                    wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
-                    st.success(f"Saved Root Node-1. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
+                        # ensure anchor row for VM
+                        vmn = wizard.get("vm","").strip() or "New VM"
+                        if df_in[df_in["Vital Measurement"].map(normalize_text) == vmn].empty:
+                            anchor = {"Vital Measurement": vmn}
+                            for c in LEVEL_COLS: anchor[c] = ""
+                            anchor["Diagnostic Triage"] = ""; anchor["Actions"] = ""
+                            df_in = pd.concat([df_in, pd.DataFrame([anchor], columns=CANON_HEADERS)], ignore_index=True)
 
-            else:
-                n1 = st.text_input("New Node-1 value", key="root_one_n1")
-                cols = st.columns(5)
-                vals = [cols[i].text_input(f"Node-2 option {i+1}", key=f"root_n2_{i}") for i in range(5)]
-                if st.button("Save Node-1 + Node-2 and Auto-cascade", key="root_save_n1n2"):
-                    k1 = level_key_tuple(1, tuple())
-                    existing = [x for x in overrides_upload.get(k1, []) if normalize_text(x)!=""]
-                    if n1 and n1 not in existing:
-                        existing.append(n1)
-                    overrides_upload[k1] = enforce_k_five(existing)
-                    k2 = level_key_tuple(2, (n1,))
-                    overrides_upload[k2] = enforce_k_five(vals)
+                        # cascade from ROOT for this VM
+                        store = infer_branch_options_with_overrides(df_in, current_sheet_overrides)
+                        label_map = build_label_child_map(store)
+                        df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vmn], [tuple()])
+                        df_in = df_new
+                        wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
 
-                    overrides_upload_all[sheet_name] = overrides_upload
-                    ss_set("branch_overrides_upload", overrides_upload_all)
-                    mark_session_edit(sheet_name, k1); mark_session_edit(sheet_name, k2)
-
-                    store = infer_branch_options_with_overrides(df_in, overrides_upload)
-                    df_new, tstats = cascade_anchor_reuse_full(df_in, store, vm_scope, [(n1,)])
-                    df_in = df_new
-                    wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
-                    st.success(f"Saved Node-1 + Node-2. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
+                        st.success(f"Wizard applied. Auto-cascade: +{tstats['new_rows']} rows, {tstats['inplace_filled']} filled anchors.")
+                        # reset wizard
+                        ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
+                with colB:
+                    if st.button("Cancel & Reset Wizard"):
+                        ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
+                        st.experimental_rerun()
 
         # Overrides for this sheet (Upload)
         overrides_upload_all = ss_get("branch_overrides_upload", {})
@@ -865,7 +963,8 @@ with tab1:
                         ss_set("branch_overrides_upload", overrides_upload_all)
                         mark_session_edit(sheet_name, key)
                         store2 = infer_branch_options_with_overrides(df_in, overrides_upload)
-                        df_new, tstats = cascade_anchor_reuse_full(df_in, store2, sorted(set(df_in["Vital Measurement"].map(normalize_text))), [parent])
+                        label_map2 = build_label_child_map(store2)
+                        df_new, tstats = cascade_anchor_reuse_full(df_in, store2, label_map2, sorted(set(df_in["Vital Measurement"].map(normalize_text))), [parent])
                         df_in = df_new
                         wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
                         st.success(f"Saved 5 and auto-cascaded: added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
@@ -904,7 +1003,8 @@ with tab1:
                         ss_set("branch_overrides_upload", overrides_upload_all)
                         mark_session_edit(sheet_name, key)
                         store2 = infer_branch_options_with_overrides(df_in, overrides_upload)
-                        df_new, tstats = cascade_anchor_reuse_full(df_in, store2, sorted(set(df_in["Vital Measurement"].map(normalize_text))), [parent])
+                        label_map2 = build_label_child_map(store2)
+                        df_new, tstats = cascade_anchor_reuse_full(df_in, store2, label_map2, sorted(set(df_in["Vital Measurement"].map(normalize_text))), [parent])
                         df_in = df_new
                         wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
                         st.success(f"Saved 5 and auto-cascaded: added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
@@ -931,7 +1031,8 @@ with tab1:
                         ss_set("branch_overrides_upload", overrides_upload_all)
                         mark_session_edit(sheet_name, key)
                         store2 = infer_branch_options_with_overrides(df_in, overrides_upload)
-                        df_new, tstats = cascade_anchor_reuse_full(df_in, store2, sorted(set(df_in["Vital Measurement"].map(normalize_text))), [parent])
+                        label_map2 = build_label_child_map(store2)
+                        df_new, tstats = cascade_anchor_reuse_full(df_in, store2, label_map2, sorted(set(df_in["Vital Measurement"].map(normalize_text))), [parent])
                         df_in = df_new
                         wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
                         st.success(f"Saved 5 and auto-cascaded: added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
@@ -958,7 +1059,7 @@ with tab1:
             else:
                 merged_overrides = {**overrides_upload, **user_fixes}
                 scope_flag = "session" if include_scope_main.endswith("session") else "all"
-                df_aug, stats, dups_df = build_raw_plus_v625(df_in, merged_overrides, scope_flag, edited_keys_for_sheet)
+                df_aug, stats, dups_df = build_raw_plus_v626(df_in, merged_overrides, scope_flag, edited_keys_for_sheet)
 
                 st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, In-place filled: **{stats['inplace_filled']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
                 st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{up_target_tab}**.")
@@ -1102,7 +1203,7 @@ with tab3:
                             overrides_all = ss_get(override_root, {})
                             overrides_sheet = overrides_all.get(sheet_cur, {})
                             edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_cur, []))
-                            df_aug, stats, dups_df = build_raw_plus_v625(wb[sheet_cur], overrides_sheet, include_scope="all", edited_keys_for_sheet=edited_keys_for_sheet)
+                            df_aug, stats, dups_df = build_raw_plus_v626(wb[sheet_cur], overrides_sheet, include_scope="all", edited_keys_for_sheet=edited_keys_for_sheet)
                             st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{sheet_cur}**.")
                             ok = push_to_google_sheets(sid, sheet_cur, df_aug)
                             if ok:
@@ -1131,10 +1232,24 @@ with tab4:
         if sid_input and sid_input != sid_current:
             ss_set("gs_spreadsheet_id", sid_input)
         include_scope_sym = st.radio("Include scope for Raw+", ["All completed parents","Only parents edited this session"], horizontal=True, key="sym_scope")
-        st.caption("Deep cascade with anchor-reuse is the default and only strategy.")
+        st.caption("Recursive deep cascade with anchor-reuse is the default.")
         push_backup = st.checkbox("Create a backup tab before overwrite", value=True, key="sym_push_backup")
         dry_run_sym = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="sym_dry_run")
         show_dups_sym = st.checkbox("Show duplicates preview after build", value=False, key="sym_show_dups")
+
+    # Export/Import Overrides (per-sheet)
+    with st.expander("📦 Export / Import Overrides (JSON)"):
+        overrides_all = ss_get("branch_overrides_upload", {})
+        overrides_sheet = overrides_all.get(st.session_state.get("sym_sheet", ss_get('sym_sheet','')), {})
+        # The actual active sheet for this tab is selected below; we will rebind after selection.
+
+        st.caption("Export the current sheet’s overrides to a JSON file, or import to replace/merge.")
+        export_col, import_col = st.columns([1,2])
+        with export_col:
+            # We'll prepare after actual sheet selection below
+            st.write("Use after selecting a sheet (below).")
+        with import_col:
+            st.write("Upload JSON after selecting a sheet (below).")
 
     # Undo stack controls
     if st.button("↩️ Undo last branch edit (session)"):
@@ -1184,6 +1299,69 @@ with tab4:
         sheet = st.selectbox("Sheet", list(wb.keys()), key="sym_sheet")
         df = wb.get(sheet, pd.DataFrame())
 
+        # Wire up Export/Import now that we know 'sheet'
+        with st.expander("📦 Export / Import Overrides (JSON)"):
+            overrides_all = ss_get(override_root, {})
+            overrides_sheet = overrides_all.get(sheet, {})
+            col1, col2 = st.columns([1,2])
+            with col1:
+                data = json.dumps(overrides_sheet, indent=2).encode("utf-8")
+                st.download_button("Export overrides.json", data=data, file_name=f"{sheet}_overrides.json", mime="application/json")
+            with col2:
+                upfile = st.file_uploader("Import overrides.json", type=["json"], key="imp_json")
+                import_mode = st.radio("Import mode", ["Replace", "Merge (prefer import)", "Merge (prefer existing)"], horizontal=True)
+                auto_cascade = st.checkbox("Auto-cascade after import", value=True)
+                if upfile is not None and st.button("Apply Import"):
+                    try:
+                        imported = json.loads(upfile.getvalue().decode("utf-8"))
+                        if not isinstance(imported, dict):
+                            st.error("Invalid JSON: expected an object mapping keys to lists.")
+                        else:
+                            stack = ss_get("undo_stack", [])
+                            stack.append({
+                                "context": "symptoms",
+                                "label": "Import overrides JSON",
+                                "override_root": override_root,
+                                "sheet": sheet,
+                                "overrides_sheet_before": overrides_all.get(sheet, {}).copy(),
+                                "df_before": df.copy()
+                            })
+                            ss_set("undo_stack", stack)
+
+                            if import_mode == "Replace":
+                                new_over = {}
+                                for k,v in imported.items():
+                                    new_over[k] = enforce_k_five(v if isinstance(v, list) else [v])
+                                    mark_session_edit(sheet, k)
+                                overrides_all[sheet] = new_over
+                            elif import_mode == "Merge (prefer import)":
+                                cur = overrides_all.get(sheet, {}).copy()
+                                for k,v in imported.items():
+                                    cur[k] = enforce_k_five(v if isinstance(v, list) else [v])
+                                    mark_session_edit(sheet, k)
+                                overrides_all[sheet] = cur
+                            else:  # prefer existing
+                                cur = overrides_all.get(sheet, {}).copy()
+                                for k,v in imported.items():
+                                    if k not in cur:
+                                        cur[k] = enforce_k_five(v if isinstance(v, list) else [v])
+                                        mark_session_edit(sheet, k)
+                                overrides_all[sheet] = cur
+
+                            ss_set(override_root, overrides_all)
+                            st.success("Overrides imported.")
+                            if auto_cascade and not df.empty and validate_headers(df):
+                                store2 = infer_branch_options_with_overrides(df, overrides_all[sheet])
+                                label_map2 = build_label_child_map(store2)
+                                vms = sorted(set(df["Vital Measurement"].map(normalize_text).replace("", np.nan).dropna().unique().tolist()))
+                                df_new, tstats = cascade_anchor_reuse_full(df, store2, label_map2, vms, [tuple()])
+                                wb[sheet] = df_new
+                                if source == "Upload workbook":
+                                    ss_set("upload_workbook", wb)
+                                else:
+                                    ss_set("gs_workbook", wb)
+                                st.info(f"Cascaded: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors filled.")
+
         # Build store + parents
         overrides_current = ss_get(override_root, {}).get(sheet, {})
         store = infer_branch_options_with_overrides(df, overrides_current)
@@ -1214,13 +1392,13 @@ with tab4:
                 def normalize_sheet_df(df0: pd.DataFrame, case_mode: str, syn_map: Dict[str,str]) -> pd.DataFrame:
                     df2 = df0.copy()
                     for col in ["Vital Measurement"] + LEVEL_COLS:
-                        if col not in df2.columns: continue
-                        def _apply(v):
-                            v = normalize_text(v)
-                            v = syn_map.get(v, v)
-                            v = normalize_label(v, case_mode) if case_mode!="None" else v
-                            return v
-                        df2[col] = df2[col].map(_apply)
+                        if col in df2.columns:
+                            def _apply(v):
+                                v = normalize_text(v)
+                                v = syn_map.get(v, v)
+                                v = normalize_label(v, case_mode) if case_mode!="None" else v
+                                return v
+                            df2[col] = df2[col].map(_apply)
                     for col in ["Diagnostic Triage","Actions"]:
                         if col in df2.columns:
                             df2[col] = df2[col].map(normalize_text)
@@ -1405,10 +1583,11 @@ with tab4:
                     overrides_all[sheet] = overrides_sheet
                     ss_set(override_root, overrides_all)
                     mark_session_edit(sheet, keyname)
-                    # Auto-cascade deep with anchor-reuse
+                    # Auto-cascade deep with anchor-reuse + label propagation
                     store2 = infer_branch_options_with_overrides(df, overrides_sheet)
+                    label_map2 = build_label_child_map(store2)
                     vms = sorted(set(df["Vital Measurement"].map(normalize_text).replace("", np.nan).dropna().unique().tolist()))
-                    df_new, tstats = cascade_anchor_reuse_full(df, store2, vms, [parent_tuple])
+                    df_new, tstats = cascade_anchor_reuse_full(df, store2, label_map2, vms, [parent_tuple])
                     wb[sheet] = df_new
                     if source == "Upload workbook":
                         ss_set("upload_workbook", wb)
@@ -1416,6 +1595,87 @@ with tab4:
                         ss_set("gs_workbook", wb)
                     st.success(f"Saved and auto-cascaded: added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors.")
                     st.caption("Tip: use Bulk Push below to write to Google Sheets.")
+
+        # ---------- Conflicts Inspector ----------
+        with st.expander("🧯 Conflicts Inspector (same parent label → different child sets)"):
+            # Build label -> list of (level, parent_tuple, child_set)
+            label_to_sets: Dict[str, List[Tuple[int, Tuple[str,...], Tuple[str,...]]]] = {}
+            for key, children in store.items():
+                if "|" not in key: continue
+                lvl_s, path = key.split("|", 1)
+                try: L = int(lvl_s[1:])
+                except: continue
+                if path == "<ROOT>": continue
+                parent_tuple = tuple(path.split(">"))
+                label = parent_tuple[-1]
+                child_set = tuple([c for c in children if normalize_text(c)!=""])
+                label_to_sets.setdefault(label, []).append((L, parent_tuple, tuple(sorted(child_set))))
+
+            conflicts = []
+            for label, entries_list in label_to_sets.items():
+                variants = sorted(set([s for (_,_,s) in entries_list]))
+                if len(variants) > 1:
+                    conflicts.append((label, variants, entries_list))
+
+            if not conflicts:
+                st.success("No conflicts detected 🎉")
+            else:
+                st.warning(f"Found {len(conflicts)} conflicting labels.")
+                resolve_ops = {}
+                for i, (label, variants, entries_list) in enumerate(conflicts, start=1):
+                    with st.expander(f"{i}. '{label}' has {len(variants)} different child sets"):
+                        st.write("Variants:")
+                        for j, var in enumerate(variants, start=1):
+                            st.code(f"{j}. {list(var)}")
+                        union_children = []
+                        seen = set()
+                        for var in variants:
+                            for c in var:
+                                if c not in seen and c!="":
+                                    union_children.append(c); seen.add(c)
+                        union_children = enforce_k_five(union_children)
+                        sel = st.multiselect("Resolve to EXACTLY 5 children (choose up to 5)", union_children, default=union_children[:5], key=f"ci_{label}")
+                        sel = enforce_k_five(sel)
+                        st.caption(f"Will apply to all occurrences of parent label '{label}' across levels (affecting next-level children).")
+                        resolve_ops[label] = sel
+
+                if st.button("Apply resolutions across this sheet"):
+                    overrides_all = ss_get(override_root, {})
+                    overrides_sheet = overrides_all.get(sheet, {}).copy()
+                    stack = ss_get("undo_stack", [])
+                    stack.append({
+                        "context": "symptoms",
+                        "label": "Conflicts resolution",
+                        "override_root": override_root,
+                        "sheet": sheet,
+                        "overrides_sheet_before": overrides_all.get(sheet, {}).copy(),
+                        "df_before": df.copy()
+                    })
+                    ss_set("undo_stack", stack)
+                    # For each key in store, if parent label matches and not ROOT, override its children
+                    for key in list(store.keys()):
+                        if "|" not in key: continue
+                        lvl_s, path = key.split("|", 1)
+                        if path == "<ROOT>": continue
+                        parent_tuple = tuple(path.split(">"))
+                        label = parent_tuple[-1]
+                        if label in resolve_ops:
+                            overrides_sheet[key] = enforce_k_five(resolve_ops[label])
+                            mark_session_edit(sheet, key)
+                    overrides_all[sheet] = overrides_sheet
+                    ss_set(override_root, overrides_all)
+
+                    # cascade
+                    store2 = infer_branch_options_with_overrides(df, overrides_sheet)
+                    label_map2 = build_label_child_map(store2)
+                    vms = sorted(set(df["Vital Measurement"].map(normalize_text).replace("", np.nan).dropna().unique().tolist()))
+                    df_new, tstats = cascade_anchor_reuse_full(df, store2, label_map2, vms, [tuple()])
+                    wb[sheet] = df_new
+                    if source == "Upload workbook":
+                        ss_set("upload_workbook", wb)
+                    else:
+                        ss_set("gs_workbook", wb)
+                    st.success(f"Applied resolutions. Cascaded: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors.")
 
         st.markdown("---")
         st.markdown("#### Bulk Push Raw+ for this sheet")
@@ -1434,7 +1694,7 @@ with tab4:
                 if not sid or not target_tab:
                     st.error("Missing Spreadsheet ID or target tab.")
                 else:
-                    df_aug, stats, dups_df = build_raw_plus_v625(df, overrides_current, scope_flag, edited_keys_for_sheet)
+                    df_aug, stats, dups_df = build_raw_plus_v626(df, overrides_current, scope_flag, edited_keys_for_sheet)
                     st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, In-place filled: **{stats['inplace_filled']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
                     st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{target_tab}**.")
                     if dry_run_sym:
@@ -1469,7 +1729,7 @@ with tab4:
                             ss_set("saved_targets", saved)
                             st.success(f"Pushed {len(df_aug)} rows to '{target_tab}'.")
         with colB:
-            st.caption("Raw+ always uses deep cascade with anchor-reuse in v6.2.5.")
+            st.caption("Raw+ uses recursive deep cascade with anchor-reuse in v6.2.6.")
             if show_dups_sym and 'dups_df' in locals():
                 if not dups_df.empty:
                     st.warning(f"Previewing {len(dups_df)} duplicate rows (already existed).")
@@ -1580,7 +1840,6 @@ with tab6:
 
             # Persist Red Flag changes back to session map
             if st.button("💾 Save Red Flag changes"):
-                # Build a unified edited view to update entire set shown (only for symptoms present in the editor)
                 edited_map = quality_map.copy()
                 for _, row in edited.iterrows():
                     edited_map[row["Symptom"]] = "Red Flag" if bool(row["Red Flag"]) else "Normal"
