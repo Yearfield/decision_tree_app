@@ -192,7 +192,7 @@ def build_label_child_map(store: Dict[str, List[str]]) -> Dict[str, List[str]]:
     for key, children in store.items():
         # key like "L2|parent1>parent2" OR "L1|<ROOT>"
         try:
-            lvl_s, path = key.split("|", 1)
+            _lvl_s, path = key.split("|", 1)
         except ValueError:
             continue
         if path == "<ROOT>":
@@ -571,7 +571,7 @@ with st.sidebar:
     st.markdown("""
 - **Recursive deep cascade:** Uses a global label→children map to propagate entire subtrees; anchor-reuse prevents duplicates.
 - **VM Builder & Wizard:** Add a Vital Measurement and its branches; auto-cascade forward.
-- **Dictionary:** Tag symptoms as **Red Flag**; exported in CSV.
+- **Dictionary:** Filter/search + toggle **Red Flag** per symptom; export CSV.
 - Use **Dry-run** to preview; keep **Backup** on for easy rollback.
 """)
 
@@ -814,7 +814,6 @@ with tab1:
                         # merge into sheet overrides and cascade for this VM
                         overrides_upload_all = ss_get("branch_overrides_upload", {})
                         current_sheet_overrides = overrides_upload_all.get(sheet_name, {}).copy()
-                        # L1|<ROOT> must exist to ensure Node-1 options; if user only defined deeper, it's still fine
                         for k,v in wizard["overrides"].items():
                             current_sheet_overrides[k] = enforce_k_five(v)
                             mark_session_edit(sheet_name, k)
@@ -836,7 +835,7 @@ with tab1:
                         df_in = df_new
                         wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
 
-                        st.success(f"Wizard applied. Auto-cascade: +{tstats['new_rows']} rows, {tstats['inplace_filled']} filled anchors.")
+                        st.success(f"Wizard applied. Auto-cascade: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors filled.")
                         # reset wizard
                         ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
                 with colB:
@@ -1241,12 +1240,9 @@ with tab4:
     with st.expander("📦 Export / Import Overrides (JSON)"):
         overrides_all = ss_get("branch_overrides_upload", {})
         overrides_sheet = overrides_all.get(st.session_state.get("sym_sheet", ss_get('sym_sheet','')), {})
-        # The actual active sheet for this tab is selected below; we will rebind after selection.
-
         st.caption("Export the current sheet’s overrides to a JSON file, or import to replace/merge.")
         export_col, import_col = st.columns([1,2])
         with export_col:
-            # We'll prepare after actual sheet selection below
             st.write("Use after selecting a sheet (below).")
         with import_col:
             st.write("Upload JSON after selecting a sheet (below).")
@@ -1361,6 +1357,8 @@ with tab4:
                                 else:
                                     ss_set("gs_workbook", wb)
                                 st.info(f"Cascaded: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors filled.")
+                    except Exception as e:
+                        st.error(f"Import failed: {e}")
 
         # Build store + parents
         overrides_current = ss_get(override_root, {}).get(sheet, {})
