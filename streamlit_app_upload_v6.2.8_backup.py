@@ -1,4 +1,4 @@
-# streamlit_app_upload.py — Version 6.2.8
+# streamlit_app_upload.py — Version 6.2.9
 
 import io
 import json
@@ -10,7 +10,7 @@ import streamlit as st
 from datetime import datetime
 
 # ============ VERSION / CONFIG ============
-APP_VERSION = "v6.2.8"
+APP_VERSION = "v6.2.9"
 CANON_HEADERS = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]
 LEVEL_COLS = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
 MAX_LEVELS = 5
@@ -35,7 +35,7 @@ def mark_session_edit(sheet: str, keyname: str):
 
 def add_thumb(category: str, identifier: str):
     # category in {"parent_keys","conflict_labels"}
-    thumbs = ss_get("thumb_marks", {"parent_keys": set(), "conflict_labels": set()})
+    thumbs = ss_get("thumb_marks", {"parent_keys": [], "conflict_labels": []})
     s = set(thumbs.get(category, []))
     s.add(identifier)
     thumbs[category] = list(s)
@@ -369,8 +369,8 @@ def cascade_anchor_reuse_full(
 
     return df, total
 
-# ============ Raw+ builder (v6.2.8) ============
-def build_raw_plus_v628(
+# ============ Raw+ builder (v6.2.9) ============
+def build_raw_plus_v629(
     df: pd.DataFrame,
     overrides: Dict[str, List[str]],
     include_scope: str,
@@ -540,12 +540,16 @@ with left:
     st.title(f"🌳 Decision Tree Builder — {APP_VERSION}")
 with right:
     badges = ""
+    # Show progress badge if any workbook loaded
     wb_upload = ss_get("upload_workbook", {})
+    wb_gs = ss_get("gs_workbook", {})
+    df0 = None
     if wb_upload:
-        first_sheet = next(iter(wb_upload))
-        df0 = wb_upload[first_sheet]
-        if validate_headers(df0) and not df0.empty:
-            badges = progress_badge_html(df0)
+        df0 = wb_upload[next(iter(wb_upload))]
+    elif wb_gs:
+        df0 = wb_gs[next(iter(wb_gs))]
+    if isinstance(df0, pd.DataFrame) and validate_headers(df0) and not df0.empty:
+        badges = progress_badge_html(df0)
     st.markdown(badges, unsafe_allow_html=True)
     if "gcp_service_account" not in st.secrets:
         st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
@@ -564,122 +568,126 @@ with st.sidebar:
 - Use **Dry-run** to preview; keep **Backup** on for easy rollback.
 """)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "⬆️ Upload Excel/CSV",
-    "📄 Google Sheets Mode",
+# ===== Tabs =====
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📥 Source",
+    "🗂️ Workspace Selection",
     "🧪 Fill Diagnostic & Actions",
     "🧬 Symptoms",
     "📜 Push Log",
-    "📚 Dictionary"
+    "📚 Dictionary",
+    "🧮 Calculator"
 ])
 
-# ---------- Upload mode ----------
+# ---------- Tab 1: Source ----------
 with tab1:
-    st.subheader("Upload your workbook")
-    file = st.file_uploader("Upload XLSX or CSV", type=["xlsx","xls","csv"])
+    st.subheader("Source")
+    st.caption("Upload a workbook or connect to Google Sheets. You can also build new VMs here.")
+    colA, colB = st.columns(2)
 
-    st.markdown("**Create a new sheet (in-session)**")
-    new_sheet_name = st.text_input("New sheet name (upload workbook)", key="new_upload_sheet")
-    if st.button("Create sheet (upload workbook)"):
-        wb = ss_get("upload_workbook", {})
-        if not new_sheet_name:
-            st.warning("Please enter a sheet name.")
-        elif new_sheet_name in wb:
-            st.warning("A sheet with that name already exists in the current session workbook.")
-        else:
-            empty = pd.DataFrame(columns=CANON_HEADERS)
-            wb[new_sheet_name] = empty
-            ss_set("upload_workbook", wb)
-            st.success(f"Created new sheet '{new_sheet_name}' in-session. Remember to Download workbook to save it locally.")
-
-    if file is not None:
-        if file.name.lower().endswith(".csv"):
-            df = pd.read_csv(file)
-            for c in CANON_HEADERS:
-                if c not in df.columns:
-                    df[c] = ""
-            df = df[CANON_HEADERS]
-            sheets = {"Sheet1": df}
-        else:
-            xls = pd.ExcelFile(file)
-            sheets = {}
-            for name in xls.sheet_names:
-                dfx = xls.parse(name)
-                dfx.columns = [normalize_text(c) for c in dfx.columns]
+    # --- Upload workbook ---
+    with colA:
+        st.markdown("### 📂 Upload Workbook")
+        file = st.file_uploader("Upload XLSX or CSV", type=["xlsx","xls","csv"])
+        if file is not None:
+            if file.name.lower().endswith(".csv"):
+                df = pd.read_csv(file)
                 for c in CANON_HEADERS:
-                    if c not in dfx.columns:
-                        dfx[c] = ""
-                dfx = dfx[CANON_HEADERS]
-                node_block = ["Vital Measurement"] + LEVEL_COLS
-                dfx = dfx[~dfx[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)].copy()
-                sheets[name] = dfx
-        ss_set("upload_workbook", {k: v.copy() for k, v in sheets.items()})
-        ss_set("upload_filename", file.name)
+                    if c not in df.columns:
+                        df[c] = ""
+                df = df[CANON_HEADERS]
+                sheets = {"Sheet1": df}
+            else:
+                xls = pd.ExcelFile(file)
+                sheets = {}
+                for name in xls.sheet_names:
+                    dfx = xls.parse(name)
+                    dfx.columns = [normalize_text(c) for c in dfx.columns]
+                    for c in CANON_HEADERS:
+                        if c not in dfx.columns:
+                            dfx[c] = ""
+                    dfx = dfx[CANON_HEADERS]
+                    node_block = ["Vital Measurement"] + LEVEL_COLS
+                    dfx = dfx[~dfx[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)].copy()
+                    sheets[name] = dfx
+            ss_set("upload_workbook", {k: v.copy() for k, v in sheets.items()})
+            ss_set("upload_filename", file.name)
+            st.success(f"Loaded {len(sheets)} sheet(s) into the Upload workbook session.")
 
-    wb = ss_get("upload_workbook", {})
-    if not wb:
-        st.info("Upload a workbook to continue.")
-    else:
-        st.write(f"Found {len(wb)} sheet(s). Choose one to process:")
-        sheet_name = st.selectbox("Sheet", list(wb.keys()))
-        df_in = wb[sheet_name].copy()
+        st.markdown("**Create a new empty sheet (in-session)**")
+        new_sheet_name = st.text_input("New sheet name (upload workbook)", key="new_upload_sheet")
+        if st.button("Create sheet (upload workbook)"):
+            wb = ss_get("upload_workbook", {})
+            if not new_sheet_name:
+                st.warning("Please enter a sheet name.")
+            elif new_sheet_name in wb:
+                st.warning("A sheet with that name already exists in the current session workbook.")
+            else:
+                empty = pd.DataFrame(columns=CANON_HEADERS)
+                wb[new_sheet_name] = empty
+                ss_set("upload_workbook", wb)
+                st.success(f"Created new sheet '{new_sheet_name}' in-session. Download to persist locally later.")
 
-        if not validate_headers(df_in):
-            st.error("Headers mismatch. First 8 columns must be: " + ", ".join(CANON_HEADERS)); st.stop()
-
-        # Progress summary
-        ok_p, total_p = compute_parent_depth_score(df_in)
-        ok_r, total_r = compute_row_path_score(df_in)
-        p1, p2 = st.columns(2)
-        with p1:
-            st.metric("Parents with 5 children", f"{ok_p}/{total_p}")
-            st.progress(0 if total_p==0 else ok_p/total_p)
-        with p2:
-            st.metric("Rows with full path", f"{ok_r}/{total_r}")
-            st.progress(0 if total_r==0 else ok_r/total_r)
-
-        # ===== Preview (50 rows) with pager
-        total_rows = len(df_in)
-        st.markdown("#### Preview (50 rows)")
-        if total_rows <= 50:
-            st.caption(f"Showing all {total_rows} rows.")
-            st.dataframe(df_in, use_container_width=True)
+    # --- Google Sheets loader ---
+    with colB:
+        st.markdown("### 🔄 Load / Refresh from Google Sheets")
+        if "gcp_service_account" not in st.secrets:
+            st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
         else:
-            state_key = f"preview_start_{sheet_name}"
-            start_idx = int(ss_get(state_key, 0))
-            cprev, cnum, cnext = st.columns([1,2,1])
-            with cprev:
-                if st.button("◀ Previous 50"):
-                    start_idx = max(0, start_idx - 50)
-            with cnum:
-                start_1based = st.number_input(
-                    "Start row (1-based)",
-                    min_value=1,
-                    max_value=max(1, total_rows-49),
-                    value=start_idx+1,
-                    step=50,
-                    help="Pick where to start the 50-row preview."
-                )
-                start_idx = int(start_1based) - 1
-            with cnext:
-                if st.button("Next 50 ▶"):
-                    start_idx = min(max(0, total_rows - 50), start_idx + 50)
-            ss_set(state_key, start_idx)
-            end_idx = min(start_idx + 50, total_rows)
-            st.caption(f"Showing rows **{start_idx+1}–{end_idx}** of **{total_rows}**.")
-            st.dataframe(df_in.iloc[start_idx:end_idx], use_container_width=True)
+            st.caption("Service account ready ✓")
+        spreadsheet_id = st.text_input("Spreadsheet ID", value=ss_get("gs_spreadsheet_id",""), key="gs_id_src")
+        if spreadsheet_id: ss_set("gs_spreadsheet_id", spreadsheet_id)
+        sheet_name_g = st.text_input("Sheet name to load (e.g., BP)", value="BP", key="gs_sheet_src")
+        run_btn = st.button("Load or Refresh from Google Sheets")
+        def get_gsheet_client():
+            import gspread
+            from google.oauth2.service_account import Credentials
+            sa_info = st.secrets["gcp_service_account"]
+            scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+            creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+            return gspread.authorize(creds)
+        if run_btn:
+            try:
+                client = get_gsheet_client()
+                sh = client.open_by_key(spreadsheet_id)
+                ws = sh.worksheet(sheet_name_g)
+                values = ws.get_all_values()
+                if not values: st.error("Selected sheet is empty."); st.stop()
+                header = values[0]; rows = values[1:]
+                df_g = pd.DataFrame(rows, columns=header)
+                df_g.columns = [normalize_text(c) for c in df_g.columns]
+                if not validate_headers(df_g): st.error("Sheet does not match canonical headers."); st.stop()
+                for c in CANON_HEADERS: df_g[c] = df_g[c].map(normalize_text)
+                node_block = ["Vital Measurement"] + LEVEL_COLS
+                df_g = df_g[~df_g[node_block].apply(lambda r: all(v == "" for v in r), axis=1)].copy()
+                wb_g = ss_get("gs_workbook", {}); wb_g[sheet_name_g] = df_g; ss_set("gs_workbook", wb_g)
+                st.success(f"Loaded '{sheet_name_g}' from Google Sheets.")
+                st.dataframe(df_g.head(50), use_container_width=True)
+            except Exception as e:
+                st.error(f"Google Sheets error: {e}")
 
-        # ===== VM builder (quick) =====
-        with st.expander("🧩 VM Builder (create Vital Measurements and auto-cascade)"):
-            vm_mode = st.radio("Mode", ["Create VM with 5 Node-1 options","Create VM with one Node-1 and its 5 Node-2 options"], horizontal=False)
-            overrides_upload_all = ss_get("branch_overrides_upload", {})
-            overrides_upload = overrides_upload_all.get(sheet_name, {}).copy()
+    st.markdown("---")
 
+    # ===== VM builder (quick) =====
+    st.markdown("### 🧩 VM Builder (create Vital Measurements and auto-cascade)")
+    # Choose target workbook context for builder actions
+    source_for_builder = st.radio("Apply VM Builder to:", ["Upload workbook","Google Sheets workbook"], horizontal=True, key="vm_builder_source")
+    if source_for_builder == "Upload workbook":
+        wb = ss_get("upload_workbook", {})
+        target_sheet_options = list(wb.keys()) or ["(no upload sheets)"]
+        target_sheet = st.selectbox("Target sheet", target_sheet_options, key="vm_builder_upload_sheet")
+        if target_sheet == "(no upload sheets)":
+            st.info("Create or load an upload sheet first.")
+        else:
+            df_in = wb[target_sheet].copy()
+            overrides_all = ss_get("branch_overrides_upload", {})
+            overrides_upload = overrides_all.get(target_sheet, {}).copy()
+            vm_mode = st.radio("Mode", ["Create VM with 5 Node-1 options","Create VM with one Node-1 and its 5 Node-2 options"], horizontal=False, key="vm_builder_mode_u")
             if vm_mode == "Create VM with 5 Node-1 options":
-                vm_name = st.text_input("Vital Measurement name", key="vm_new_name")
+                vm_name = st.text_input("Vital Measurement name", key="vm_new_name_u")
                 cols = st.columns(5)
-                vals_n1 = [cols[i].text_input(f"Node-1 option {i+1}", key=f"vm_n1_{i}") for i in range(5)]
-                if st.button("Create VM and Auto-cascade", key="vm_create_n1"):
+                vals_n1 = [cols[i].text_input(f"Node-1 option {i+1}", key=f"vm_n1_u_{i}") for i in range(5)]
+                if st.button("Create VM and Auto-cascade", key="vm_create_n1_u"):
                     if not vm_name.strip():
                         st.error("Enter a Vital Measurement name.")
                     else:
@@ -688,27 +696,23 @@ with tab1:
                             for c in LEVEL_COLS: anchor[c] = ""
                             anchor["Diagnostic Triage"] = ""; anchor["Actions"] = ""
                             df_in = pd.concat([df_in, pd.DataFrame([anchor], columns=CANON_HEADERS)], ignore_index=True)
-
                         k1 = level_key_tuple(1, tuple())
                         overrides_upload[k1] = enforce_k_five(vals_n1)
-                        overrides_upload_all[sheet_name] = overrides_upload
-                        ss_set("branch_overrides_upload", overrides_upload_all)
-                        mark_session_edit(sheet_name, k1)
-
+                        overrides_all[target_sheet] = overrides_upload
+                        ss_set("branch_overrides_upload", overrides_all)
+                        mark_session_edit(target_sheet, k1)
                         store = infer_branch_options_with_overrides(df_in, overrides_upload)
                         label_map = build_label_child_map(store)
                         df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vm_name], [tuple()])
-                        df_in = df_new
-                        wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
-                        st.success(f"VM '{vm_name}' created. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors. 👍")
+                        wb[target_sheet] = df_new; ss_set("upload_workbook", wb)
+                        st.success(f"VM '{vm_name}' created. Auto-cascade +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors. 👍")
                         add_thumb("parent_keys", level_key_tuple(1, tuple()))
-
             else:
-                vm_name = st.text_input("Vital Measurement name", key="vm2_new_name")
-                n1 = st.text_input("Node-1 value", key="vm2_n1")
+                vm_name = st.text_input("Vital Measurement name", key="vm2_new_name_u")
+                n1 = st.text_input("Node-1 value", key="vm2_n1_u")
                 cols = st.columns(5)
-                vals_n2 = [cols[i].text_input(f"Node-2 option {i+1}", key=f"vm2_n2_{i}") for i in range(5)]
-                if st.button("Create VM + Node-1 + Node-2 and Auto-cascade", key="vm_create_n1n2"):
+                vals_n2 = [cols[i].text_input(f"Node-2 option {i+1}", key=f"vm2_n2_u_{i}") for i in range(5)]
+                if st.button("Create VM + Node-1 + Node-2 and Auto-cascade", key="vm_create_n1n2_u"):
                     if not vm_name.strip() or not n1.strip():
                         st.error("Enter a Vital Measurement and Node-1.")
                     else:
@@ -717,7 +721,6 @@ with tab1:
                             for c in LEVEL_COLS: anchor[c] = ""
                             anchor["Diagnostic Triage"] = ""; anchor["Actions"] = ""
                             df_in = pd.concat([df_in, pd.DataFrame([anchor], columns=CANON_HEADERS)], ignore_index=True)
-
                         k1 = level_key_tuple(1, tuple())
                         existing = [x for x in overrides_upload.get(k1, []) if normalize_text(x)!=""]
                         if n1 and n1 not in existing:
@@ -725,81 +728,152 @@ with tab1:
                         overrides_upload[k1] = enforce_k_five(existing)
                         k2 = level_key_tuple(2, (n1,))
                         overrides_upload[k2] = enforce_k_five(vals_n2)
-
-                        overrides_upload_all[sheet_name] = overrides_upload
-                        ss_set("branch_overrides_upload", overrides_upload_all)
-                        mark_session_edit(sheet_name, k1); mark_session_edit(sheet_name, k2)
-
+                        overrides_all[target_sheet] = overrides_upload
+                        ss_set("branch_overrides_upload", overrides_all)
+                        mark_session_edit(target_sheet, k1); mark_session_edit(target_sheet, k2)
                         store = infer_branch_options_with_overrides(df_in, overrides_upload)
                         label_map = build_label_child_map(store)
                         df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vm_name], [(n1,)])
-                        df_in = df_new
-                        wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
-                        st.success(f"VM '{vm_name}' with Node-1 '{n1}' created. Auto-cascade added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors. 👍")
+                        wb[target_sheet] = df_new; ss_set("upload_workbook", wb)
+                        st.success(f"VM '{vm_name}' with Node-1 '{n1}' created. Auto-cascade +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors. 👍")
+                        add_thumb("parent_keys", level_key_tuple(2, (n1,)))
+    else:
+        wb = ss_get("gs_workbook", {})
+        target_sheet_options = list(wb.keys()) or ["(no GS sheets)"]
+        target_sheet = st.selectbox("Target sheet", target_sheet_options, key="vm_builder_gs_sheet")
+        if target_sheet == "(no GS sheets)":
+            st.info("Load a sheet from Google Sheets first (top-right of this tab).")
+        else:
+            df_in = wb[target_sheet].copy()
+            overrides_all = ss_get("branch_overrides_gs", {})
+            overrides_gs = overrides_all.get(target_sheet, {}).copy()
+            vm_mode = st.radio("Mode", ["Create VM with 5 Node-1 options","Create VM with one Node-1 and its 5 Node-2 options"], horizontal=False, key="vm_builder_mode_gs")
+            if vm_mode == "Create VM with 5 Node-1 options":
+                vm_name = st.text_input("Vital Measurement name", key="vm_new_name_gs")
+                cols = st.columns(5)
+                vals_n1 = [cols[i].text_input(f"Node-1 option {i+1}", key=f"vm_n1_gs_{i}") for i in range(5)]
+                if st.button("Create VM and Auto-cascade", key="vm_create_n1_gs"):
+                    if not vm_name.strip():
+                        st.error("Enter a Vital Measurement name.")
+                    else:
+                        if df_in[df_in["Vital Measurement"].map(normalize_text) == vm_name].empty:
+                            anchor = {"Vital Measurement": vm_name}
+                            for c in LEVEL_COLS: anchor[c] = ""
+                            anchor["Diagnostic Triage"] = ""; anchor["Actions"] = ""
+                            df_in = pd.concat([df_in, pd.DataFrame([anchor], columns=CANON_HEADERS)], ignore_index=True)
+                        k1 = level_key_tuple(1, tuple())
+                        overrides_gs[k1] = enforce_k_five(vals_n1)
+                        overrides_all[target_sheet] = overrides_gs
+                        ss_set("branch_overrides_gs", overrides_all)
+                        mark_session_edit(target_sheet, k1)
+                        store = infer_branch_options_with_overrides(df_in, overrides_gs)
+                        label_map = build_label_child_map(store)
+                        df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vm_name], [tuple()])
+                        wb[target_sheet] = df_new; ss_set("gs_workbook", wb)
+                        st.success(f"VM '{vm_name}' created. Auto-cascade +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors. 👍")
+                        add_thumb("parent_keys", level_key_tuple(1, tuple()))
+            else:
+                vm_name = st.text_input("Vital Measurement name", key="vm2_new_name_gs")
+                n1 = st.text_input("Node-1 value", key="vm2_n1_gs")
+                cols = st.columns(5)
+                vals_n2 = [cols[i].text_input(f"Node-2 option {i+1}", key=f"vm2_n2_gs_{i}") for i in range(5)]
+                if st.button("Create VM + Node-1 + Node-2 and Auto-cascade", key="vm_create_n1n2_gs"):
+                    if not vm_name.strip() or not n1.strip():
+                        st.error("Enter a Vital Measurement and Node-1.")
+                    else:
+                        if df_in[df_in["Vital Measurement"].map(normalize_text) == vm_name].empty:
+                            anchor = {"Vital Measurement": vm_name}
+                            for c in LEVEL_COLS: anchor[c] = ""
+                            anchor["Diagnostic Triage"] = ""; anchor["Actions"] = ""
+                            df_in = pd.concat([df_in, pd.DataFrame([anchor], columns=CANON_HEADERS)], ignore_index=True)
+                        k1 = level_key_tuple(1, tuple())
+                        existing = [x for x in overrides_gs.get(k1, []) if normalize_text(x)!=""]
+                        if n1 and n1 not in existing:
+                            existing.append(n1)
+                        overrides_gs[k1] = enforce_k_five(existing)
+                        k2 = level_key_tuple(2, (n1,))
+                        overrides_gs[k2] = enforce_k_five(vals_n2)
+                        overrides_all[target_sheet] = overrides_gs
+                        ss_set("branch_overrides_gs", overrides_all)
+                        mark_session_edit(target_sheet, k1); mark_session_edit(target_sheet, k2)
+                        store = infer_branch_options_with_overrides(df_in, overrides_gs)
+                        label_map = build_label_child_map(store)
+                        df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vm_name], [(n1,)])
+                        wb[target_sheet] = df_new; ss_set("gs_workbook", wb)
+                        st.success(f"VM '{vm_name}' with Node-1 '{n1}' created. Auto-cascade +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors. 👍")
                         add_thumb("parent_keys", level_key_tuple(2, (n1,)))
 
-        # ===== 🧙 VM Build Wizard =====
-        with st.expander("🧙 VM Build Wizard (step-by-step to Node 5)"):
-            wizard = ss_get("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
-            vm_input = st.text_input("VM name (applies cascade/rows for this VM only)", value=wizard.get("vm",""))
-            if not wizard["active"]:
-                if st.button("Start Wizard"):
-                    wizard = {"vm": vm_input.strip(), "queue":[()], "overrides":{}, "active": True}
+    st.markdown("---")
+    # ===== 🧙 VM Build Wizard =====
+    st.markdown("### 🧙 VM Build Wizard (step-by-step to Node 5)")
+    wizard = ss_get("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
+    vm_input = st.text_input("VM name (applies cascade/rows for this VM only)", value=wizard.get("vm",""), key="wiz_vm_name")
+    if not wizard["active"]:
+        if st.button("Start Wizard"):
+            wizard = {"vm": vm_input.strip(), "queue":[()], "overrides":{}, "active": True}
+            ss_set("vm_wizard", wizard)
+            st.experimental_rerun()
+    else:
+        if vm_input.strip() != wizard["vm"]:
+            wizard["vm"] = vm_input.strip()
+            ss_set("vm_wizard", wizard)
+
+        if not wizard["queue"]:
+            st.success("Wizard queue is empty. You can Finish & Apply or Reset.")
+        else:
+            current_parent = wizard["queue"][0]
+            L = len(current_parent)+1
+            st.write(f"**Current parent path:** `{ display_parent(current_parent) }` — define children for **Node {L}**")
+            cols = st.columns(5)
+            vals = [cols[i].text_input(f"Child {i+1}", key=f"wiz_{L}_{'__'.join(current_parent)}_{i}") for i in range(5)]
+            fill_other = st.checkbox("Fill remaining blanks with 'Other'", key=f"wiz_other_{L}_{'__'.join(current_parent)}")
+            if fill_other:
+                vals = [v if v.strip() else "Other" for v in vals]
+            vals = enforce_k_five(vals)
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("Save children & Next"):
+                    key = level_key_tuple(L, current_parent)
+                    wizard["overrides"][key] = vals
+                    if L < MAX_LEVELS:
+                        for v in [normalize_text(x) for x in vals if normalize_text(x)!=""]:
+                            wizard["queue"].append(current_parent + (v,))
+                    wizard["queue"].pop(0)
                     ss_set("vm_wizard", wizard)
-                    st.rerun()
-            else:
-                if vm_input.strip() != wizard["vm"]:
-                    wizard["vm"] = vm_input.strip()
+                    st.experimental_rerun()
+            with c2:
+                if st.button("Skip this parent"):
+                    wizard["queue"].pop(0)
                     ss_set("vm_wizard", wizard)
+                    st.experimental_rerun()
+            with c3:
+                if st.button("Reset Wizard"):
+                    ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
+                    st.experimental_rerun()
 
-                if not wizard["queue"]:
-                    st.success("Wizard queue is empty. You can Finish & Apply or Reset.")
-                else:
-                    current_parent = wizard["queue"][0]
-                    L = len(current_parent)+1
-                    st.write(f"**Current parent path:** `{ display_parent(current_parent) }` — define children for **Node {L}**")
-                    cols = st.columns(5)
-                    vals = [cols[i].text_input(f"Child {i+1}", key=f"wiz_{L}_{'__'.join(current_parent)}_{i}") for i in range(5)]
-                    fill_other = st.checkbox("Fill remaining blanks with 'Other'", key=f"wiz_other_{L}_{'__'.join(current_parent)}")
-                    if fill_other:
-                        vals = [v if v.strip() else "Other" for v in vals]
-                    vals = enforce_k_five(vals)
-
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        if st.button("Save children & Next"):
-                            key = level_key_tuple(L, current_parent)
-                            wizard["overrides"][key] = vals
-                            if L < MAX_LEVELS:
-                                for v in [normalize_text(x) for x in vals if normalize_text(x)!=""]:
-                                    wizard["queue"].append(current_parent + (v,))
-                            wizard["queue"].pop(0)
-                            ss_set("vm_wizard", wizard)
-                            st.rerun()
-                    with c2:
-                        if st.button("Skip this parent"):
-                            wizard["queue"].pop(0)
-                            ss_set("vm_wizard", wizard)
-                            st.rerun()
-                    with c3:
-                        if st.button("Reset Wizard"):
-                            ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
-                            st.experimental_rerun()
-
-                st.markdown("---")
+        st.markdown("---")
+        # Decide where to apply wizard: Upload or GS workbook
+        target_env = st.radio("Apply wizard to:", ["Upload workbook","Google Sheets workbook"], horizontal=True, key="wiz_target_env")
+        if target_env == "Upload workbook":
+            wb_target = ss_get("upload_workbook", {})
+            sheet_target_options = list(wb_target.keys()) or ["(no upload sheets)"]
+            sheet_target = st.selectbox("Target sheet", sheet_target_options, key="wiz_target_upload_sheet")
+            if sheet_target != "(no upload sheets)":
                 colA, colB = st.columns(2)
                 with colA:
-                    if st.button("Finish & Apply to this sheet"):
-                        overrides_upload_all = ss_get("branch_overrides_upload", {})
-                        current_sheet_overrides = overrides_upload_all.get(sheet_name, {}).copy()
+                    if st.button("Finish & Apply to Upload sheet"):
+                        overrides_all = ss_get("branch_overrides_upload", {})
+                        current_sheet_overrides = overrides_all.get(sheet_target, {}).copy()
                         for k,v in wizard["overrides"].items():
                             current_sheet_overrides[k] = enforce_k_five(v)
-                            mark_session_edit(sheet_name, k)
+                            mark_session_edit(sheet_target, k)
                             add_thumb("parent_keys", k)
-                        overrides_upload_all[sheet_name] = current_sheet_overrides
-                        ss_set("branch_overrides_upload", overrides_upload_all)
+                        overrides_all[sheet_target] = current_sheet_overrides
+                        ss_set("branch_overrides_upload", overrides_all)
 
                         vmn = wizard.get("vm","").strip() or "New VM"
+                        df_in = wb_target.get(sheet_target, pd.DataFrame()).copy()
                         if df_in[df_in["Vital Measurement"].map(normalize_text) == vmn].empty:
                             anchor = {"Vital Measurement": vmn}
                             for c in LEVEL_COLS: anchor[c] = ""
@@ -809,90 +883,127 @@ with tab1:
                         store = infer_branch_options_with_overrides(df_in, current_sheet_overrides)
                         label_map = build_label_child_map(store)
                         df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vmn], [tuple()])
-                        df_in = df_new
-                        wb[sheet_name] = df_in; ss_set("upload_workbook", wb)
-
+                        wb_target[sheet_target] = df_new; ss_set("upload_workbook", wb_target)
                         st.success(f"Wizard applied. Auto-cascade: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors filled. 👍")
                         ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
                 with colB:
-                    if st.button("Cancel & Reset Wizard"):
+                    if st.button("Cancel & Reset Wizard (Upload)"):
+                        ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
+                        st.experimental_rerun()
+            else:
+                st.info("Create or load an upload sheet first.")
+        else:
+            wb_target = ss_get("gs_workbook", {})
+            sheet_target_options = list(wb_target.keys()) or ["(no GS sheets)"]
+            sheet_target = st.selectbox("Target sheet", sheet_target_options, key="wiz_target_gs_sheet")
+            if sheet_target != "(no GS sheets)":
+                colA, colB = st.columns(2)
+                with colA:
+                    if st.button("Finish & Apply to Google Sheets sheet"):
+                        overrides_all = ss_get("branch_overrides_gs", {})
+                        current_sheet_overrides = overrides_all.get(sheet_target, {}).copy()
+                        for k,v in wizard["overrides"].items():
+                            current_sheet_overrides[k] = enforce_k_five(v)
+                            mark_session_edit(sheet_target, k)
+                            add_thumb("parent_keys", k)
+                        overrides_all[sheet_target] = current_sheet_overrides
+                        ss_set("branch_overrides_gs", overrides_all)
+
+                        vmn = wizard.get("vm","").strip() or "New VM"
+                        df_in = wb_target.get(sheet_target, pd.DataFrame()).copy()
+                        if df_in[df_in["Vital Measurement"].map(normalize_text) == vmn].empty:
+                            anchor = {"Vital Measurement": vmn}
+                            for c in LEVEL_COLS: anchor[c] = ""
+                            anchor["Diagnostic Triage"] = ""; anchor["Actions"] = ""
+                            df_in = pd.concat([df_in, pd.DataFrame([anchor], columns=CANON_HEADERS)], ignore_index=True)
+
+                        store = infer_branch_options_with_overrides(df_in, current_sheet_overrides)
+                        label_map = build_label_child_map(store)
+                        df_new, tstats = cascade_anchor_reuse_full(df_in, store, label_map, [vmn], [tuple()])
+                        wb_target[sheet_target] = df_new; ss_set("gs_workbook", wb_target)
+                        st.success(f"Wizard applied. Auto-cascade: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors filled. 👍")
+                        ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
+                with colB:
+                    if st.button("Cancel & Reset Wizard (GS)"):
                         ss_set("vm_wizard", {"vm":"","queue":[()], "overrides":{}, "active": False})
                         st.experimental_rerun()
 
-# ---------- Google Sheets mode (central workspace) ----------
+# ---------- Tab 2: Workspace Selection ----------
 with tab2:
-    st.subheader("Google Sheets (workspace)")
-
-    # Service account state
-    if "gcp_service_account" not in st.secrets:
-        st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
-    else:
-        st.caption("Service account ready ✓")
-
-    # Load/refresh GS sheet
-    spreadsheet_id = st.text_input("Spreadsheet ID", value=ss_get("gs_spreadsheet_id",""), key="gs_id")
-    if spreadsheet_id: ss_set("gs_spreadsheet_id", spreadsheet_id)
-    sheet_name_g = st.text_input("Sheet name to load (e.g., BP)", value="BP")
-    run_btn = st.button("Load or Refresh from Google Sheets")
-
-    def get_gsheet_client():
-        import gspread
-        from google.oauth2.service_account import Credentials
-        sa_info = st.secrets["gcp_service_account"]
-        scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-        return gspread.authorize(creds)
-
-    if run_btn:
-        try:
-            client = get_gsheet_client()
-            sh = client.open_by_key(spreadsheet_id)
-            ws = sh.worksheet(sheet_name_g)
-            values = ws.get_all_values()
-            if not values: st.error("Selected sheet is empty."); st.stop()
-            header = values[0]; rows = values[1:]
-            df_g = pd.DataFrame(rows, columns=header)
-            df_g.columns = [normalize_text(c) for c in df_g.columns]
-            if not validate_headers(df_g): st.error("Sheet does not match canonical headers."); st.stop()
-            for c in CANON_HEADERS: df_g[c] = df_g[c].map(normalize_text)
-            node_block = ["Vital Measurement"] + LEVEL_COLS
-            df_g = df_g[~df_g[node_block].apply(lambda r: all(v == "" for v in r), axis=1)].copy()
-            wb_g = ss_get("gs_workbook", {}); wb_g[sheet_name_g] = df_g; ss_set("gs_workbook", wb_g)
-            st.success(f"Loaded '{sheet_name_g}' from Google Sheets.")
-            st.dataframe(df_g.head(50), use_container_width=True)
-        except Exception as e:
-            st.error(f"Google Sheets error: {e}")
-
-    st.markdown("---")
-    st.subheader("Workspace selection")
+    st.subheader("Workspace Selection")
 
     # Choose data source
     sources = []
     if ss_get("upload_workbook", {}): sources.append("Upload workbook")
     if ss_get("gs_workbook", {}): sources.append("Google Sheets workbook")
     if not sources:
-        st.info("Load a workbook in the Upload tab or use the controls above to load from Google Sheets.")
+        st.info("Load a workbook in the **Source** tab first (upload file or Google Sheets).")
     else:
-        source_ws = st.radio("Choose data source", sources, horizontal=True, key="ws_source")
+        source_ws = st.radio("Choose data source", sources, horizontal=True, key="ws_source_sel")
         if source_ws == "Upload workbook":
             wb_ws = ss_get("upload_workbook", {})
-            sheet_ws = st.selectbox("Sheet", list(wb_ws.keys()), key="ws_sheet")
+            sheet_ws = st.selectbox("Sheet", list(wb_ws.keys()), key="ws_sheet_sel")
             df_ws = wb_ws.get(sheet_ws, pd.DataFrame())
             override_root = "branch_overrides_upload"
             current_source_code = "upload"
         else:
             wb_ws = ss_get("gs_workbook", {})
-            sheet_ws = st.selectbox("Sheet", list(wb_ws.keys()), key="ws_sheet")
+            sheet_ws = st.selectbox("Sheet", list(wb_ws.keys()), key="ws_sheet_sel")
             df_ws = wb_ws.get(sheet_ws, pd.DataFrame())
             override_root = "branch_overrides_gs"
             current_source_code = "gs"
 
-        # Remember current work context for other tabs (Symptoms)
+        # Remember current work context for Symptoms tab
         ss_set("work_context", {"source": current_source_code, "sheet": sheet_ws})
 
-        if df_ws.empty:
-            st.info("Selected sheet is empty or not loaded yet.")
+        # ===== Summary + Preview moved here =====
+        if df_ws.empty or not validate_headers(df_ws):
+            st.info("Selected sheet is empty or headers mismatch.")
         else:
+            st.write(f"Found {len(wb_ws)} sheet(s). Choose one to process:")
+            ok_p, total_p = compute_parent_depth_score(df_ws)
+            ok_r, total_r = compute_row_path_score(df_ws)
+            p1, p2 = st.columns(2)
+            with p1:
+                st.metric("Parents with 5 children", f"{ok_p}/{total_p}")
+                st.progress(0 if total_p==0 else ok_p/total_p)
+            with p2:
+                st.metric("Rows with full path", f"{ok_r}/{total_r}")
+                st.progress(0 if total_r==0 else ok_r/total_r)
+
+            total_rows = len(df_ws)
+            st.markdown("#### Preview (50 rows)")
+            if total_rows <= 50:
+                st.caption(f"Showing all {total_rows} rows.")
+                st.dataframe(df_ws, use_container_width=True)
+            else:
+                state_key = f"preview_start_{sheet_ws}"
+                start_idx = int(ss_get(state_key, 0))
+                cprev, cnum, cnext = st.columns([1,2,1])
+                with cprev:
+                    if st.button("◀ Previous 50", key=f"prev50_{sheet_ws}"):
+                        start_idx = max(0, start_idx - 50)
+                with cnum:
+                    start_1based = st.number_input(
+                        "Start row (1-based)",
+                        min_value=1,
+                        max_value=max(1, total_rows-49),
+                        value=start_idx+1,
+                        step=50,
+                        help="Pick where to start the 50-row preview.",
+                        key=f"startnum_{sheet_ws}"
+                    )
+                    start_idx = int(start_1based) - 1
+                with cnext:
+                    if st.button("Next 50 ▶", key=f"next50_{sheet_ws}"):
+                        start_idx = min(max(0, total_rows - 50), start_idx + 50)
+                ss_set(state_key, start_idx)
+                end_idx = min(start_idx + 50, total_rows)
+                st.caption(f"Showing rows **{start_idx+1}–{end_idx}** of **{total_rows}**.")
+                st.dataframe(df_ws.iloc[start_idx:end_idx], use_container_width=True)
+
+            st.markdown("---")
+
             # ========== 📦 Export / Import Overrides (JSON) ==========
             with st.expander("📦 Export / Import Overrides (JSON)"):
                 overrides_all = ss_get(override_root, {})
@@ -902,10 +1013,10 @@ with tab2:
                     data = json.dumps(overrides_sheet, indent=2).encode("utf-8")
                     st.download_button("Export overrides.json", data=data, file_name=f"{sheet_ws}_overrides.json", mime="application/json")
                 with col2:
-                    upfile = st.file_uploader("Import overrides.json", type=["json"], key="ws_imp_json")
-                    import_mode = st.radio("Import mode", ["Replace", "Merge (prefer import)", "Merge (prefer existing)"], horizontal=True, key="ws_imp_mode")
-                    auto_cascade = st.checkbox("Auto-cascade after import", value=True, key="ws_imp_cascade")
-                    if upfile is not None and st.button("Apply Import", key="ws_imp_apply"):
+                    upfile = st.file_uploader("Import overrides.json", type=["json"], key="ws_imp_json_sel")
+                    import_mode = st.radio("Import mode", ["Replace", "Merge (prefer import)", "Merge (prefer existing)"], horizontal=True, key="ws_imp_mode_sel")
+                    auto_cascade = st.checkbox("Auto-cascade after import", value=True, key="ws_imp_cascade_sel")
+                    if upfile is not None and st.button("Apply Import", key="ws_imp_apply_sel"):
                         try:
                             imported = json.loads(upfile.getvalue().decode("utf-8"))
                             if not isinstance(imported, dict):
@@ -918,7 +1029,7 @@ with tab2:
                                     "override_root": override_root,
                                     "sheet": sheet_ws,
                                     "overrides_sheet_before": overrides_all.get(sheet_ws, {}).copy(),
-                                    "df_before": df_ws.copy()
+                                    "df_before": df_ws.copy() if current_source_code=="upload" else None
                                 })
                                 ss_set("undo_stack", stack)
 
@@ -964,8 +1075,8 @@ with tab2:
                 ok_r, total_r = compute_row_path_score(df_ws)
                 st.write(f"Parents with 5 children: **{ok_p}/{total_p}**")
                 st.write(f"Rows with full path: **{ok_r}/{total_r}**")
-                case_mode = st.selectbox("Case normalization", ["None","Title","lower","UPPER"], index=0, key="ws_case_mode")
-                syn_text = st.text_area("Synonym map (one per line: A => B)", key="ws_syn_map_text")
+                case_mode = st.selectbox("Case normalization", ["None","Title","lower","UPPER"], index=0, key="ws_case_mode_sel")
+                syn_text = st.text_area("Synonym map (one per line: A => B)", key="ws_syn_map_text_sel")
 
                 def parse_synonym_map(text: str) -> Dict[str,str]:
                     mapping = {}
@@ -998,13 +1109,13 @@ with tab2:
                             df2[col] = df2[col].map(normalize_text)
                     return df2
 
-                if st.button("Normalize sheet now (in-session)", key="ws_norm"):
+                if st.button("Normalize sheet now (in-session)", key="ws_norm_sel"):
                     syn_map = parse_synonym_map(syn_text)
                     df_norm = normalize_sheet_df(df_ws, case_mode, syn_map)
                     wb_ws[sheet_ws] = df_norm
                     if current_source_code == "upload":
                         ss_set("upload_workbook", wb_ws)
-                        st.success("Sheet normalized in-session. Download in Upload tab to persist locally.")
+                        st.success("Sheet normalized in-session. Download from Source tab to persist locally.")
                     else:
                         sid = ss_get("gs_spreadsheet_id","")
                         if not sid:
@@ -1017,8 +1128,8 @@ with tab2:
             # ========== 🧩 Group rows by Node 2 (cluster identical Node 2 labels together) ==========
             with st.expander("🧩 Group rows by Node 2 (cluster identical Node 2 labels together)"):
                 st.caption("Groups rows so identical **Node 2** values are contiguous. This is a stable grouping limited to Node 2.")
-                scope = st.radio("Grouping scope", ["Whole sheet", "Within Vital Measurement"], horizontal=True, key="ws_group_scope")
-                preview = st.checkbox("Show preview (does not modify data)", value=True, key="ws_group_preview")
+                scope = st.radio("Grouping scope", ["Whole sheet", "Within Vital Measurement"], horizontal=True, key="ws_group_scope_sel")
+                preview = st.checkbox("Show preview (does not modify data)", value=True, key="ws_group_preview_sel")
 
                 def grouped_by_node2(df0: pd.DataFrame, scope_mode: str) -> pd.DataFrame:
                     df2 = df0.copy()
@@ -1039,7 +1150,7 @@ with tab2:
 
                 colg1, colg2, colg3 = st.columns([1,1,2])
                 with colg1:
-                    if st.button("Apply grouping (in-session)"):
+                    if st.button("Apply grouping (in-session)", key="ws_group_apply_sel"):
                         df_grouped = grouped_by_node2(df_ws, scope)
                         wb_ws[sheet_ws] = df_grouped
                         if current_source_code == "upload":
@@ -1051,12 +1162,12 @@ with tab2:
                 with colg2:
                     if current_source_code == "gs":
                         sid = ss_get("gs_spreadsheet_id","")
-                        if sid and st.button("Apply & push grouping to Google Sheets"):
+                        if sid and st.button("Apply & push grouping to Google Sheets", key="ws_group_push_sel"):
                             df_grouped = grouped_by_node2(df_ws, scope)
                             ok = push_to_google_sheets(sid, sheet_ws, df_grouped)
                             if ok: st.success("Grouping pushed to Google Sheets.")
                 with colg3:
-                    # Extra export of the CURRENT grouped view (per v6.2.8 scope)
+                    # Extra export of the CURRENT grouped view
                     df_grouped = grouped_by_node2(df_ws, scope)
                     csvcur = df_grouped.to_csv(index=False).encode("utf-8")
                     st.download_button("Export current grouped view (CSV)", data=csvcur, file_name=f"{sheet_ws}_grouped_node2_current.csv", mime="text/csv")
@@ -1064,24 +1175,28 @@ with tab2:
             # ========== 🔧 Google Sheets Push Settings + Bulk Push ==========
             with st.expander("🔧 Google Sheets Push Settings"):
                 sid = ss_get("gs_spreadsheet_id", "")
-                sid = st.text_input("Spreadsheet ID", value=sid, key="ws_push_sid") or sid
+                sid = st.text_input("Spreadsheet ID", value=sid, key="ws_push_sid_sel") or sid
                 if sid: ss_set("gs_spreadsheet_id", sid)
                 default_tab = ss_get("saved_targets", {}).get(sheet_ws, {}).get("tab", f"{sheet_ws}")
-                target_tab = st.text_input("Target tab", value=default_tab, key="ws_push_target")
-                include_scope = st.radio("Include scope", ["All completed parents","Only parents edited this session"], horizontal=True, key="ws_push_scope")
-                push_backup = st.checkbox("Create a backup tab before overwrite", value=True, key="ws_push_backup")
-                dry_run = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="ws_push_dry")
-                show_dups = st.checkbox("Show duplicates preview after build", value=False, key="ws_push_dups")
+                target_tab = st.text_input("Target tab", value=default_tab, key="ws_push_target_sel")
+                include_scope = st.radio("Include scope", ["All completed parents","Only parents edited this session"], horizontal=True, key="ws_push_scope_sel")
+                push_backup = st.checkbox("Create a backup tab before overwrite", value=True, key="ws_push_backup_sel")
+                dry_run = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="ws_push_dry_sel")
+                show_dups = st.checkbox("Show duplicates preview after build", value=False, key="ws_push_dups_sel")
 
                 edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_ws, []))
                 overrides_all = ss_get(override_root, {})
                 overrides_current = overrides_all.get(sheet_ws, {})
 
-                if st.button("📤 Bulk Push Raw+ (build/overwrite)", type="primary", key="ws_push_btn"):
+                if st.button("📤 Bulk Push Raw+ (build/overwrite)", type="primary", key="ws_push_btn_sel"):
                     if not sid or not target_tab:
                         st.error("Missing Spreadsheet ID or target tab.")
                     else:
-                        df_aug, stats, dups_df = build_raw_plus_v628(df_ws, overrides_current, "session" if include_scope.endswith("session") else "all", edited_keys_for_sheet)
+                        df_aug, stats, dups_df = build_raw_plus_v629(
+                            df_ws, overrides_current,
+                            "session" if include_scope.endswith("session") else "all",
+                            edited_keys_for_sheet
+                        )
                         st.info(f"Delta preview — Generated: **{stats['generated']}**, New added: **{stats['new_added']}**, In-place filled: **{stats['inplace_filled']}**, Duplicates skipped: **{stats['duplicates_skipped']}**, Final total: **{stats['final_total']}**.")
                         st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{target_tab}**.")
                         if show_dups and not dups_df.empty:
@@ -1122,7 +1237,7 @@ with tab2:
                                 ss_set("saved_targets", saved)
                                 st.success(f"Pushed {len(df_aug)} rows to '{target_tab}'.")
 
-            # ========== ✅ Validation rules ==========
+            # ========== ✅ Validation rules (unchanged) ==========
             with st.expander("✅ Validation rules & health checks"):
                 overrides_all = ss_get(override_root, {})
                 overrides_current = overrides_all.get(sheet_ws, {})
@@ -1148,7 +1263,7 @@ with tab2:
                         child_labels.add(c)
                         edges.setdefault(plabel, set()).add(c)
 
-                # Orphans: appears as child but never as a parent
+                # Orphans
                 orphans = sorted(list(child_labels - parent_labels))
                 if orphans:
                     st.warning(f"Orphan labels (appear as child, never as parent): {len(orphans)}")
@@ -1158,7 +1273,7 @@ with tab2:
                 else:
                     st.success("No orphan labels detected. 👍")
 
-                # Cycles: DFS on label graph
+                # Cycles
                 def find_cycles(graph: Dict[str, Set[str]], limit: int = 10) -> List[List[str]]:
                     cycles = []
                     temp_mark = set()
@@ -1166,12 +1281,11 @@ with tab2:
                     stack: List[str] = []
 
                     def visit(n: str):
-                        if len(cycles) >= limit:  # cap
+                        if len(cycles) >= limit:
                             return
                         if n in perm_mark:
                             return
                         if n in temp_mark:
-                            # Found a cycle; capture from first occurrence
                             if n in stack:
                                 idx = stack.index(n)
                                 cycles.append(stack[idx:] + [n])
@@ -1197,13 +1311,12 @@ with tab2:
                 if cycles:
                     st.error(f"Potential cycles detected: {len(cycles)} (showing up to 10)")
                     for cyc in cycles:
-                        # hide the __ROOT__ helper node if present
                         cyc_disp = [("Root of tree" if n=="__ROOT__" else n) for n in cyc]
                         st.write(" → ".join(cyc_disp))
                 else:
                     st.success("No cycles detected in label graph. 👍")
 
-                # Missing Red Flag coverage: every parent should have at least one flagged child
+                # Missing Red Flag coverage
                 quality_map = ss_get("symptom_quality", {})
                 missing_rf = []
                 for key, children in store.items():
@@ -1211,7 +1324,7 @@ with tab2:
                     lvl_s, path = key.split("|", 1)
                     try: L = int(lvl_s[1:])
                     except: continue
-                    if L >= MAX_LEVELS:  # Node 5 has no next-level children
+                    if L >= MAX_LEVELS:
                         continue
                     non_empty_children = [normalize_text(c) for c in children if normalize_text(c)!=""]
                     if not non_empty_children:
@@ -1231,14 +1344,14 @@ with tab2:
                 else:
                     st.success("All parents have at least one Red-Flag child. 👍")
 
-# ---------- Interactive completion tab ----------
+# ---------- Tab 3: Interactive completion ----------
 with tab3:
     st.subheader("Fill Diagnostic & Actions (random)")
     st.caption("Works across ALL currently loaded sheets (Upload or Google Sheets).")
     sources = []
     if ss_get("upload_workbook", {}): sources.append("Upload workbook")
     if ss_get("gs_workbook", {}): sources.append("Google Sheets workbook")
-    if not sources: st.info("Load a workbook first (Upload or Google Sheets tabs).")
+    if not sources: st.info("Load a workbook first (Source tab).")
     else:
         source = st.radio("Choose data source", sources, horizontal=True, key="act_source")
         if source == "Upload workbook":
@@ -1286,12 +1399,12 @@ with tab3:
                         st.success("Saved in-session. Download to persist locally.")
                     else:
                         sid = ss_get("gs_spreadsheet_id", "")
-                        if not sid: st.error("Missing Spreadsheet ID in session. Use Google Sheets tab to set it.")
+                        if not sid: st.error("Missing Spreadsheet ID in session. Use Source tab to set it.")
                         else:
                             overrides_all = ss_get(override_root, {})
                             overrides_sheet = overrides_all.get(sheet_cur, {})
                             edited_keys_for_sheet = set(ss_get("session_edited_keys", {}).get(sheet_cur, []))
-                            df_aug, stats, _ = build_raw_plus_v628(wb[sheet_cur], overrides_sheet, include_scope="all", edited_keys_for_sheet=edited_keys_for_sheet)
+                            df_aug, stats, _ = build_raw_plus_v629(wb[sheet_cur], overrides_sheet, include_scope="all", edited_keys_for_sheet=edited_keys_for_sheet)
                             st.caption(f"Will write **{len(df_aug)} rows × {len(df_aug.columns)} cols** to tab **{sheet_cur}**.")
                             ok = push_to_google_sheets(sid, sheet_cur, df_aug)
                             if ok:
@@ -1309,14 +1422,14 @@ with tab3:
                                 st.success("Changes pushed to Google Sheets (Raw+).")
             else: st.info("Click 'Pick a random incomplete row' to begin.")
 
-# ---------- Symptoms browser & editor ----------
+# ---------- Tab 4: Symptoms (with improved Conflicts Inspector persistence) ----------
 with tab4:
-    st.subheader("Symptoms — browse, check consistency, edit child branches, auto-cascade, export PDF")
+    st.subheader("Symptoms — browse, edit child branches, auto-cascade, export PDF")
 
-    # Editing context is selected in Google Sheets Mode
+    # Editing context is selected in Workspace Selection
     ctx = ss_get("work_context", {})
     if not ctx:
-        st.info("Go to **Google Sheets Mode** to choose the data source & sheet. Then return here to edit symptoms.")
+        st.info("Go to **Workspace Selection** to choose the data source & sheet. Then return here to edit symptoms.")
         st.stop()
 
     source_code = ctx.get("source")
@@ -1331,7 +1444,7 @@ with tab4:
         st.caption(f"Editing **Google Sheets workbook** → **{sheet}**")
 
     if sheet not in wb:
-        st.warning("Selected sheet no longer available. Re-select in **Google Sheets Mode**.")
+        st.warning("Selected sheet no longer available. Re-select in **Workspace Selection**.")
         st.stop()
 
     df = wb.get(sheet, pd.DataFrame())
@@ -1460,9 +1573,11 @@ with tab4:
     for parent_tuple, children, status in entries:
         keyname = level_key_tuple(level, parent_tuple)
         thumb = " 👍" if has_thumb("parent_keys", keyname) else ""
+        open_map = ss_get("conflict_open_map", {})  # {keyname: bool}
+        expanded_default = bool(open_map.get(keyname, False))
         subtitle = f"{display_parent(parent_tuple)} — {status}{thumb} {'⚠️' if (level, (parent_tuple[-1] if parent_tuple else 'Root of tree')) in inconsistent_labels else ''}"
 
-        with st.expander(subtitle):
+        with st.expander(subtitle, expanded=expanded_default):
             selected_vals = []
             if compact:
                 for i in range(5):
@@ -1533,38 +1648,51 @@ with tab4:
                 else:
                     ss_set("gs_workbook", wb)
                 add_thumb("parent_keys", keyname)
+
+                # Keep expander open after save
+                open_map[keyname] = True
+                ss_set("conflict_open_map", open_map)
                 st.success(f"Saved and auto-cascaded: added {tstats['new_rows']} rows, filled {tstats['inplace_filled']} anchors. 👍")
 
-    # ---------- Conflicts Inspector (UPGRADED) ----------
-    with st.expander("🧯 Conflicts Inspector (same parent label → different child sets)"):
-        label_to_sets: Dict[str, List[Tuple[int, Tuple[str,...], Tuple[str,...]]]] = {}
-        for key, children in store.items():
-            if "|" not in key: continue
-            lvl_s, path = key.split("|", 1)
-            try: L = int(lvl_s[1:])
-            except: continue
-            if path == "<ROOT>": continue
-            parent_tuple = tuple(path.split(">"))
-            label = parent_tuple[-1]
-            child_set = tuple([c for c in children if normalize_text(c)!=""])
-            label_to_sets.setdefault(label, []).append((L, parent_tuple, tuple(sorted(child_set))))
+    # ---------- Conflicts Inspector (UPGRADED + persistence) ----------
+    with st.expander("🧯 Conflicts Inspector (same parent label → different child sets)", expanded=ss_get("conflict_inspector_open", True)):
+        overrides_all = ss_get(override_root, {})
+        overrides_sheet = overrides_all.get(sheet, {}).copy()
 
-        conflicts = []
-        for label, entries_list in label_to_sets.items():
-            variants = sorted(set([s for (_,_,s) in entries_list]))
-            if len(variants) > 1:
-                conflicts.append((label, variants, entries_list))
+        # Cacheable conflict computation
+        def compute_conflicts_from_store(store_dict: Dict[str, List[str]]) -> List[Tuple[str, List[Tuple[str,...]], List[Tuple[int, Tuple[str,...], Tuple[str,...]]]]]:
+            label_to_sets: Dict[str, List[Tuple[int, Tuple[str,...], Tuple[str,...]]]] = {}
+            for key, children in store_dict.items():
+                if "|" not in key: continue
+                lvl_s, path = key.split("|", 1)
+                try: L = int(lvl_s[1:])
+                except: continue
+                if path == "<ROOT>": continue
+                parent_tuple = tuple(path.split(">"))
+                label = parent_tuple[-1]
+                child_set = tuple([c for c in children if normalize_text(c)!=""])
+                label_to_sets.setdefault(label, []).append((L, parent_tuple, tuple(sorted(child_set))))
+
+            conflicts_local = []
+            for label, entries_list in label_to_sets.items():
+                variants = sorted(set([s for (_,_,s) in entries_list]))
+                if len(variants) > 1:
+                    conflicts_local.append((label, variants, entries_list))
+            return conflicts_local
+
+        conflicts = compute_conflicts_from_store(store)
 
         if not conflicts:
             st.success("No conflicts detected — Root of tree: OK (no conflicts) 🎉")
         else:
             st.warning(f"Found {len(conflicts)} conflicting labels.")
-            overrides_all = ss_get(override_root, {})
-            overrides_sheet = overrides_all.get(sheet, {}).copy()
+            open_map = ss_get("conflict_open_map", {})  # reuse for expansions
 
             for i, (label, variants, entries_list) in enumerate(conflicts, start=1):
                 thumb = " 👍" if has_thumb("conflict_labels", label) else ""
-                with st.expander(f"{i}. '{label}' has {len(variants)} different child sets{thumb}"):
+                exp_key = f"conflict_exp_{label}"
+                expanded_default = bool(open_map.get(exp_key, False))
+                with st.expander(f"{i}. '{label}' has {len(variants)} different child sets{thumb}", expanded=expanded_default):
                     st.write("Variants (child sets):")
                     for j, var in enumerate(variants, start=1):
                         st.code(f"{j}. {list(var)}")
@@ -1579,19 +1707,23 @@ with tab4:
 
                     st.caption("Choose EXACTLY 5 children to keep for ALL parents with this label.")
                     cols = st.columns(5)
-                    # default: first 5 selected
-                    defaults = set(unique_children[:5])
+                    # default: first 5 selected OR remember previous selection for this label
+                    prev_choice = ss_get("conflict_choices", {}).get(label, unique_children[:5])
                     chosen_map = {}
                     for idx, child in enumerate(unique_children):
                         col = cols[idx % 5]
-                        chosen_map[child] = col.checkbox(child, value=(child in defaults), key=f"ci2_ck_{label}_{idx}")
+                        chosen_map[child] = col.checkbox(child, value=(child in prev_choice), key=f"ci2_ck_{label}_{idx}")
 
-                    # Build chosen set (max 5)
                     chosen = [c for c, val in chosen_map.items() if val]
                     if len(chosen) > 5:
                         st.error(f"Selected {len(chosen)} children — please select **at most 5**.")
                     else:
                         st.info(f"Selected **{len(chosen)} / 5** children.")
+
+                    # Persist current in-session choice for this label
+                    choices_all = ss_get("conflict_choices", {})
+                    choices_all[label] = chosen
+                    ss_set("conflict_choices", choices_all)
 
                     # Save per-conflict child set
                     if st.button(f"Save child set for '{label}'", key=f"ci2_save_{label}"):
@@ -1620,10 +1752,15 @@ with tab4:
                                 ss_set("upload_workbook", wb)
                             else:
                                 ss_set("gs_workbook", wb)
+
                             add_thumb("conflict_labels", label)
+                            # Keep this conflict expander open after save
+                            open_map[exp_key] = True
+                            ss_set("conflict_open_map", open_map)
+                            # Toast-like confirmation
                             st.success(f"Saved resolution for '{label}'. Cascaded: +{tstats['new_rows']} rows, {tstats['inplace_filled']} anchors. 👍")
 
-# ---------- Push Log ----------
+# ---------- Tab 5: Push Log ----------
 with tab5:
     st.subheader("Push Log")
     log = ss_get("push_log", [])
@@ -1635,7 +1772,7 @@ with tab5:
         csv = df_log.to_csv(index=False).encode("utf-8")
         st.download_button("Download push log (CSV)", data=csv, file_name="push_log.csv", mime="text/csv")
 
-# ---------- Dictionary ----------
+# ---------- Tab 6: Dictionary ----------
 with tab6:
     st.subheader("Dictionary — all symptom labels (branches)")
 
@@ -1644,7 +1781,7 @@ with tab6:
     if ss_get("gs_workbook", {}): sources_avail.append("Google Sheets workbook")
 
     if not sources_avail:
-        st.info("Load a workbook in the Upload or Google Sheets tab first.")
+        st.info("Load a workbook in the **Source** tab first.")
     else:
         source_choice = st.multiselect("Include sources", sources_avail, default=sources_avail, key="dict_sources")
         dfs: List[pd.DataFrame] = []
@@ -1749,3 +1886,8 @@ with tab6:
 
             csv = filtered.to_csv(index=False).encode("utf-8")
             st.download_button("Download current view (CSV)", data=csv, file_name="symptom_dictionary.csv", mime="text/csv")
+
+# ---------- Tab 7: Calculator (placeholder) ----------
+with tab7:
+    st.subheader("🧮 Calculator")
+    st.info("Coming in v6.3.0 — diagnostic calculators, scoring tools, and simulation utilities will appear here.")
