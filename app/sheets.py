@@ -23,27 +23,21 @@ from typing import Optional
 def get_gspread_client_from_secrets(secrets_dict: dict) -> gspread.Client:
     """
     Create a gspread client using service account credentials from Streamlit secrets.
-    
-    Args:
-        secrets_dict: Dictionary containing service account credentials
-        
-    Returns:
-        gspread.Client: Authenticated client for Google Sheets API
-        
-    Raises:
-        GoogleAuthError: If authentication fails
-        ValueError: If required credentials are missing
     """
     try:
-        # Create credentials from the service account dict (same as monolith)
         from google.oauth2.service_account import Credentials
-        credentials = Credentials.from_service_account_info(secrets_dict)
-        
-        # Create and return the client (same as monolith)
+
+        # ✅ Explicit scopes (match the monolith)
+        SCOPES = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(secrets_dict, scopes=SCOPES)
+
+        # Authorize gspread client
         client = gspread.authorize(credentials)
-        
         return client
-        
+
     except GoogleAuthError as e:
         raise GoogleAuthError(
             "❌ Google Sheets authentication failed. Please check your service account credentials in "
