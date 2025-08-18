@@ -1,11 +1,12 @@
 # streamlit_app_upload.py
 # Decision Tree Builder — Unified Monolith
-# Version: v6.3.1.2
+# Version: v6.3.3
 
 from __future__ import annotations
 
 import io
 import json
+import uuid
 from typing import Dict, List, Tuple, Optional, Set
 
 import numpy as np
@@ -24,7 +25,7 @@ except Exception:
 # ==============================
 # VERSION / CONFIG
 # ==============================
-APP_VERSION = "v6.3.1.2"
+APP_VERSION = "v6.3.3"
 CANON_HEADERS = [
     "Vital Measurement", "Node 1", "Node 2", "Node 3", "Node 4", "Node 5",
     "Diagnostic Triage", "Actions"
@@ -52,6 +53,87 @@ def mark_session_edit(sheet: str, keyname: str):
     cur.add(keyname)
     ek[sheet] = list(cur)
     ss_set("session_edited_keys", ek)
+
+
+# ==============================
+# URL query helpers (sid)
+# ==============================
+def _get_query_params() -> Dict[str, List[str]]:
+    try:
+        return dict(st.query_params)
+    except Exception:
+        return st.experimental_get_query_params()
+
+def _set_query_params(params: Dict[str, List[str] | str]):
+    try:
+        qp = dict(st.query_params)
+        qp.update({k: v for k, v in params.items()})
+        st.query_params = qp
+    except Exception:
+        st.experimental_set_query_params(**params)
+
+def _ensure_sid() -> str:
+    qp = _get_query_params()
+    sid = qp.get("sid", [None])[0] if isinstance(qp.get("sid"), list) else qp.get("sid")
+    if not sid:
+        sid = str(uuid.uuid4())
+        _set_query_params({"sid": sid})
+    ss_set("sid", sid)
+    return sid
+
+
+# ==============================
+# Server-store for sticky sessions
+# ==============================
+@st.cache_resource(show_spinner=False)
+def _get_session_store() -> Dict[str, dict]:
+    # process-wide store {sid -> saved_state_dict}
+    return {}
+
+PERSIST_KEYS = [
+    "upload_workbook", "gs_workbook", "branch_overrides", "symptom_quality",
+    "push_log", "saved_targets", "gs_spreadsheet_id", "gs_default_sheet",
+    "work_context", "undo_stack"
+]
+
+def _pack_state_for_store() -> dict:
+    out = {}
+    for k in PERSIST_KEYS:
+        out[k] = st.session_state.get(k)
+    return out
+
+def _restore_state_from_store(saved: dict):
+    if not isinstance(saved, dict):
+        return
+    for k, v in saved.items():
+        st.session_state[k] = v
+
+def autosave_now():
+    if not ss_get("autosave_enabled", True):
+        return
+    sid = ss_get("sid", None)
+    if not sid:
+        return
+    store = _get_session_store()
+    store[sid] = _pack_state_for_store()
+
+def clear_saved_state():
+    sid = ss_get("sid", None)
+    if not sid:
+        return
+    store = _get_session_store()
+    if sid in store:
+        del store[sid]
+
+def try_restore_on_load():
+    # only once per page load
+    if ss_get("_restored_once", False):
+        return
+    ss_set("_restored_once", True)
+    sid = _ensure_sid()
+    store = _get_session_store()
+    if sid in store:
+        _restore_state_from_store(store[sid])
 
 
 # ==============================
@@ -146,7 +228,6 @@ def compute_parent_depth_score_counts(df: pd.DataFrame) -> Tuple[int, int]:
 def compute_row_path_score_counts(df: pd.DataFrame) -> Tuple[int, int]:
     if df is None or df.empty:
         return (0,0)
-    # avoid applymap deprecation — use per-column map:
     nodes = df[LEVEL_COLS].apply(lambda s: s.map(normalize_text))
     full = nodes.ne("").all(axis=1)
     return int(full.sum()), int(len(df))
@@ -218,9 +299,6 @@ def detect_orphans(
     return results
 
 def detect_orphan_nodes(df: pd.DataFrame) -> List[str]:
-    """
-    Simpler row-based orphan check: any Node k that has an empty Node k-1 on its row.
-    """
     problems = []
     for _, row in df.iterrows():
         for i in range(1, len(LEVEL_COLS)):
@@ -231,9 +309,6 @@ def detect_orphan_nodes(df: pd.DataFrame) -> List[str]:
     return problems
 
 def detect_loops(df: pd.DataFrame) -> List[Dict[str, object]]:
-    """
-    Circular branches within a single row (a label repeats later in the same path).
-    """
     assert validate_headers(df), "Headers must match canonical schema."
     results: List[Dict[str, object]] = []
     nodes = df[LEVEL_COLS].apply(lambda s: s.map(normalize_text))
@@ -262,10 +337,6 @@ def detect_missing_redflag_coverage(
     overrides: Optional[Dict[str, List[str]]] = None,
     redflag_map: Optional[Dict[str, str]] = None
 ) -> List[Dict[str, object]]:
-    """
-    For every parent with children, verify at least one child is 'Red Flag'.
-    redflag_map format: {label -> "Red Flag"|"Normal"} (exact label keys).
-    """
     assert validate_headers(df), "Headers must match canonical schema."
     store = infer_branch_options_with_overrides(df, overrides or {})
     results: List[Dict[str, object]] = []
@@ -296,7 +367,6 @@ def detect_missing_redflag_coverage(
                 "children": non_empty,
                 "redflag_present": False
             })
-
     return results
 
 
@@ -401,12 +471,16 @@ def sort_sheet_for_view(df: pd.DataFrame, redflag_map: Optional[Dict[str, str]] 
     df2 = df2.sort_values(sort_cols, kind="stable").drop(columns=["_rf2"], errors="ignore").reset_index(drop=True)
     return df2
 
-def order_rows_for_push(df: pd.DataFrame, redflag_map: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+def order_rows_for_push(
+    df: pd.DataFrame,
+    redflag_map: Optional[Dict[str, str]] = None,
+    rf_scope: str = "any"  # "any" or "node2"
+) -> pd.DataFrame:
     """
     Push ordering that:
       - Preserves Vital Measurement grouping,
       - Groups by Node 1,
-      - Optionally lifts any row containing a Red Flag label across Node 1–5 (Dictionary-driven),
+      - Optionally lifts any row containing a Red Flag label (scope: any node vs Node 2 only),
       - Then sorts Node 2..5 alphabetically for stability.
     """
     if df is None or df.empty:
@@ -427,7 +501,11 @@ def order_rows_for_push(df: pd.DataFrame, redflag_map: Optional[Dict[str, str]] 
 
     if rf:
         def _rf_hit(row):
-            for col in ("Node 1","Node 2","Node 3","Node 4","Node 5"):
+            if rf_scope == "node2":
+                cols = ["Node 2"]
+            else:
+                cols = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
+            for col in cols:
                 val = str(row.get(col, "")).strip().lower()
                 if val and rf.get(val) == "red flag":
                     return 1
@@ -445,13 +523,141 @@ def order_rows_for_push(df: pd.DataFrame, redflag_map: Optional[Dict[str, str]] 
 
 
 # ==============================
-# UI: Header / Badges
+# Materialization (make overrides become rows)
+# ==============================
+def _parse_override_key(k: str) -> Optional[Tuple[int, Tuple[str,...]]]:
+    # "L2|A>B" -> (2, ("A","B"))
+    if "|" not in k:
+        return None
+    lvl_s, path = k.split("|", 1)
+    try:
+        L = int(lvl_s[1:])
+    except Exception:
+        return None
+    parent_tuple = tuple([] if path == "<ROOT>" else [normalize_text(x) for x in path.split(">") if normalize_text(x)])
+    return L, parent_tuple
+
+def materialize_overrides(
+    df: pd.DataFrame,
+    overrides: Dict[str, List[str]],
+    prune: bool = False,
+    prune_only_if_deeper_blank: bool = True
+) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    """
+    For each override key "Lk|parent_tuple", ensure rows exist so that the parent's children (exactly 5) are present.
+    - Adds missing rows with VM scoped (per-VM).
+    - Optionally prunes rows whose child at Node k is not in chosen 5 (safe: only if deeper nodes are blank).
+    Returns (new_df, report) with report['added'], report['pruned'] dataframes.
+    """
+    if df is None or df.empty:
+        return df, {"added": pd.DataFrame(columns=CANON_HEADERS), "pruned": pd.DataFrame(columns=CANON_HEADERS)}
+
+    df2 = df.copy()
+    for c in CANON_HEADERS:
+        if c not in df2.columns:
+            df2[c] = ""
+    df2 = df2[CANON_HEADERS].copy()
+
+    # Normalize values
+    for c in ["Vital Measurement"] + LEVEL_COLS:
+        df2[c] = df2[c].astype(str).map(normalize_text)
+
+    vms = sorted(set(df2["Vital Measurement"].astype(str).map(normalize_text)))
+    added_rows: List[Dict[str,str]] = []
+    pruned_rows: List[pd.Series] = []
+
+    # Pre-normalize overrides children per key
+    ov_children: Dict[Tuple[int, Tuple[str,...]], List[str]] = {}
+    for k, vals in (overrides or {}).items():
+        parsed = _parse_override_key(k)
+        if not parsed:
+            continue
+        L, parent_tuple = parsed
+        if not (1 <= L <= MAX_LEVELS):
+            continue
+        kids = [normalize_text(x) for x in (vals if isinstance(vals, list) else [vals])]
+        kids = [x for x in kids if x]
+        kids = enforce_k_five(kids)
+        kids = [x for x in kids if x]  # drop blanks after enforce
+        if kids:
+            ov_children[(L, parent_tuple)] = kids
+
+    def _row_deeper_blank(row: pd.Series, L: int) -> bool:
+        for col in LEVEL_COLS[L:]:  # L is 1-based level, LEVEL_COLS indexed 0..4
+            if normalize_text(row.get(col, "")):
+                return False
+        return True
+
+    # Process per VM
+    for vm in vms:
+        scope = df2[df2["Vital Measurement"].astype(str).map(normalize_text) == vm].copy()
+        for (L, parent_tuple), desired_children in ov_children.items():
+            # existing children in this VM under this parent
+            mask_parent = pd.Series([True] * len(scope))
+            for i in range(L-1):
+                col = LEVEL_COLS[i]
+                want = parent_tuple[i] if i < len(parent_tuple) else ""
+                mask_parent &= (scope[col].astype(str).map(normalize_text) == want)
+            for j in range(L-1, MAX_LEVELS):
+                # ensure parent levels beyond L-1 don't preclude matches (ok if blank or anything)
+                pass
+            existing_children = set(scope.loc[mask_parent, LEVEL_COLS[L-1]].astype(str).map(normalize_text))
+            existing_children.discard("")  # ignore blanks
+
+            # Add missing children
+            for child in desired_children:
+                if child not in existing_children:
+                    new_row = {c: "" for c in CANON_HEADERS}
+                    new_row["Vital Measurement"] = vm
+                    for i in range(L-1):
+                        new_row[LEVEL_COLS[i]] = parent_tuple[i] if i < len(parent_tuple) else ""
+                    new_row[LEVEL_COLS[L-1]] = child
+                    added_rows.append(new_row)
+
+            # Prune unwanted children (if enabled)
+            if prune:
+                unwanted = existing_children - set(desired_children)
+                if unwanted:
+                    mask_unwanted = mask_parent & scope[LEVEL_COLS[L-1]].astype(str).map(normalize_text).isin(unwanted)
+                    if prune_only_if_deeper_blank:
+                        mask_unwanted = mask_unwanted & scope.apply(lambda r: _row_deeper_blank(r, L), axis=1)
+                    rows_to_prune = scope[mask_unwanted]
+                    if not rows_to_prune.empty:
+                        pruned_rows.extend([r for _, r in rows_to_prune.iterrows()])
+                        # Drop from scope (and later from df2)
+                        scope = scope.drop(rows_to_prune.index, errors="ignore")
+
+        # Replace this VM slice with pruned scope
+        df2 = pd.concat([df2[df2["Vital Measurement"] != vm], scope], ignore_index=True)
+
+    # Append added rows
+    if added_rows:
+        df_add = pd.DataFrame(added_rows, columns=CANON_HEADERS)
+        df2 = pd.concat([df2, df_add], ignore_index=True)
+    else:
+        df_add = pd.DataFrame(columns=CANON_HEADERS)
+
+    # Drop exact duplicates on VM + Node1..5 (+ diag/actions to be safe)
+    df2 = df2.drop_duplicates(subset=CANON_HEADERS).reset_index(drop=True)
+
+    df_pruned = pd.DataFrame(pruned_rows, columns=CANON_HEADERS) if pruned_rows else pd.DataFrame(columns=CANON_HEADERS)
+    report = {"added": df_add, "pruned": df_pruned}
+    return df2, report
+
+
+# ==============================
+# Sticky Session: try restore
+# ==============================
+try_restore_on_load()
+
+
+# ==============================
+# UI: Header / Badges + Sidebar Session tools
 # ==============================
 left, right = st.columns([1,2])
 with left:
     st.title(f"🌳 Decision Tree Builder — {APP_VERSION}")
 with right:
-    # If a workbook is present in session, show quick badge metrics for first sheet
     badges_html = ""
     wb_upload = ss_get("upload_workbook", {})
     if wb_upload:
@@ -484,6 +690,71 @@ with right:
             </div>
             """
     st.markdown(badges_html, unsafe_allow_html=True)
+
+# Sidebar Session tools
+st.sidebar.header("💾 Session")
+st.sidebar.caption("Sessions auto-save to a server store tied to your URL `sid`.")
+st.sidebar.write(f"**Session ID:** `{ss_get('sid','')}`")
+autosave_flag = st.sidebar.toggle("Autosave changes to server store", value=ss_get("autosave_enabled", True))
+ss_set("autosave_enabled", autosave_flag)
+
+col_s1, col_s2 = st.sidebar.columns(2)
+with col_s1:
+    if st.button("Save now", use_container_width=True):
+        autosave_now()
+        st.sidebar.success("Session saved.")
+with col_s2:
+    if st.button("Clear saved", use_container_width=True):
+        clear_saved_state()
+        st.sidebar.success("Saved copy cleared.")
+
+# Export / Import session JSON
+expander_io = st.sidebar.expander("Export / Import session JSON", expanded=False)
+with expander_io:
+    if st.button("Export session JSON", key="btn_export_json"):
+        def _pack_wb(wb: Dict[str, pd.DataFrame]) -> Dict[str, str]:
+            if not isinstance(wb, dict):
+                return {}
+            return {name: df.to_csv(index=False) for name, df in wb.items() if isinstance(df, pd.DataFrame)}
+        payload = {
+            "version": APP_VERSION,
+            "timestamp": datetime.now().isoformat(),
+            "upload_workbook": _pack_wb(ss_get("upload_workbook", {})),
+            "gs_workbook": _pack_wb(ss_get("gs_workbook", {})),
+            "branch_overrides": ss_get("branch_overrides", {}),
+            "symptom_quality": ss_get("symptom_quality", {}),
+            "push_log": ss_get("push_log", []),
+            "saved_targets": ss_get("saved_targets", {}),
+            "gs_spreadsheet_id": ss_get("gs_spreadsheet_id",""),
+            "gs_default_sheet": ss_get("gs_default_sheet","BP"),
+            "work_context": ss_get("work_context", {}),
+        }
+        data = json.dumps(payload).encode("utf-8")
+        st.sidebar.download_button("Download session.json", data=data, file_name="decision_tree_session.json", mime="application/json")
+
+    up = st.file_uploader("Import session.json", type=["json"], key="imp_json_upl")
+    if up is not None and st.button("Load imported session", key="imp_json_btn"):
+        try:
+            raw = json.loads(up.read().decode("utf-8"))
+            def _unpack_wb(packed: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+                out = {}
+                for name, csv_text in (packed or {}).items():
+                    out[name] = pd.read_csv(io.StringIO(csv_text))
+                return out
+            ss_set("upload_workbook", _unpack_wb(raw.get("upload_workbook", {})))
+            ss_set("gs_workbook", _unpack_wb(raw.get("gs_workbook", {})))
+            ss_set("branch_overrides", raw.get("branch_overrides", {}))
+            ss_set("symptom_quality", raw.get("symptom_quality", {}))
+            ss_set("push_log", raw.get("push_log", []))
+            ss_set("saved_targets", raw.get("saved_targets", {}))
+            ss_set("gs_spreadsheet_id", raw.get("gs_spreadsheet_id",""))
+            ss_set("gs_default_sheet", raw.get("gs_default_sheet","BP"))
+            ss_set("work_context", raw.get("work_context", {}))
+            autosave_now()
+            st.sidebar.success("Session imported & saved.")
+        except Exception as e:
+            st.sidebar.error(f"Import failed: {e}")
+
 
 if "gcp_service_account" not in st.secrets:
     st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
@@ -522,15 +793,12 @@ with tabs[0]:
     if file is not None:
         if file.name.lower().endswith(".csv"):
             df = pd.read_csv(file)
-            # Guarantee canonical columns
             for c in CANON_HEADERS:
                 if c not in df.columns:
                     df[c] = ""
             df = df[CANON_HEADERS]
-            # Remove empty node blocks
             node_block = ["Vital Measurement"] + LEVEL_COLS
             df = df[~df[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)].copy()
-            # Sort for view using RF map (if any)
             df = sort_sheet_for_view(df, ss_get("symptom_quality", {}))
             wb = {"Sheet1": df}
         else:
@@ -550,6 +818,7 @@ with tabs[0]:
             wb = sheets
         ss_set("upload_workbook", wb)
         ss_set("upload_filename", file.name)
+        autosave_now()
         st.success(f"Loaded {len(wb)} sheet(s) into session.")
 
     # Load or refresh from Google Sheets
@@ -588,11 +857,12 @@ with tabs[0]:
                     wb_g = ss_get("gs_workbook", {})
                     wb_g[gs_sheet] = df_g
                     ss_set("gs_workbook", wb_g)
+                    ss_set("gs_default_sheet", gs_sheet)
+                    autosave_now()
                     st.success(f"Loaded '{gs_sheet}' from Google Sheets.")
         except Exception as e:
             st.error(f"Google Sheets error: {e}")
 
-    # VM builder stubs
     st.markdown("---")
     st.subheader("🧩 VM Builder (create Vital Measurements and auto-cascade)")
     st.caption("Stub for now in this monolith. Use Symptoms/Dictionary for edits.")
@@ -634,6 +904,7 @@ with tabs[1]:
 
             # Remember context
             ss_set("work_context", {"source": current_source_code, "sheet": sheet_ws})
+            autosave_now()
 
             # Summary + preview
             if df_ws.empty or not validate_headers(df_ws):
@@ -681,26 +952,29 @@ with tabs[1]:
                     st.caption(f"Showing rows **{start_idx+1}–{end_idx}** of **{total_rows}**.")
                     st.dataframe(df_ws.iloc[start_idx:end_idx], use_container_width=True)
 
-            # Group rows controls (Node 1 / Node 2)
+            # Group rows controls
             st.markdown("---")
             with st.expander("🧩 Group rows (cluster identical labels together)"):
-                st.caption("Group rows so identical **Node 1** and **Node 2** values are contiguous. Red Flags in Node 2 appear on top.")
+                st.caption("Group rows so identical **Node 1** and **Node 2** values are contiguous.")
                 if df_ws.empty or not validate_headers(df_ws):
                     st.info("Load a valid sheet first.")
                 else:
                     scope = st.radio("Grouping scope", ["Whole sheet", "Within Vital Measurement"], horizontal=True, key="ws_group_scope_sel")
+                    rf_scope = st.radio("Red-Flag priority", ["Node 2 only", "Any node (Dictionary)"], horizontal=True, key="ws_group_rf_scope")
                     preview = st.checkbox("Show preview (does not modify data)", value=True, key="ws_group_preview_sel")
 
-                    def grouped_df(df0: pd.DataFrame, scope_mode: str) -> pd.DataFrame:
-                        df2 = sort_sheet_for_view(df0, ss_get("symptom_quality", {}))
+                    def grouped_df(df0: pd.DataFrame, scope_mode: str, rf_scope_sel: str) -> pd.DataFrame:
+                        if rf_scope_sel == "Node 2 only":
+                            df2 = sort_sheet_for_view(df0, ss_get("symptom_quality", {}))
+                        else:
+                            df2 = order_rows_for_push(df0, redflag_map=ss_get("symptom_quality", {}), rf_scope="any")
                         if scope_mode == "Within Vital Measurement":
-                            # Stable sort within VM, preserving overall VM groups
                             df2["_vm"] = df2["Vital Measurement"].map(normalize_text)
                             df2["_row"] = np.arange(len(df2))
                             df2 = df2.sort_values(["_vm","Node 1","Node 2","Node 3","Node 4","Node 5","_row"], kind="stable").drop(columns=["_vm","_row"])
                         return df2
 
-                    df_prev = grouped_df(df_ws, scope)
+                    df_prev = grouped_df(df_ws, scope, rf_scope)
                     if preview:
                         st.dataframe(df_prev.head(100), use_container_width=True)
                     csvprev = df_prev.to_csv(index=False).encode("utf-8")
@@ -716,37 +990,97 @@ with tabs[1]:
                             else:
                                 ss_set("gs_workbook", wb_ws)
                                 st.success("Applied grouping in-session (Google Sheets workbook).")
+                            autosave_now()
                     with colg2:
                         sid2 = ss_get("gs_spreadsheet_id","")
                         if current_source_code == "gs" and sid2 and st.button("Apply & push grouping to Google Sheets", key="ws_group_push_sel"):
                             ok = push_to_google_sheets(sid2, sheet_ws, df_prev)
-                            if ok: st.success("Grouping pushed to Google Sheets.")
+                            if ok:
+                                st.success("Grouping pushed to Google Sheets.")
+                                autosave_now()
 
-            # Push settings at bottom
+            # ---- Materialize & Push ----
             st.markdown("---")
             st.subheader("🔧 Google Sheets Push Settings (current view)")
+
             sid = st.text_input("Spreadsheet ID", value=ss_get("gs_spreadsheet_id",""), key="ws_push_sid_sel")
             if sid:
-                ss_set("gs_spreadsheet_id", sid)
+                ss_set("gs_spreadsheet_id", sid); autosave_now()
             default_tab = ss_get("saved_targets", {}).get(sheet_ws, {}).get("tab", f"{sheet_ws}")
             target_tab = st.text_input("Target tab", value=default_tab, key="ws_push_target_sel")
+
             include_scope = st.radio("Include scope (for stats only)", ["All completed parents","Only parents edited this session"], horizontal=True, key="ws_push_scope_sel")
             push_backup = st.checkbox("Create a backup tab before overwrite", value=True, key="ws_push_backup_sel")
-            sort_rf_first = st.checkbox("Sort Red Flags first (Dictionary-wide lift across Node 1–5)", value=True, key="ws_push_rf_first_sel")
+            rf_scope_push = st.radio("RF priority for push", ["Node 2 only", "Any node (Dictionary)"], horizontal=True, key="ws_push_rf_scope")
+            materialize_on_push = st.checkbox("Add missing rows from overrides (materialize 5-child sets)", value=True, key="ws_push_mat")
+            prune_on_push = st.checkbox("Prune non-selected children (only if deeper nodes are blank)", value=False, key="ws_push_prune")
+            show_diff = st.checkbox("Show diff preview (added / pruned rows)", value=True, key="ws_push_diff")
+            update_session_after_push = st.checkbox("Update in-session sheet with materialized result after push", value=True, key="ws_push_update_session")
             dry_run = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="ws_push_dry_sel")
 
+            # Preview button
+            if st.button("👀 Preview materialization (no write)"):
+                if df_ws.empty or not validate_headers(df_ws):
+                    st.error("Current sheet is empty or headers mismatch.")
+                else:
+                    overrides_all = ss_get("branch_overrides", {})
+                    overrides_sheet = overrides_all.get(sheet_ws, {})
+                    df_mat = df_ws.copy()
+                    rep = {"added": pd.DataFrame(columns=CANON_HEADERS), "pruned": pd.DataFrame(columns=CANON_HEADERS)}
+                    if materialize_on_push:
+                        df_mat, rep = materialize_overrides(df_ws, overrides_sheet, prune=prune_on_push, prune_only_if_deeper_blank=True)
+                    redflag_map = ss_get("symptom_quality", {}) if rf_scope_push != "None" else None
+                    rf_scope_val = "node2" if rf_scope_push == "Node 2 only" else "any"
+                    df_view = order_rows_for_push(df_mat, redflag_map=redflag_map, rf_scope=rf_scope_val)
+
+                    st.success(f"Preview built. Added rows: {len(rep['added'])} · Pruned rows: {len(rep['pruned'])} · Final rows: {len(df_view)}")
+                    if show_diff:
+                        if len(rep["added"]) > 0:
+                            st.markdown("**Added rows (first 50):**")
+                            st.dataframe(rep["added"].head(50), use_container_width=True)
+                            st.download_button("Download added rows (CSV)", rep["added"].to_csv(index=False).encode("utf-8"), file_name="added_rows.csv", mime="text/csv")
+                        if len(rep["pruned"]) > 0:
+                            st.markdown("**Pruned rows (first 50):**")
+                            st.dataframe(rep["pruned"].head(50), use_container_width=True)
+                            st.download_button("Download pruned rows (CSV)", rep["pruned"].to_csv(index=False).encode("utf-8"), file_name="pruned_rows.csv", mime="text/csv")
+                    st.markdown("**Final view (first 50):**")
+                    st.dataframe(df_view.head(50), use_container_width=True)
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                        df_view.to_excel(writer, index=False, sheet_name=sheet_ws[:31] or "Sheet1")
+                    st.download_button("Download preview workbook", data=buffer.getvalue(),
+                                       file_name="decision_tree_materialized_preview.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            # Push button
             if st.button("📤 Push current view to Google Sheets", type="primary", key="ws_push_btn_sel"):
                 if not sid or not target_tab:
                     st.error("Missing Spreadsheet ID or target tab.")
                 elif df_ws.empty or not validate_headers(df_ws):
                     st.error("Current sheet is empty or headers mismatch.")
                 else:
-                    # Build push view: preserve VM grouping, group Node 1, optionally lift RF anywhere in Node1–5
-                    redflag_map = ss_get("symptom_quality", {}) if sort_rf_first else None
-                    view_df = order_rows_for_push(df_ws, redflag_map=redflag_map)
+                    overrides_all = ss_get("branch_overrides", {})
+                    overrides_sheet = overrides_all.get(sheet_ws, {})
+
+                    df_to_push = df_ws.copy()
+                    rep = {"added": pd.DataFrame(columns=CANON_HEADERS), "pruned": pd.DataFrame(columns=CANON_HEADERS)}
+                    if materialize_on_push:
+                        df_to_push, rep = materialize_overrides(df_ws, overrides_sheet, prune=prune_on_push, prune_only_if_deeper_blank=True)
+
+                    # Order for push
+                    redflag_map = ss_get("symptom_quality", {}) if rf_scope_push != "None" else None
+                    rf_scope_val = "node2" if rf_scope_push == "Node 2 only" else "any"
+                    view_df = order_rows_for_push(df_to_push, redflag_map=redflag_map, rf_scope=rf_scope_val)
 
                     if dry_run:
-                        st.success("Dry-run complete. No changes written to Google Sheets.")
+                        st.success(f"Dry-run complete. Added rows: {len(rep['added'])} · Pruned rows: {len(rep['pruned'])}. No changes written.")
+                        if show_diff:
+                            if len(rep["added"]) > 0:
+                                st.markdown("**Added rows (first 50):**")
+                                st.dataframe(rep["added"].head(50), use_container_width=True)
+                            if len(rep["pruned"]) > 0:
+                                st.markdown("**Pruned rows (first 50):**")
+                                st.dataframe(rep["pruned"].head(50), use_container_width=True)
                         st.dataframe(view_df.head(50), use_container_width=True)
                         buffer = io.BytesIO()
                         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -768,7 +1102,7 @@ with tabs[1]:
                                 "target_tab": target_tab,
                                 "spreadsheet_id": sid,
                                 "rows_written": len(view_df),
-                                "new_rows_added": 0,
+                                "new_rows_added": int(len(rep['added'])),
                                 "scope": "session" if include_scope.endswith("session") else "all",
                             })
                             ss_set("push_log", log)
@@ -776,11 +1110,20 @@ with tabs[1]:
                             saved.setdefault(sheet_ws, {})
                             saved[sheet_ws]["tab"] = target_tab
                             ss_set("saved_targets", saved)
-                            st.success(f"Pushed {len(view_df)} rows to '{target_tab}'.")
+
+                            if update_session_after_push:
+                                wb_ws[sheet_ws] = view_df
+                                if current_source_code == "upload":
+                                    ss_set("upload_workbook", wb_ws)
+                                else:
+                                    ss_set("gs_workbook", wb_ws)
+
+                            autosave_now()
+                            st.success(f"Pushed {len(view_df)} rows to '{target_tab}'. Added: {len(rep['added'])}, Pruned: {len(rep['pruned'])}.")
 
 
 # ==============================
-# Tab: Symptoms (simplified inline editor with vocabulary)
+# Tab: Symptoms (inline editor + APPLY OVERRIDES)
 # ==============================
 with tabs[2]:
     st.header("🧬 Symptoms — inline edit of child sets")
@@ -851,7 +1194,7 @@ with tabs[2]:
                 vocab = build_vocabulary(df)
                 vocab_opts = ["(pick suggestion)"] + vocab
 
-                # Search / status sort
+                # Top controls
                 top_cols = st.columns([2,1,1,1,2])
                 with top_cols[0]:
                     search = st.text_input("Search parent symptom/path", key="sym_search").strip().lower()
@@ -936,7 +1279,6 @@ with tabs[2]:
                             fixed = build_final_values()
                             overrides_all = ss_get("branch_overrides", {})
                             overrides_sheet = overrides_all.get(sheet, {}).copy()
-                            # undo stack
                             stack = ss_get("undo_stack", [])
                             stack.append({
                                 "context": "symptoms",
@@ -952,13 +1294,31 @@ with tabs[2]:
                             ss_set("branch_overrides", overrides_all)
                             mark_session_edit(sheet, keyname)
 
-                            # Update view df using overrides (no heavy cascade)
                             wb[sheet] = sort_sheet_for_view(df, ss_get("symptom_quality", {}))
                             if where == "upload":
                                 ss_set("upload_workbook", wb)
                             else:
                                 ss_set("gs_workbook", wb)
-                            st.success("Saved and updated in-session view (grouping by Node 1 with RF on Node 2).")
+                            autosave_now()
+                            st.success("Saved override. Use 'Apply overrides to data' below to create the missing rows if needed.")
+
+            # Apply overrides to data
+            st.markdown("---")
+            st.subheader("Apply overrides to data (expand rows)")
+            prune_apply = st.checkbox("Prune non-selected children (only if deeper nodes are blank)", value=False, key="sym_apply_prune")
+            if st.button("↳ Apply now for this sheet"):
+                overrides_all = ss_get("branch_overrides", {})
+                overrides_sheet = overrides_all.get(sheet, {})
+                df_new, rep = materialize_overrides(df, overrides_sheet, prune=prune_apply, prune_only_if_deeper_blank=True)
+                wb[sheet] = df_new
+                if where == "upload":
+                    ss_set("upload_workbook", wb)
+                else:
+                    ss_set("gs_workbook", wb)
+                autosave_now()
+                st.success(f"Applied. Added rows: {len(rep['added'])} · Pruned rows: {len(rep['pruned'])} · Total rows: {len(df_new)}")
+                if len(rep["added"]) > 0:
+                    st.dataframe(rep["added"].head(50), use_container_width=True)
 
             # Undo
             st.markdown("---")
@@ -980,16 +1340,16 @@ with tabs[2]:
                                 ss_set("upload_workbook", wb2)
                             else:
                                 ss_set("gs_workbook", wb2)
+                        autosave_now()
                         st.success(f"Undid overrides for sheet '{last['sheet']}'.")
 
 
 # ==============================
-# Tab: Dictionary (search, highlight, red flag tagging)
+# Tab: Dictionary
 # ==============================
 with tabs[3]:
     st.header("📖 Dictionary — all symptom labels")
 
-    # Pick sources
     sources_avail = []
     if ss_get("upload_workbook", {}): sources_avail.append("Upload workbook")
     if ss_get("gs_workbook", {}): sources_avail.append("Google Sheets workbook")
@@ -1016,7 +1376,6 @@ with tabs[3]:
         if not dfs:
             st.info("Select at least one sheet.")
         else:
-            # Build dictionary
             counts: Dict[str,int] = {}
             levels_map: Dict[str, Set[int]] = {}
             for df0 in dfs:
@@ -1030,7 +1389,7 @@ with tabs[3]:
                             counts[val] = counts.get(val, 0) + 1
                             levels_map.setdefault(val, set()).add(lvl)
 
-            quality_map = ss_get("symptom_quality", {})  # {label: "Red Flag"|"Normal"}
+            quality_map = ss_get("symptom_quality", {})
 
             rows = []
             for symptom, cnt in counts.items():
@@ -1044,7 +1403,6 @@ with tabs[3]:
                 })
             dict_df = pd.DataFrame(rows).sort_values(["Symptom"]).reset_index(drop=True)
 
-            # Search & filter & sort
             st.subheader("Search & Filter")
             c1, c2, c3, c4 = st.columns([2,1,1,1])
             with c1:
@@ -1146,6 +1504,7 @@ with tabs[3]:
                         for _, r in dict_df.iterrows():
                             new_quality[r["Symptom"]] = "Red Flag" if bool(r["RedFlag"]) else "Normal"
                         ss_set("symptom_quality", new_quality)
+                        autosave_now()
                         st.success("Red Flags saved for this session.")
                 with colS2:
                     csv_data = view.to_csv(index=False).encode("utf-8")
@@ -1153,11 +1512,10 @@ with tabs[3]:
 
 
 # ==============================
-# Tab: Conflicts (simple inspector & resolver)
+# Tab: Conflicts (inspector & resolver + APPLY + UNDO)
 # ==============================
 with tabs[4]:
     st.header("⚖️ Conflicts inspector")
-    # Use current context sheet if available
     ctx = ss_get("work_context", {})
     src = ctx.get("source")
     sheet = ctx.get("sheet")
@@ -1197,7 +1555,6 @@ with tabs[4]:
                 st.warning(f"Found {len(conflicts)} parent label(s) with conflicting child sets.")
                 for (L, plabel), sets in conflicts.items():
                     with st.expander(f"Node {L} parent '{plabel}' — {len(set(sets))} different child sets"):
-                        # show each set
                         union_children = sorted({c for tup in sets for c in tup})
                         st.write("All observed child sets:")
                         for i, tup in enumerate(set(sets), start=1):
@@ -1209,10 +1566,16 @@ with tabs[4]:
                             if len(selected) != 5:
                                 st.error("Please pick exactly 5 options.")
                             else:
-                                # Save under the canonical key L|parent_tuple for each distinct parent tuple that shares this label
-                                # We resolve *by label*, so apply to *all* parent tuples whose last label == plabel at this level.
+                                # Snapshot for UNDO
+                                stack = ss_get("undo_stack", [])
+                                stack.append({
+                                    "context": "conflicts",
+                                    "sheet": sheet,
+                                    "overrides_sheet_before": overrides_all.get(sheet, {}).copy(),
+                                })
+                                ss_set("undo_stack", stack)
+
                                 new_overrides = overrides_all.get(sheet, {}).copy()
-                                # find all parent tuples with last label == plabel
                                 for key2 in store.keys():
                                     if "|" not in key2: continue
                                     lvl_s2, path2 = key2.split("|", 1)
@@ -1225,7 +1588,44 @@ with tabs[4]:
                                         new_overrides[level_key_tuple(L, ptuple)] = enforce_k_five(selected)
                                 overrides_all[sheet] = new_overrides
                                 ss_set("branch_overrides", overrides_all)
+                                autosave_now()
                                 st.success("Resolved and saved for all matching parents.")
+
+            st.markdown("---")
+            # Apply overrides to data from Conflicts
+            prune_apply_c = st.checkbox("Prune non-selected children (only if deeper nodes are blank)", value=False, key="conf_apply_prune")
+            if st.button("↳ Apply overrides to data (expand rows)"):
+                overrides_all = ss_get("branch_overrides", {})
+                overrides_sheet = overrides_all.get(sheet, {})
+                df_new, rep = materialize_overrides(df, overrides_sheet, prune=prune_apply_c, prune_only_if_deeper_blank=True)
+                wb[sheet] = df_new
+                if src == "upload":
+                    ss_set("upload_workbook", wb)
+                else:
+                    ss_set("gs_workbook", wb)
+                autosave_now()
+                st.success(f"Applied. Added rows: {len(rep['added'])} · Pruned rows: {len(rep['pruned'])} · Total rows: {len(df_new)}")
+
+            if st.button("↩️ Undo last conflict resolution"):
+                stack = ss_get("undo_stack", [])
+                if not stack:
+                    st.info("Nothing to undo.")
+                else:
+                    last = None
+                    while stack:
+                        cand = stack.pop()
+                        if cand.get("context") == "conflicts":
+                            last = cand
+                            break
+                    ss_set("undo_stack", stack)
+                    if last is None:
+                        st.info("No conflict resolution to undo.")
+                    else:
+                        ov = ss_get("branch_overrides", {})
+                        ov[sheet] = last.get("overrides_sheet_before", {})
+                        ss_set("branch_overrides", ov)
+                        autosave_now()
+                        st.success("Conflict resolution undone.")
 
 
 # ==============================
@@ -1234,7 +1634,6 @@ with tabs[4]:
 with tabs[5]:
     st.header("🧪 Validation rules")
 
-    # Use current context
     ctx = ss_get("work_context", {})
     src = ctx.get("source")
     sheet = ctx.get("sheet")
@@ -1255,8 +1654,10 @@ with tabs[5]:
             overrides_sheet = overrides_all.get(sheet, {})
             redflag_map = ss_get("symptom_quality", {})
 
-            orphans_loose = detect_orphans(df, overrides=overrides_sheet, strict=False)
-            orphans_strict = detect_orphans(df, overrides=overrides_sheet, strict=True)
+            show_loose = st.checkbox("Show loose orphans", value=True)
+            show_strict = st.checkbox("Show strict orphans", value=True)
+            orphans_loose = detect_orphans(df, overrides=overrides_sheet, strict=False) if show_loose else []
+            orphans_strict = detect_orphans(df, overrides=overrides_sheet, strict=True) if show_strict else []
             loops = detect_loops(df)
             missing_rf = detect_missing_redflag_coverage(df, overrides=overrides_sheet, redflag_map=redflag_map)
 
@@ -1278,14 +1679,12 @@ with tabs[5]:
             if not loops:
                 st.success("None")
             else:
-                # Flatten Arrow/CSV-unfriendly objects to strings
                 def _fmt_path(x):
                     if isinstance(x, (list, tuple)):
                         return " > ".join(map(str, x))
                     return str(x)
 
                 def _fmt_repeats(x):
-                    # x ~ [(label, first_pos, later_pos), ...]
                     if isinstance(x, list):
                         try:
                             parts = []
@@ -1318,18 +1717,120 @@ with tabs[5]:
 
 
 # ==============================
-# Tab: Calculator (placeholder)
+# Tab: Calculator (Navigator & Quick Match)
 # ==============================
 with tabs[6]:
-    st.header("🧮 Calculator (placeholder)")
-    st.caption("A staging ground for v6.3.2 features — quick estimators, RF coverage %, etc.")
-    n_rows = st.number_input("Rows", 0, 100000, 0, step=100)
-    n_parents = st.number_input("Parents", 0, 100000, 0, step=100)
-    if st.button("Compute simple ratio"):
-        if n_parents == 0:
-            st.warning("Parents must be > 0")
-        else:
-            st.success(f"Rows per parent: {n_rows / max(1, n_parents):.2f}")
+    st.header("🧮 Calculator — Branch Navigator")
+
+    ctx = ss_get("work_context", {})
+    src = ctx.get("source")
+    sheet = ctx.get("sheet")
+    if src == "upload":
+        wb = ss_get("upload_workbook", {})
+    else:
+        wb = ss_get("gs_workbook", {})
+
+    if not sheet or sheet not in wb or wb[sheet].empty or not validate_headers(wb[sheet]):
+        st.info("Select a valid sheet in **Workspace** first.")
+    else:
+        df_calc_full = wb[sheet].copy()
+        overrides_all = ss_get("branch_overrides", {})
+        overrides_sheet = overrides_all.get(sheet, {})
+
+        sub_tabs = st.tabs(["🧭 Guided Navigator", "🔎 Quick Match (pick up to 5)"])
+
+        with sub_tabs[0]:
+            vms = sorted(set(df_calc_full["Vital Measurement"].astype(str).map(normalize_text)))
+            vm_sel = st.selectbox("Vital Measurement", options=vms, key="calc_vm_sel")
+            df_scope = df_calc_full[df_calc_full["Vital Measurement"].astype(str).map(normalize_text) == normalize_text(vm_sel)]
+            store_vm = infer_branch_options_with_overrides(df_scope, overrides_sheet)
+
+            def get_children(level: int, parent_tuple: Tuple[str, ...]) -> List[str]:
+                return [x for x in store_vm.get(level_key_tuple(level, parent_tuple), []) if normalize_text(x) != ""]
+
+            l1 = st.selectbox("Node 1", options=[""] + get_children(1, ()), key="calc_n1")
+            parent1 = (l1,) if l1 else tuple()
+
+            l2_opts = get_children(2, parent1) if l1 else []
+            l2 = st.selectbox("Node 2", options=[""] + l2_opts, key="calc_n2")
+            parent2 = parent1 + ((l2,) if l2 else tuple())
+
+            l3_opts = get_children(3, parent2) if l2 else []
+            l3 = st.selectbox("Node 3", options=[""] + l3_opts, key="calc_n3")
+            parent3 = parent2 + ((l3,) if l3 else tuple())
+
+            l4_opts = get_children(4, parent3) if l3 else []
+            l4 = st.selectbox("Node 4", options=[""] + l4_opts, key="calc_n4")
+            parent4 = parent3 + ((l4,) if l4 else tuple())
+
+            l5_opts = get_children(5, parent4) if l4 else []
+            l5 = st.selectbox("Node 5", options=[""] + l5_opts, key="calc_n5")
+
+            sel_path = [normalize_text(x) for x in [l1, l2, l3, l4, l5] if normalize_text(x)]
+            st.caption(f"Path: **{vm_sel}** → " + (" > ".join(sel_path) if sel_path else "(no selection)"))
+
+            df_match = df_scope.copy()
+            for i, val in enumerate(sel_path):
+                if val:
+                    col = LEVEL_COLS[i]
+                    df_match = df_match[df_match[col].astype(str).map(normalize_text) == val]
+
+            st.markdown("**Outcomes (Diagnostic Triage & Actions)**")
+            if df_match.empty:
+                st.info("No rows match the current path.")
+            else:
+                out = df_match[["Diagnostic Triage","Actions"]].copy().fillna("")
+                out = out.drop_duplicates().reset_index(drop=True)
+                st.dataframe(out, use_container_width=True, hide_index=True)
+                csv = df_match.to_csv(index=False).encode("utf-8")
+                st.download_button("Download matched rows (CSV)", data=csv, file_name="matched_rows.csv", mime="text/csv")
+
+        with sub_tabs[1]:
+            def build_vocabulary(df0: pd.DataFrame) -> List[str]:
+                vocab = set()
+                for col in LEVEL_COLS:
+                    if col in df0.columns:
+                        for x in df0[col].dropna().astype(str):
+                            x = normalize_text(x)
+                            if x: vocab.add(x)
+                return sorted(vocab)
+            vocab = build_vocabulary(df_calc_full)
+            opt = [""] + vocab
+
+            vm_opt = ["(All)"] + sorted(set(df_calc_full["Vital Measurement"].astype(str).map(normalize_text)))
+            vm_filter = st.selectbox("Filter by Vital Measurement (optional)", options=vm_opt, key="calc_qm_vm")
+            df_qm_scope = df_calc_full.copy()
+            if vm_filter != "(All)":
+                df_qm_scope = df_qm_scope[df_qm_scope["Vital Measurement"].astype(str).map(normalize_text) == normalize_text(vm_filter)]
+
+            col_inputs = st.columns(5)
+            pick = []
+            for i in range(5):
+                with col_inputs[i]:
+                    val = st.selectbox(f"Node {i+1}", options=opt, key=f"calc_qm_n{i+1}")
+                    pick.append(normalize_text(val))
+
+            df_qm = df_qm_scope.copy()
+            used = 0
+            for i in range(5):
+                v = pick[i]
+                if v:
+                    df_qm = df_qm[df_qm[LEVEL_COLS[i]].astype(str).map(normalize_text) == v]
+                    used += 1
+                else:
+                    break
+
+            if used == 0:
+                st.info("Pick at least Node 1 to begin.")
+            else:
+                st.markdown("**Best matches**")
+                if df_qm.empty:
+                    st.warning("No matching rows.")
+                else:
+                    out = df_qm[["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]].copy()
+                    st.dataframe(out.head(50), use_container_width=True)
+                    csv2 = out.to_csv(index=False).encode("utf-8")
+                    st.download_button("Download results (CSV)", data=csv2, file_name="quick_match_results.csv", mime="text/csv")
 
 
 # ==============================
@@ -1340,7 +1841,6 @@ with tabs[7]:
     if not _HAS_PYVIS:
         st.info("PyVis is not installed. Add `pyvis>=0.3.2` to requirements to enable the visualizer.")
     else:
-        # Resolve current sheet
         def _get_current_df() -> Tuple[Optional[pd.DataFrame], str]:
             ctx = ss_get("work_context", {})
             src = ctx.get("source")
@@ -1378,7 +1878,6 @@ with tabs[7]:
             with c4:
                 limit = st.number_input("Row limit", min_value=100, max_value=100000, value=5000, step=500)
 
-            # Build graph data
             def _build_edges(df: pd.DataFrame, limit_rows: int, scope_vm: Optional[str], collapse_by_label_per_level: bool):
                 nodes: Set[str] = set()
                 edges: List[Tuple[str, str]] = []
