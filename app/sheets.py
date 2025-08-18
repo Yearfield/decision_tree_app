@@ -35,31 +35,27 @@ def get_gspread_client_from_secrets(secrets_dict: dict) -> gspread.Client:
         ValueError: If required credentials are missing
     """
     try:
-        # Validate that we have the required service account data
-        required_fields = ['type', 'project_id', 'private_key_id', 'private_key', 'client_email']
-        missing_fields = [field for field in required_fields if field not in secrets_dict]
+        # Create credentials from the service account dict (same as monolith)
+        from google.oauth2.service_account import Credentials
+        credentials = Credentials.from_service_account_info(secrets_dict)
         
-        if missing_fields:
-            raise ValueError(f"Missing required service account fields: {missing_fields}")
-        
-        # Create credentials from the service account dict
-        credentials = gspread.service_account_from_dict(secrets_dict)
-        
-        # Create and return the client
+        # Create and return the client (same as monolith)
         client = gspread.authorize(credentials)
-        
-        # Test the connection by listing spreadsheets (this will fail if auth is wrong)
-        client.list_spreadsheet_files()
         
         return client
         
     except GoogleAuthError as e:
         raise GoogleAuthError(
-            "Failed to authenticate with Google Sheets. Please check your service account credentials. "
-            "Make sure the service account has the necessary permissions and the credentials are valid."
+            "❌ Google Sheets authentication failed. Please check your service account credentials in "
+            "st.secrets['gcp_service_account']. Make sure the service account has the necessary permissions."
+        ) from e
+    except KeyError as e:
+        raise ValueError(
+            f"❌ Missing required field in service account: {e}. Please check your "
+            "st.secrets['gcp_service_account'] configuration."
         ) from e
     except Exception as e:
-        raise Exception(f"Unexpected error during authentication: {str(e)}") from e
+        raise Exception(f"❌ Unexpected authentication error: {str(e)}") from e
 
 
 def open_spreadsheet(client: gspread.Client, spreadsheet_id: str) -> gspread.Spreadsheet:
@@ -80,7 +76,7 @@ def open_spreadsheet(client: gspread.Client, spreadsheet_id: str) -> gspread.Spr
     try:
         # Validate spreadsheet_id format (basic check)
         if not spreadsheet_id or len(spreadsheet_id) < 20:
-            raise ValueError("Invalid spreadsheet ID format")
+            raise ValueError("❌ Invalid spreadsheet ID format. Please provide a valid Google Sheets URL or ID.")
         
         # Open the spreadsheet
         spreadsheet = client.open_by_key(spreadsheet_id)
@@ -88,13 +84,13 @@ def open_spreadsheet(client: gspread.Client, spreadsheet_id: str) -> gspread.Spr
         
     except SpreadsheetNotFound:
         raise SpreadsheetNotFound(
-            f"Spreadsheet with ID '{spreadsheet_id}' not found or access denied. "
-            "Please check the spreadsheet ID and ensure your service account has access to it."
+            f"❌ Spreadsheet '{spreadsheet_id}' not found or access denied. "
+            "Please check the spreadsheet ID and ensure your service account has edit permissions."
         )
     except NoValidUrlKeyFound:
-        raise ValueError(f"Invalid spreadsheet ID: '{spreadsheet_id}'")
+        raise ValueError(f"❌ Invalid spreadsheet ID: '{spreadsheet_id}'. Please provide a valid Google Sheets URL or ID.")
     except Exception as e:
-        raise Exception(f"Error opening spreadsheet: {str(e)}") from e
+        raise Exception(f"❌ Error opening spreadsheet: {str(e)}") from e
 
 
 def list_worksheets(spreadsheet: gspread.Spreadsheet) -> list[str]:
@@ -142,12 +138,12 @@ def create_worksheet(spreadsheet: gspread.Spreadsheet, title: str, rows: int = 1
     try:
         # Validate title
         if not title or not title.strip():
-            raise ValueError("Worksheet title cannot be empty")
+            raise ValueError("❌ Worksheet title cannot be empty. Please provide a valid name.")
         
         # Check if worksheet already exists
         existing_titles = list_worksheets(spreadsheet)
         if title in existing_titles:
-            raise ValueError(f"Worksheet '{title}' already exists")
+            raise ValueError(f"❌ Worksheet '{title}' already exists. Please choose a different name.")
         
         # Create the worksheet
         worksheet = spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
@@ -157,10 +153,10 @@ def create_worksheet(spreadsheet: gspread.Spreadsheet, title: str, rows: int = 1
         raise  # Re-raise ValueError as-is
     except APIError as e:
         raise APIError(
-            f"Unable to create worksheet '{title}'. Please check your permissions."
+            f"❌ Unable to create worksheet '{title}'. Please check your permissions for this spreadsheet."
         ) from e
     except Exception as e:
-        raise Exception(f"Error creating worksheet: {str(e)}") from e
+        raise Exception(f"❌ Error creating worksheet: {str(e)}") from e
 
 
 def read_worksheet(spreadsheet: gspread.Spreadsheet, title: str) -> pd.DataFrame:
@@ -196,14 +192,14 @@ def read_worksheet(spreadsheet: gspread.Spreadsheet, title: str) -> pd.DataFrame
         
     except WorksheetNotFound:
         raise WorksheetNotFound(
-            f"Worksheet '{title}' not found in the spreadsheet."
+            f"❌ Worksheet '{title}' not found in the spreadsheet. Please check the worksheet name."
         )
     except APIError as e:
         raise APIError(
-            f"Unable to read worksheet '{title}'. Please check your permissions."
+            f"❌ Unable to read worksheet '{title}'. Please check your permissions for this spreadsheet."
         ) from e
     except Exception as e:
-        raise Exception(f"Error reading worksheet: {str(e)}") from e
+        raise Exception(f"❌ Error reading worksheet: {str(e)}") from e
 
 
 def read_worksheet_with_canonical_headers(spreadsheet: gspread.Spreadsheet, title: str, canonical_headers: list[str]) -> pd.DataFrame:
@@ -289,7 +285,7 @@ def write_dataframe(spreadsheet: gspread.Spreadsheet, title: str, df: pd.DataFra
     try:
         # Validate mode
         if mode not in ["overwrite", "append"]:
-            raise ValueError("Mode must be 'overwrite' or 'append'")
+            raise ValueError("❌ Mode must be 'overwrite' or 'append'")
         
         # Get the worksheet
         worksheet = spreadsheet.worksheet(title)
@@ -319,16 +315,16 @@ def write_dataframe(spreadsheet: gspread.Spreadsheet, title: str, df: pd.DataFra
         
     except WorksheetNotFound:
         raise WorksheetNotFound(
-            f"Worksheet '{title}' not found in the spreadsheet."
+            f"❌ Worksheet '{title}' not found in the spreadsheet. Please check the worksheet name."
         )
     except ValueError:
         raise  # Re-raise ValueError as-is
     except APIError as e:
         raise APIError(
-            f"Unable to write to worksheet '{title}'. Please check your permissions."
+            f"❌ Unable to write to worksheet '{title}'. Please check your permissions for this spreadsheet."
         ) from e
     except Exception as e:
-        raise Exception(f"Error writing to worksheet: {str(e)}") from e
+        raise Exception(f"❌ Error writing to worksheet: {str(e)}") from e
 
 
 def backup_worksheet(spreadsheet: gspread.Spreadsheet, source_title: str) -> Optional[str]:

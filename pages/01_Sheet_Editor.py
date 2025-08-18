@@ -55,10 +55,11 @@ def connect_and_list() -> None:
 		# Get credentials from st.secrets; never print them
 		service_account_info = st.secrets["gcp_service_account"]
 
-		client = get_gspread_client_from_secrets(service_account_info)
-		spreadsheet_id = extract_spreadsheet_id(st.session_state["spreadsheet_id_input"])
-		ss = open_spreadsheet(client, spreadsheet_id)
-		names = list_worksheets(ss)
+		with st.spinner("🔗 Connecting to Google Sheets..."):
+			client = get_gspread_client_from_secrets(service_account_info)
+			spreadsheet_id = extract_spreadsheet_id(st.session_state["spreadsheet_id_input"])
+			ss = open_spreadsheet(client, spreadsheet_id)
+			names = list_worksheets(ss)
 
 		# Update session state on success
 		st.session_state["gclient"] = client
@@ -69,9 +70,15 @@ def connect_and_list() -> None:
 		else:
 			st.session_state["selected_worksheet"] = None
 
-		st.success("Connected. Worksheets listed below.")
+		# Show success message with sheet info
+		st.success(f"✅ Connected to spreadsheet: {spreadsheet_id}")
+		if names:
+			st.info(f"📋 Found {len(names)} worksheet(s): {', '.join(names)}")
+		else:
+			st.info("📋 No worksheets found. You can create a new one below.")
+			
 	except KeyError:
-		st.error("Missing gcp_service_account in secrets. Add service account JSON to st.secrets.")
+		st.error("❌ Missing gcp_service_account in secrets. Add your service account JSON to st.secrets['gcp_service_account'].")
 	except Exception as e:
 		# Show a user-friendly error, but do not reveal secrets
 		st.error(str(e))
@@ -81,20 +88,22 @@ def create_new_worksheet() -> None:
 	"""Create a new worksheet with the provided name and refresh list."""
 	name = (st.session_state.get("new_worksheet_name") or "").strip()
 	if not name:
-		st.warning("Enter a name for the new worksheet.")
+		st.warning("⚠️ Please enter a name for the new worksheet.")
 		return
 
 	if st.session_state.get("spreadsheet") is None:
-		st.warning("Connect to a spreadsheet first.")
+		st.warning("⚠️ Connect to a spreadsheet first.")
 		return
 
 	try:
-		ws = create_worksheet(st.session_state["spreadsheet"], name)
-		# Refresh worksheet list
-		names = list_worksheets(st.session_state["spreadsheet"])
-		st.session_state["worksheet_names"] = names
-		st.session_state["selected_worksheet"] = name
-		st.success(f"Worksheet '{name}' created.")
+		with st.spinner(f"📝 Creating worksheet '{name}'..."):
+			ws = create_worksheet(st.session_state["spreadsheet"], name)
+			# Refresh worksheet list
+			names = list_worksheets(st.session_state["spreadsheet"])
+			st.session_state["worksheet_names"] = names
+			st.session_state["selected_worksheet"] = name
+		
+		st.success(f"✅ Worksheet '{name}' created successfully!")
 	except Exception as e:
 		st.error(str(e))
 
@@ -103,28 +112,29 @@ def load_worksheet_data() -> None:
 	"""Load the selected worksheet data into a DataFrame."""
 	selected_worksheet = st.session_state.get("selected_worksheet")
 	if not selected_worksheet:
-		st.warning("Please select a worksheet first.")
+		st.warning("⚠️ Please select a worksheet first.")
 		return
 
 	if st.session_state.get("spreadsheet") is None:
-		st.warning("Connect to a spreadsheet first.")
+		st.warning("⚠️ Connect to a spreadsheet first.")
 		return
 
 	try:
-		# Load worksheet data using the helper function
-		df = read_worksheet(st.session_state["spreadsheet"], selected_worksheet)
-		
-		# Store in session state
-		st.session_state["current_df"] = df
-		st.session_state["df_loaded"] = True
+		with st.spinner(f"📥 Loading worksheet '{selected_worksheet}'..."):
+			# Load worksheet data using the helper function
+			df = read_worksheet(st.session_state["spreadsheet"], selected_worksheet)
+			
+			# Store in session state
+			st.session_state["current_df"] = df
+			st.session_state["df_loaded"] = True
 		
 		if df.empty:
-			st.info("Worksheet is empty. You can add headers and data below.")
+			st.info("📋 Worksheet is empty. You can add headers and data below.")
 		else:
-			st.success(f"Loaded {len(df)} rows and {len(df.columns)} columns from '{selected_worksheet}'.")
+			st.success(f"✅ Loaded {len(df)} rows and {len(df.columns)} columns from '{selected_worksheet}'.")
 			
 	except Exception as e:
-		st.error(f"Error loading worksheet: {str(e)}")
+		st.error(str(e))
 
 
 def create_empty_dataframe_with_headers() -> None:
@@ -143,10 +153,10 @@ def create_empty_dataframe_with_headers() -> None:
 			df = pd.DataFrame(columns=header_list)
 			st.session_state["current_df"] = df
 			st.session_state["df_loaded"] = True
-			st.success(f"Created empty DataFrame with {len(header_list)} columns.")
+			st.success(f"✅ Created empty DataFrame with {len(header_list)} columns.")
 			st.rerun()
 		else:
-			st.warning("Please enter at least one column header.")
+			st.warning("⚠️ Please enter at least one column header.")
 
 
 def save_dataframe_to_sheet() -> None:
@@ -156,19 +166,24 @@ def save_dataframe_to_sheet() -> None:
 	save_mode = st.session_state.get("save_mode", "overwrite")
 	
 	if not selected_worksheet:
-		st.error("Please select a worksheet first.")
+		st.error("❌ Please select a worksheet first.")
 		return
 		
 	if current_df is None:
-		st.error("No data to save. Load a worksheet first.")
+		st.error("❌ No data to save. Load a worksheet first.")
+		return
+		
+	# Validate DataFrame is not empty before saving
+	if current_df.empty:
+		st.warning("⚠️ Cannot save empty DataFrame. Please add some data first.")
 		return
 		
 	if st.session_state.get("spreadsheet") is None:
-		st.error("Not connected to a spreadsheet.")
+		st.error("❌ Not connected to a spreadsheet.")
 		return
 	
 	try:
-		with st.spinner(f"Saving data ({save_mode} mode)..."):
+		with st.spinner(f"💾 Saving data ({save_mode} mode)..."):
 			write_dataframe(
 				st.session_state["spreadsheet"],
 				selected_worksheet,
@@ -176,10 +191,11 @@ def save_dataframe_to_sheet() -> None:
 				mode=save_mode
 			)
 		
-		st.success(f"Data saved successfully to '{selected_worksheet}' ({save_mode} mode).")
+		# Use status for success message
+		st.success(f"✅ Data saved successfully to '{selected_worksheet}' ({save_mode} mode).")
 		
 	except Exception as e:
-		st.error(f"Error saving data: {str(e)}")
+		st.error(str(e))
 
 
 def get_csv_download_data() -> str:
@@ -243,11 +259,23 @@ if st.session_state.get("spreadsheet") is not None:
 
 # Data editing section
 if st.session_state.get("df_loaded") and st.session_state.get("current_df") is not None:
+	current_df = st.session_state["current_df"]
+	
 	st.subheader("Edit Data")
+	
+	# Always show data summary prominently
+	with st.container(border=True):
+		col1, col2, col3 = st.columns(3)
+		with col1:
+			st.metric("Rows", len(current_df))
+		with col2:
+			st.metric("Columns", len(current_df.columns))
+		with col3:
+			st.metric("Status", "Empty" if current_df.empty else "Has Data")
 	
 	# Display the DataFrame in an editable grid
 	edited_df = st.data_editor(
-		st.session_state["current_df"],
+		current_df,
 		use_container_width=True,
 		editable=True,
 		num_rows="dynamic",
@@ -255,9 +283,6 @@ if st.session_state.get("df_loaded") and st.session_state.get("current_df") is n
 	
 	# Update session state with edited DataFrame
 	st.session_state["current_df"] = edited_df
-	
-	# Show data summary
-	st.info(f"DataFrame: {len(edited_df)} rows × {len(edited_df.columns)} columns")
 	
 	# Save controls section
 	st.subheader("Save Data")
@@ -289,13 +314,16 @@ if st.session_state.get("df_loaded") and st.session_state.get("current_df") is n
 			st.button("📥 Download CSV backup", disabled=True, help="No data to download")
 	
 	with col2:
-		# Save button
-		if st.button("💾 Save changes", type="primary"):
-			save_dataframe_to_sheet()
+		# Save button with validation
+		if edited_df.empty:
+			st.button("💾 Save changes", disabled=True, help="Cannot save empty DataFrame")
+		else:
+			if st.button("💾 Save changes", type="primary"):
+				save_dataframe_to_sheet()
 
 elif st.session_state.get("df_loaded") and st.session_state.get("current_df") is not None and st.session_state["current_df"].empty:
 	st.subheader("Empty Worksheet")
-	st.info("This worksheet is empty. You can create headers and start adding data.")
+	st.info("📋 This worksheet is empty. You can create headers and start adding data.")
 	
 	# Option to create headers for empty worksheet
 	create_empty_dataframe_with_headers()
