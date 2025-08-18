@@ -34,6 +34,15 @@ FRIENDLY_ROOT: str = "Top-level (Node 1) options"
 def normalize_text(x: object) -> str:
     """
     Return a stripped string, converting NaN/None to "".
+    
+    Args:
+        x: Any object to convert to string
+        
+    Returns:
+        Stripped string, empty string for None/NaN values
+        
+    Failure modes:
+        - Returns empty string for any unconvertible objects
     """
     try:
         if x is None:
@@ -41,36 +50,91 @@ def normalize_text(x: object) -> str:
         if isinstance(x, float) and np.isnan(x):
             return ""
     except Exception:
-        pass
+        return ""
     return str(x).strip()
 
 
 def validate_headers(df: pd.DataFrame) -> bool:
     """
     Verify that the first len(CANON_HEADERS) columns match the canonical schema.
+    
+    Args:
+        df: DataFrame to validate
+        
+    Returns:
+        True if headers match canonical schema, False otherwise
+        
+    Failure modes:
+        - Returns False for non-DataFrame inputs
+        - Returns False for empty DataFrames
+        - Returns False for DataFrames with insufficient columns
     """
-    return list(df.columns[:len(CANON_HEADERS)]) == CANON_HEADERS
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return False
+        if len(df.columns) < len(CANON_HEADERS):
+            return False
+        return list(df.columns[:len(CANON_HEADERS)]) == CANON_HEADERS
+    except Exception:
+        return False
 
 
 def ensure_canon_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensure the DataFrame has all canonical columns (creates missing as "") and in order.
     Does not drop any extra columns the caller may have added.
+    
+    Args:
+        df: DataFrame to ensure canonical columns for
+        
+    Returns:
+        DataFrame with all canonical columns present and in order
+        
+    Failure modes:
+        - Returns empty DataFrame with canonical columns for non-DataFrame inputs
+        - Creates missing columns as empty strings
     """
-    df2 = df.copy()
-    for c in CANON_HEADERS:
-        if c not in df2.columns:
-            df2[c] = ""
-    return df2[CANON_HEADERS]
+    try:
+        if not isinstance(df, pd.DataFrame):
+            return pd.DataFrame(columns=CANON_HEADERS)
+        
+        df2 = df.copy()
+        for c in CANON_HEADERS:
+            if c not in df2.columns:
+                df2[c] = ""
+        return df2[CANON_HEADERS]
+    except Exception:
+        return pd.DataFrame(columns=CANON_HEADERS)
 
 
 def drop_fully_blank_paths(df: pd.DataFrame) -> pd.DataFrame:
     """
     Drop rows where Vital Measurement + Node1..Node5 are all blank.
+    
+    Args:
+        df: DataFrame to filter
+        
+    Returns:
+        DataFrame with fully blank rows removed
+        
+    Failure modes:
+        - Returns empty DataFrame for non-DataFrame inputs
+        - Returns original DataFrame if required columns missing
     """
-    node_block = ["Vital Measurement"] + LEVEL_COLS
-    mask_blank = df[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)
-    return df[~mask_blank].copy()
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        
+        node_block = ["Vital Measurement"] + LEVEL_COLS
+        # Check if required columns exist
+        missing_cols = [col for col in node_block if col not in df.columns]
+        if missing_cols:
+            return df.copy()
+        
+        mask_blank = df[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)
+        return df[~mask_blank].copy()
+    except Exception:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
 
 # ========= Keys & paths =========
@@ -88,16 +152,111 @@ def parent_key_from_row_strict(row: pd.Series, upto_level: int) -> Optional[Tupl
     For a row and a target 'upto_level', return the parent tuple of length (upto_level-1).
     If any required Node column is blank, return None.
     L=1 => parent is () (root).
+    
+    Args:
+        row: DataFrame row to extract parent from
+        upto_level: Target level to build parent for
+        
+    Returns:
+        Parent tuple or None if incomplete
+        
+    Failure modes:
+        - Returns None for invalid inputs
+        - Returns None if required columns missing
     """
-    if upto_level <= 1:
-        return tuple()
-    parent: List[str] = []
-    for c in LEVEL_COLS[:upto_level-1]:
-        v = normalize_text(row.get(c, ""))
-        if v == "":
-            return None
-        parent.append(v)
-    return tuple(parent)
+    try:
+        if upto_level <= 1:
+            return tuple()
+        parent: List[str] = []
+        for c in LEVEL_COLS[:upto_level-1]:
+            v = normalize_text(row.get(c, ""))
+            if v == "":
+                return None
+            parent.append(v)
+        return tuple(parent)
+    except Exception:
+        return None
+
+
+def order_decision_tree(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Order decision tree DataFrame so that:
+      - All Node 1 branches appear first, grouped together
+      - Children follow directly after their parents
+      - Ordering cascades through Node 2 → Node 3 → Node 4 → Node 5
+    Falls back gracefully if structure is incomplete.
+    
+    Args:
+        df: DataFrame to order
+        
+    Returns:
+        Ordered DataFrame with logical tree structure
+        
+    Failure modes:
+        - Returns original DataFrame for non-DataFrame inputs
+        - Returns original DataFrame if required columns missing
+        - Returns original DataFrame if ordering fails
+    """
+    try:
+        # Defensive: return df if invalid
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+
+        # Defensive: check for required node columns
+        node_cols = [c for c in LEVEL_COLS if c in df.columns]
+        if not node_cols:
+            return df
+
+        # Build an ordered list of indices
+        ordered_indices = []
+        visited = set()
+
+        def add_branch(parent_path, depth=1):
+            """
+            Recursively add parent + children in order
+            """
+            nonlocal ordered_indices
+            parent_col = LEVEL_COLS[depth - 1]  # Use LEVEL_COLS instead of hardcoded names
+            if parent_col not in df.columns:
+                return
+
+            # Filter rows where this node matches parent_path
+            mask = df[parent_col] == parent_path if parent_path else df[parent_col].notna()
+            rows = df[mask]
+
+            for idx, row in rows.iterrows():
+                if idx not in visited:
+                    ordered_indices.append(idx)
+                    visited.add(idx)
+
+                    # Recurse into next depth
+                    if depth < MAX_LEVELS:
+                        next_col = LEVEL_COLS[depth] if depth < len(LEVEL_COLS) else None
+                        if next_col and next_col in df.columns:
+                            next_val = row.get(next_col, None)
+                            if pd.notna(next_val) and normalize_text(next_val):
+                                add_branch(next_val, depth + 1)
+
+        # Start with Node 1 roots
+        if LEVEL_COLS[0] in df.columns:
+            roots = df[LEVEL_COLS[0]].dropna().unique()
+            for root in roots:
+                if normalize_text(root):
+                    add_branch(root, 1)
+
+        # Add any remaining unvisited rows
+        for idx in df.index:
+            if idx not in visited:
+                ordered_indices.append(idx)
+
+        # Reindex DataFrame
+        if ordered_indices:
+            return df.loc[ordered_indices].reset_index(drop=True)
+        else:
+            return df
+            
+    except Exception:
+        return df
 
 
 def friendly_parent_label(level: int, parent_tuple: Tuple[str, ...]) -> str:

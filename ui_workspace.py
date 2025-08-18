@@ -15,6 +15,7 @@ from utils import (
     normalize_text, validate_headers,
     compute_parent_depth_score, compute_row_path_score,
     friendly_parent_label, level_key_tuple, enforce_k_five,
+    order_decision_tree,
 )
 
 # --- Google Sheets helpers (using app.sheets module) ---
@@ -120,11 +121,20 @@ def render():
             st.metric("Rows with full path", f"{ok_r}/{total_r}")
             st.progress(0 if total_r==0 else ok_r/total_r)
 
-        total_rows = len(df_ws)
+        # Apply branch ordering for logical display
+        try:
+            df_ws_ordered = order_decision_tree(df_ws)
+            if not df_ws_ordered.equals(df_ws):
+                st.info("📊 Data displayed in logical tree order (parents followed by children)")
+        except Exception as e:
+            st.warning(f"⚠️ Could not apply tree ordering: {e}")
+            df_ws_ordered = df_ws
+        
+        total_rows = len(df_ws_ordered)
         st.markdown("#### Preview (50 rows)")
         if total_rows <= 50:
             st.caption(f"Showing all {total_rows} rows.")
-            st.dataframe(df_ws, use_container_width=True)
+            st.dataframe(df_ws_ordered, use_container_width=True)
         else:
             state_key = f"preview_start_{sheet_ws}"
             start_idx = int(st.session_state.get(state_key, 0))
@@ -149,7 +159,7 @@ def render():
             st.session_state[state_key] = start_idx
             end_idx = min(start_idx + 50, total_rows)
             st.caption(f"Showing rows **{start_idx+1}–{end_idx}** of **{total_rows}**.")
-            st.dataframe(df_ws.iloc[start_idx:end_idx], use_container_width=True)
+            st.dataframe(df_ws_ordered.iloc[start_idx:end_idx], use_container_width=True)
 
     st.markdown("---")
 

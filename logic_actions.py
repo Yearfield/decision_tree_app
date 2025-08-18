@@ -27,21 +27,35 @@ def filter_actions_data(df: pd.DataFrame) -> pd.DataFrame:
         
     Returns:
         DataFrame filtered for actions view
+        
+    Failure modes:
+        - Returns empty DataFrame for non-DataFrame inputs
+        - Returns empty DataFrame for empty DataFrames
+        - Returns empty DataFrame if required columns missing
+        - Returns empty DataFrame if processing fails
     """
-    if df is None or df.empty:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        
+        if not validate_headers(df):
+            return pd.DataFrame()
+        
+        # Select relevant columns
+        actions_columns = ["Vital Measurement"] + LEVEL_COLS + ["Actions"]
+        # Check if required columns exist
+        missing_cols = [col for col in actions_columns if col not in df.columns]
+        if missing_cols:
+            return pd.DataFrame()
+        
+        actions_df = df[actions_columns].copy()
+        
+        # Filter out completely empty rows
+        actions_df = actions_df.dropna(subset=["Vital Measurement"] + LEVEL_COLS, how="all")
+        
+        return actions_df
+    except Exception:
         return pd.DataFrame()
-    
-    if not validate_headers(df):
-        return pd.DataFrame()
-    
-    # Select relevant columns
-    actions_columns = ["Vital Measurement"] + LEVEL_COLS + ["Actions"]
-    actions_df = df[actions_columns].copy()
-    
-    # Filter out completely empty rows
-    actions_df = actions_df.dropna(subset=["Vital Measurement"] + LEVEL_COLS, how="all")
-    
-    return actions_df
 
 
 def compute_actions_metrics(df: pd.DataFrame) -> Dict[str, Any]:
@@ -53,8 +67,66 @@ def compute_actions_metrics(df: pd.DataFrame) -> Dict[str, Any]:
         
     Returns:
         Dictionary containing actions metrics
+        
+    Failure modes:
+        - Returns empty metrics structure for non-DataFrame inputs
+        - Returns empty metrics structure for empty DataFrames
+        - Returns empty metrics structure if required columns missing
+        - Returns empty metrics structure if processing fails
     """
-    if df is None or df.empty:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {
+                "total_rows": 0,
+                "actions_rows": 0,
+                "coverage_pct": 0.0,
+                "remaining": 0,
+                "action_types": {},
+                "action_categories": {},
+                "missing_actions": []
+            }
+        
+        # Check if Actions column exists
+        if "Actions" not in df.columns:
+            return {
+                "total_rows": len(df),
+                "actions_rows": 0,
+                "coverage_pct": 0.0,
+                "remaining": len(df),
+                "action_types": {},
+                "action_categories": {},
+                "missing_actions": []
+            }
+        
+        total_rows = len(df)
+        
+        # Count rows with actions
+        actions_mask = df["Actions"].notna() & (df["Actions"].astype(str).str.strip() != "")
+        actions_rows = actions_mask.sum()
+        
+        # Calculate coverage
+        coverage_pct = (actions_rows / total_rows * 100) if total_rows > 0 else 0
+        remaining = total_rows - actions_rows
+        
+        # Analyze action types
+        action_types = _analyze_action_types(df)
+        
+        # Analyze action categories
+        action_categories = _analyze_action_categories(df)
+        
+        # Find rows missing actions
+        missing_actions = _find_missing_actions(df)
+        
+        return {
+            "total_rows": total_rows,
+            "actions_rows": actions_rows,
+            "coverage_pct": coverage_pct,
+            "remaining": remaining,
+            "action_types": action_types,
+            "action_categories": action_categories,
+            "missing_actions": missing_actions
+        }
+    except Exception:
         return {
             "total_rows": 0,
             "actions_rows": 0,
@@ -64,35 +136,6 @@ def compute_actions_metrics(df: pd.DataFrame) -> Dict[str, Any]:
             "action_categories": {},
             "missing_actions": []
         }
-    
-    total_rows = len(df)
-    
-    # Count rows with actions
-    actions_mask = df["Actions"].notna() & (df["Actions"].astype(str).str.strip() != "")
-    actions_rows = actions_mask.sum()
-    
-    # Calculate coverage
-    coverage_pct = (actions_rows / total_rows * 100) if total_rows > 0 else 0
-    remaining = total_rows - actions_rows
-    
-    # Analyze action types
-    action_types = _analyze_action_types(df)
-    
-    # Analyze action categories
-    action_categories = _analyze_action_categories(df)
-    
-    # Find rows missing actions
-    missing_actions = _find_missing_actions(df)
-    
-    return {
-        "total_rows": total_rows,
-        "actions_rows": actions_rows,
-        "coverage_pct": coverage_pct,
-        "remaining": remaining,
-        "action_types": action_types,
-        "action_categories": action_categories,
-        "missing_actions": missing_actions
-    }
 
 
 def validate_actions_data(df: pd.DataFrame) -> Tuple[bool, List[str]]:

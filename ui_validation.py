@@ -8,7 +8,7 @@ import streamlit as st
 from utils import (
     CANON_HEADERS, LEVEL_COLS, MAX_LEVELS,
     normalize_text, validate_headers, friendly_parent_label,
-    level_key_tuple,
+    level_key_tuple, order_decision_tree,
 )
 
 # Import validation logic functions

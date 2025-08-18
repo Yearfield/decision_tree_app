@@ -27,21 +27,35 @@ def filter_triage_data(df: pd.DataFrame) -> pd.DataFrame:
         
     Returns:
         DataFrame filtered for triage view
+        
+    Failure modes:
+        - Returns empty DataFrame for non-DataFrame inputs
+        - Returns empty DataFrame for empty DataFrames
+        - Returns empty DataFrame if required columns missing
+        - Returns empty DataFrame if processing fails
     """
-    if df is None or df.empty:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        
+        if not validate_headers(df):
+            return pd.DataFrame()
+        
+        # Select relevant columns
+        triage_columns = ["Vital Measurement"] + LEVEL_COLS + ["Diagnostic Triage"]
+        # Check if required columns exist
+        missing_cols = [col for col in triage_columns if col not in df.columns]
+        if missing_cols:
+            return pd.DataFrame()
+        
+        triage_df = df[triage_columns].copy()
+        
+        # Filter out completely empty rows
+        triage_df = triage_df.dropna(subset=["Vital Measurement"] + LEVEL_COLS, how="all")
+        
+        return triage_df
+    except Exception:
         return pd.DataFrame()
-    
-    if not validate_headers(df):
-        return pd.DataFrame()
-    
-    # Select relevant columns
-    triage_columns = ["Vital Measurement"] + LEVEL_COLS + ["Diagnostic Triage"]
-    triage_df = df[triage_columns].copy()
-    
-    # Filter out completely empty rows
-    triage_df = triage_df.dropna(subset=["Vital Measurement"] + LEVEL_COLS, how="all")
-    
-    return triage_df
 
 
 def compute_triage_metrics(df: pd.DataFrame) -> Dict[str, Any]:
@@ -53,8 +67,60 @@ def compute_triage_metrics(df: pd.DataFrame) -> Dict[str, Any]:
         
     Returns:
         Dictionary containing triage metrics
+        
+    Failure modes:
+        - Returns empty metrics structure for non-DataFrame inputs
+        - Returns empty metrics structure for empty DataFrames
+        - Returns empty metrics structure if required columns missing
+        - Returns empty metrics structure if processing fails
     """
-    if df is None or df.empty:
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {
+                "total_rows": 0,
+                "triaged_rows": 0,
+                "coverage_pct": 0.0,
+                "remaining": 0,
+                "priority_breakdown": {},
+                "urgency_levels": {}
+            }
+        
+        # Check if Diagnostic Triage column exists
+        if "Diagnostic Triage" not in df.columns:
+            return {
+                "total_rows": len(df),
+                "triaged_rows": 0,
+                "coverage_pct": 0.0,
+                "remaining": len(df),
+                "priority_breakdown": {},
+                "urgency_levels": {}
+            }
+        
+        total_rows = len(df)
+        
+        # Count triaged rows
+        triaged_mask = df["Diagnostic Triage"].notna() & (df["Diagnostic Triage"].astype(str).str.strip() != "")
+        triaged_rows = triaged_mask.sum()
+        
+        # Calculate coverage
+        coverage_pct = (triaged_rows / total_rows * 100) if total_rows > 0 else 0
+        remaining = total_rows - triaged_rows
+        
+        # Analyze priority breakdown
+        priority_breakdown = _analyze_triage_priorities(df)
+        
+        # Analyze urgency levels
+        urgency_levels = _analyze_urgency_levels(df)
+        
+        return {
+            "total_rows": total_rows,
+            "triaged_rows": triaged_rows,
+            "coverage_pct": coverage_pct,
+            "remaining": remaining,
+            "priority_breakdown": priority_breakdown,
+            "urgency_levels": urgency_levels
+        }
+    except Exception:
         return {
             "total_rows": 0,
             "triaged_rows": 0,
@@ -63,31 +129,6 @@ def compute_triage_metrics(df: pd.DataFrame) -> Dict[str, Any]:
             "priority_breakdown": {},
             "urgency_levels": {}
         }
-    
-    total_rows = len(df)
-    
-    # Count triaged rows
-    triaged_mask = df["Diagnostic Triage"].notna() & (df["Diagnostic Triage"].astype(str).str.strip() != "")
-    triaged_rows = triaged_mask.sum()
-    
-    # Calculate coverage
-    coverage_pct = (triaged_rows / total_rows * 100) if total_rows > 0 else 0
-    remaining = total_rows - triaged_rows
-    
-    # Analyze priority breakdown
-    priority_breakdown = _analyze_triage_priorities(df)
-    
-    # Analyze urgency levels
-    urgency_levels = _analyze_urgency_levels(df)
-    
-    return {
-        "total_rows": total_rows,
-        "triaged_rows": triaged_rows,
-        "coverage_pct": coverage_pct,
-        "remaining": remaining,
-        "priority_breakdown": priority_breakdown,
-        "urgency_levels": urgency_levels
-    }
 
 
 def validate_triage_data(df: pd.DataFrame) -> Tuple[bool, List[str]]:
