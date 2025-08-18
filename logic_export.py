@@ -46,32 +46,7 @@ def validate_headers(df: pd.DataFrame) -> bool:
     return list(df.columns[: len(CANON_HEADERS)]) == CANON_HEADERS
 
 
-def _require_streamlit_secrets() -> dict:
-    """Fetch service account info from Streamlit secrets or raise a clear error."""
-    if st is None:
-        raise RuntimeError("Streamlit is required for Google Sheets functions.")
-    if "gcp_service_account" not in st.secrets:
-        raise RuntimeError(
-            "Google Sheets not configured. Add your service account JSON under [gcp_service_account] in secrets."
-        )
-    return st.secrets["gcp_service_account"]
 
-
-def _get_gsheet_client():
-    """Authorize and return a gspread client using Streamlit secrets."""
-    sa_info = _require_streamlit_secrets()
-
-    # Lazy imports to avoid hard dependency when not needed
-    import gspread  # type: ignore
-    from google.oauth2.service_account import Credentials  # type: ignore
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-    client = gspread.authorize(creds)
-    return client
 
 
 # ===== Google Sheets: read / write / backup =====
@@ -81,33 +56,27 @@ def read_google_sheet(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
     - Fills missing canonical columns
     - Drops rows where all Node columns and VM are blank
     """
-    client = _get_gsheet_client()
-    sh = client.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(sheet_name)
-    values = ws.get_all_values()
-    if not values:
+    try:
+        from app.sheets import get_gspread_client_from_secrets, open_spreadsheet, read_worksheet_with_canonical_headers
+        
+        # Get client and open spreadsheet
+        client = get_gspread_client_from_secrets(st.secrets["gcp_service_account"])
+        spreadsheet = open_spreadsheet(client, spreadsheet_id)
+        
+        # Read with canonical headers
+        df = read_worksheet_with_canonical_headers(spreadsheet, sheet_name, CANON_HEADERS)
+        
+        # Drop fully blank node paths (VM + Node1..5 empty)
+        node_block = ["Vital Measurement"] + LEVEL_COLS
+        mask_blank = df[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)
+        df = df[~mask_blank].copy()
+        
+        return df
+        
+    except Exception as e:
+        if st:
+            st.error(f"Error reading Google Sheet: {e}")
         return pd.DataFrame(columns=CANON_HEADERS)
-
-    header = [normalize_text(c) for c in values[0]]
-    rows = values[1:]
-
-    df = pd.DataFrame(rows, columns=header)
-    # Ensure canonical headers exist
-    for c in CANON_HEADERS:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[CANON_HEADERS]
-
-    # Normalize text cells
-    for c in CANON_HEADERS:
-        df[c] = df[c].map(normalize_text)
-
-    # Drop fully blank node paths (VM + Node1..5 empty)
-    node_block = ["Vital Measurement"] + LEVEL_COLS
-    mask_blank = df[node_block].apply(lambda r: all(normalize_text(v) == "" for v in r), axis=1)
-    df = df[~mask_blank].copy()
-
-    return df
 
 
 def push_to_google_sheets(
@@ -124,24 +93,18 @@ def push_to_google_sheets(
     - Writes headers + all rows
     """
     try:
-        client = _get_gsheet_client()
-        sh = client.open_by_key(spreadsheet_id)
-
+        from app.sheets import get_gspread_client_from_secrets, open_spreadsheet, write_dataframe
+        
+        # Get client and open spreadsheet
+        client = get_gspread_client_from_secrets(st.secrets["gcp_service_account"])
+        spreadsheet = open_spreadsheet(client, spreadsheet_id)
+        
+        # Prepare DataFrame for writing
         df = df.fillna("")
-        headers = list(df.columns)
-        values = [headers] + df.astype(str).values.tolist()
-
-        n_rows = max(len(values), min_rows)
-        n_cols = max(len(headers), min_cols)
-
-        try:
-            ws = sh.worksheet(sheet_name)
-            ws.clear()
-            ws.resize(rows=n_rows, cols=n_cols)
-        except Exception:
-            ws = sh.add_worksheet(title=sheet_name, rows=n_rows, cols=n_cols)
-
-        ws.update("A1", values, value_input_option="RAW")
+        
+        # Write data using the new helper
+        write_dataframe(spreadsheet, sheet_name, df, mode="overwrite")
+        
         return True
 
     except Exception as e:
@@ -156,25 +119,14 @@ def backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
     Returns the created backup sheet name, or None on failure.
     """
     try:
-        client = _get_gsheet_client()
-        sh = client.open_by_key(spreadsheet_id)
-
-        try:
-            ws = sh.worksheet(source_sheet)
-        except Exception:
-            return None
-
-        values = ws.get_all_values()
-        ts = datetime.now().strftime("%Y-%m-%d %H%M")
-        backup_title_full = f"{source_sheet} (backup {ts})"
-        backup_title = backup_title_full[:99]
-
-        rows = max(len(values), 100)
-        cols = max(len(values[0]) if values else 8, 8)
-
-        ws_bak = sh.add_worksheet(title=backup_title, rows=rows, cols=cols)
-        if values:
-            ws_bak.update("A1", values, value_input_option="RAW")
+        from app.sheets import get_gspread_client_from_secrets, open_spreadsheet, backup_worksheet
+        
+        # Get client and open spreadsheet
+        client = get_gspread_client_from_secrets(st.secrets["gcp_service_account"])
+        spreadsheet = open_spreadsheet(client, spreadsheet_id)
+        
+        # Create backup using the new helper
+        backup_title = backup_worksheet(spreadsheet, source_sheet)
         return backup_title
 
     except Exception as e:

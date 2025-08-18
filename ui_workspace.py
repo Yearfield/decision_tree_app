@@ -7,7 +7,6 @@ from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
 import pandas as pd
 import streamlit as st
-from datetime import datetime
 
 from utils import (
     CANON_HEADERS, LEVEL_COLS, MAX_LEVELS,
@@ -16,35 +15,22 @@ from utils import (
     friendly_parent_label, level_key_tuple, enforce_k_five,
 )
 
-# --- Google Sheets helpers (kept local for now; consider moving to logic_export) ---
+# --- Google Sheets helpers (using app.sheets module) ---
 def _push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFrame) -> bool:
+    """Push DataFrame to Google Sheets using app.sheets module."""
     try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-        if "gcp_service_account" not in st.secrets:
-            st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
-            return False
-
-        sa_info = st.secrets["gcp_service_account"]
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-        client = gspread.authorize(creds)
-        sh = client.open_by_key(spreadsheet_id)
-
+        from app.sheets import get_gspread_client_from_secrets, open_spreadsheet, write_dataframe
+        
+        # Get client and open spreadsheet
+        client = get_gspread_client_from_secrets(st.secrets["gcp_service_account"])
+        spreadsheet = open_spreadsheet(client, spreadsheet_id)
+        
+        # Prepare DataFrame for writing
         df = df.fillna("")
-        headers = list(df.columns)
-        values = [headers] + df.astype(str).values.tolist()
-        n_rows = len(values)
-        n_cols = max(1, len(headers))
-
-        try:
-            ws = sh.worksheet(sheet_name)
-            ws.clear()
-            ws.resize(rows=max(n_rows, 200), cols=max(n_cols, 8))
-        except Exception:
-            ws = sh.add_worksheet(title=sheet_name, rows=max(n_rows, 200), cols=max(n_cols, 8))
-
-        ws.update('A1', values, value_input_option="RAW")
+        
+        # Write data using the new helper
+        write_dataframe(spreadsheet, sheet_name, df, mode="overwrite")
+        
         return True
 
     except Exception as e:
@@ -53,30 +39,18 @@ def _push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFram
 
 
 def _backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
+    """Create backup of Google Sheet using app.sheets module."""
     try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-        if "gcp_service_account" not in st.secrets:
-            return None
-        sa_info = st.secrets["gcp_service_account"]
-        scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-        client = gspread.authorize(creds)
-        sh = client.open_by_key(spreadsheet_id)
-        try:
-            ws = sh.worksheet(source_sheet)
-        except Exception:
-            return None
-        values = ws.get_all_values()
-        ts = datetime.now().strftime("%Y-%m-%d %H%M")
-        backup_title_full = f"{source_sheet} (backup {ts})"
-        backup_title = backup_title_full[:99]
-        rows = max(len(values), 100)
-        cols = max(len(values[0]) if values else 8, 8)
-        ws_bak = sh.add_worksheet(title=backup_title, rows=rows, cols=cols)
-        if values:
-            ws_bak.update('A1', values, value_input_option="RAW")
+        from app.sheets import get_gspread_client_from_secrets, open_spreadsheet, backup_worksheet
+        
+        # Get client and open spreadsheet
+        client = get_gspread_client_from_secrets(st.secrets["gcp_service_account"])
+        spreadsheet = open_spreadsheet(client, spreadsheet_id)
+        
+        # Create backup using the new helper
+        backup_title = backup_worksheet(spreadsheet, source_sheet)
         return backup_title
+        
     except Exception as e:
         st.error(f"Backup failed: {e}")
         return None
