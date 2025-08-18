@@ -1,12 +1,13 @@
 # streamlit_app_upload.py
 # Decision Tree Builder — Unified Monolith
-# Version: v6.3.4
+# Version: v6.3.5
 
 from __future__ import annotations
 
 import io
 import json
 import uuid
+import difflib
 from typing import Dict, List, Tuple, Optional, Set
 
 import numpy as np
@@ -25,7 +26,7 @@ except Exception:
 # ==============================
 # VERSION / CONFIG
 # ==============================
-APP_VERSION = "v6.3.4"
+APP_VERSION = "v6.3.5"
 CANON_HEADERS = [
     "Vital Measurement", "Node 1", "Node 2", "Node 3", "Node 4", "Node 5",
     "Diagnostic Triage", "Actions"
@@ -287,7 +288,7 @@ def detect_orphans(
         parent_tuple = tuple([] if path == "<ROOT>" else path.split(">"))
         next_level = L + 1
 
-        for c in [normalize_text(x) for x in children if normalize_text(x) != ""]:
+        for c in [normalize_text(x) for x in children if normalize_text(x) != ""] :
             if strict:
                 k_exact = level_key_tuple(next_level, parent_tuple + (c,))
                 if k_exact not in store:
@@ -523,7 +524,68 @@ def order_rows_for_push(
 
 
 # ==============================
-# Materialization (make overrides become rows) — v6.3.4
+# Auto Dictionary Sync helpers (v6.3.5)
+# ==============================
+def build_global_vocabulary() -> List[str]:
+    """Gather all unique labels across all loaded workbooks (upload + gs)."""
+    vocab = set()
+    for wb in [ss_get("upload_workbook", {}), ss_get("gs_workbook", {})]:
+        for _, df in (wb or {}).items():
+            if df is None or df.empty or not validate_headers(df):
+                continue
+            for col in LEVEL_COLS:
+                vocab.update({normalize_text(x) for x in df[col].astype(str).tolist() if normalize_text(x)})
+    return sorted(vocab)
+
+def make_canonical_map(vocab: List[str]) -> Dict[str, str]:
+    """
+    Map normalized forms to a canonical casing/spelling that already exists in your data.
+    If duplicates differ only by case/spacing, this picks the longest representative (more likely 'Abdominal Pain').
+    """
+    canon: Dict[str, str] = {}
+    by_norm: Dict[str, List[str]] = {}
+    for v in vocab:
+        n = normalize_text(v).lower()
+        by_norm.setdefault(n, []).append(v)
+    for n, forms in by_norm.items():
+        # pick longest (heuristic), but keep original spacing/case of that representative
+        best = max(forms, key=len)
+        canon[n] = best
+    return canon
+
+def canonicalize_labels(labels: List[str], canon_map: Dict[str,str], enable_fuzzy: bool = True) -> Tuple[List[str], List[Tuple[str,str]]]:
+    """
+    For each label, if its normalized form exists in canon_map, replace with canonical spelling.
+    Optionally fuzzy-match near misses using difflib at a conservative cutoff.
+    Returns (new_labels, replacements) where replacements is list of (old, new).
+    """
+    out: List[str] = []
+    repl: List[Tuple[str,str]] = []
+    keys = list(canon_map.keys())
+    for lab in labels:
+        raw = normalize_text(lab)
+        key = raw.lower()
+        if key in canon_map:
+            canon = canon_map[key]
+            if canon != lab:
+                repl.append((lab, canon))
+            out.append(canon)
+        elif enable_fuzzy and raw:
+            # fuzzy to nearest known label
+            close = difflib.get_close_matches(key, keys, n=1, cutoff=0.93)
+            if close:
+                canon = canon_map[close[0]]
+                repl.append((lab, canon))
+                out.append(canon)
+            else:
+                out.append(lab)
+        else:
+            out.append(lab)
+    return out, repl
+
+
+# ==============================
+# Materialization (make overrides become rows) — v6.3.5
 #   - Fills blank child rows first (if deeper blank), then adds missing
 #   - Optionally enforces exactly 5 rows (prunes extras if deeper blank)
 #   - Bugfix: always select a single column as Series (no ndim assert)
@@ -593,7 +655,7 @@ def materialize_overrides(
             ov_children[(L, parent_tuple)] = kids
 
     def _row_deeper_blank(row: pd.Series, L: int) -> bool:
-        for col in LEVEL_COLS[L:]:  # L is 1-based level, LEVEL_COLS indexed 0..4
+        for col in LEVEL_COLS[L:]:  # L is 1-based level
             if normalize_text(row.get(col, "")):
                 return False
         return True
@@ -626,9 +688,7 @@ def materialize_overrides(
                     if not blank_idxs:
                         break
                     idx = blank_idxs.pop(0)
-                    # Fill the blank child
                     scope.loc[idx, col] = child
-                    # track filled (after state)
                     filled_rows.append(scope.loc[idx, CANON_HEADERS].to_dict())
                     missing.remove(child)
                     existing_children.add(child)
@@ -642,16 +702,7 @@ def materialize_overrides(
                 new_row[col] = child
                 added_rows.append(new_row)
 
-            # Apply additions to scope at the end of this parent
-            # (we'll concat for this VM after processing all parents)
-            # For enforce step we need a fresh sub including newly filled values
-            # Build fresh sub AFTER we add new rows to df2/scope at VM level (we'll add new rows after loop over parents)
-            if enforce_exactly_five or prune:
-                # We'll postpone exact pruning until after we append 'added_rows' to scope;
-                # but to reason, we can still compute and mark candidates now using current 'scope' subset.
-                pass
-
-            # ENFORCE EXACTLY 5 (and/or PRUNE extras) within the current scope
+            # ENFORCE EXACTLY 5 (and/or PRUNE extras)
             if enforce_exactly_five or prune:
                 # refresh sub (still on current scope before additions)
                 sub = scope.loc[mask_parent].copy()
@@ -1233,7 +1284,7 @@ with tabs[1]:
 
 
 # ==============================
-# Tab: Symptoms (inline editor + APPLY OVERRIDES)
+# Tab: Symptoms (inline editor + APPLY OVERRIDES + Auto Dictionary Sync)
 # ==============================
 with tabs[2]:
     st.header("🧬 Symptoms — inline edit of child sets")
@@ -1292,7 +1343,12 @@ with tabs[2]:
                 parents_by_level = compute_virtual_parents(store)
                 level = st.selectbox("Level to inspect (child options of...)", [1,2,3,4,5], format_func=lambda x: f"Node {x}", key="sym_level")
 
-                # Vocabulary from sheet (all node labels)
+                # Vocabulary from global data (for Auto Dictionary Sync)
+                global_vocab = build_global_vocabulary()
+                canon_map = make_canonical_map(global_vocab)
+                auto_sync = st.checkbox("Auto Dictionary Sync (normalize labels to canonical)", value=True, key="sym_auto_dict_sync")
+
+                # Vocabulary for suggestions
                 def build_vocabulary(df0: pd.DataFrame) -> List[str]:
                     vocab = set()
                     for col in LEVEL_COLS:
@@ -1319,7 +1375,6 @@ with tabs[2]:
 
                 # Build entries
                 entries = []
-                label_childsets: Dict[Tuple[int,str], set] = {}
                 for parent_tuple in sorted(parents_by_level.get(level, set())):
                     parent_text = " > ".join(parent_tuple)
                     if search and (search not in parent_text.lower()):
@@ -1332,8 +1387,6 @@ with tabs[2]:
                     elif n == 5: status = "OK"
                     else: status = "Overspecified"
                     entries.append((parent_tuple, children, status))
-                    last_label = parent_tuple[-1] if parent_tuple else "<ROOT>"
-                    label_childsets.setdefault((level, last_label), set()).add(tuple(sorted([c for c in children])))
 
                 status_rank = {"No group of symptoms":0, "Symptom left out":1, "Overspecified":2, "OK":3}
                 if sort_mode.startswith("Problem"):
@@ -1383,12 +1436,20 @@ with tabs[2]:
                                         uniq.append(v); seen.add(v)
                                 vals = uniq + [""] * max(0, 5 - len(uniq))
                                 if fill_other: vals = [v if v else "Other" for v in vals]
+                            vals = enforce_k_five(vals)
+                            if auto_sync:
+                                canon_vals, replacements = canonicalize_labels(vals, canon_map, enable_fuzzy=True)
+                                if replacements:
+                                    st.info("Auto Dictionary Sync applied: " + "; ".join([f"“{a}”→“{b}”" for a,b in replacements]))
+                                vals = canon_vals
                             return enforce_k_five(vals)
 
-                        if st.button("Save 5 branches for this parent", key=f"sym_save_{level}_{'__'.join(parent_tuple)}"):
+                        if st.button("💾 Save & materialize (enforce 5)", key=f"sym_save_{level}_{'__'.join(parent_tuple)}"):
                             fixed = build_final_values()
                             overrides_all = ss_get("branch_overrides", {})
                             overrides_sheet = overrides_all.get(sheet, {}).copy()
+
+                            # Undo snapshot (dataframe before)
                             stack = ss_get("undo_stack", [])
                             stack.append({
                                 "context": "symptoms",
@@ -1399,20 +1460,29 @@ with tabs[2]:
                                 "df_before": df.copy()
                             })
                             ss_set("undo_stack", stack)
+
                             overrides_sheet[keyname] = fixed
                             overrides_all[sheet] = overrides_sheet
                             ss_set("branch_overrides", overrides_all)
                             mark_session_edit(sheet, keyname)
 
-                            wb[sheet] = sort_sheet_for_view(df, ss_get("symptom_quality", {}))
+                            # MATERIALIZE immediately with safe enforce-5 logic
+                            df_new, rep = materialize_overrides(
+                                df, overrides_sheet,
+                                prune=True, enforce_exactly_five=True, prune_only_if_deeper_blank=True
+                            )
+                            wb[sheet] = sort_sheet_for_view(df_new, ss_get("symptom_quality", {}))
                             if where == "upload":
                                 ss_set("upload_workbook", wb)
                             else:
                                 ss_set("gs_workbook", wb)
                             autosave_now()
-                            st.success("Saved override. Use 'Apply overrides to data' below to create the missing rows if needed.")
+                            st.success(
+                                f"Saved + materialized. Filled: {len(rep['filled'])} · Added: {len(rep['added'])} · "
+                                f"Pruned: {len(rep['pruned'])} · Kept: {len(rep['kept_protected'])}"
+                            )
 
-            # Apply overrides to data
+            # Apply overrides to data (explicit button still available)
             st.markdown("---")
             st.subheader("Apply overrides to data (expand rows)")
             enforce5_apply = st.checkbox("Enforce exactly 5 rows (fill blanks then add; prune extras if safe)", value=True, key="sym_apply_enforce5")
@@ -1437,12 +1507,10 @@ with tabs[2]:
                     f"Pruned: {len(rep['pruned'])} · Kept (protected): {len(rep['kept_protected'])} · "
                     f"Total rows: {len(df_new)}"
                 )
-                if len(rep["filled"]) > 0:
-                    st.dataframe(rep["filled"].head(50), use_container_width=True)
 
             # Undo
             st.markdown("---")
-            if st.button("↩️ Undo last branch edit (session)"):
+            if st.button("↩️ Undo last Symptoms change (session)"):
                 stack = ss_get("undo_stack", [])
                 if not stack:
                     st.info("Nothing to undo.")
@@ -1461,7 +1529,7 @@ with tabs[2]:
                             else:
                                 ss_set("gs_workbook", wb2)
                         autosave_now()
-                        st.success(f"Undid overrides for sheet '{last['sheet']}'.")
+                        st.success(f"Undid last Symptoms materialization for '{last['sheet']}'.")
 
 
 # ==============================
@@ -1616,6 +1684,7 @@ with tabs[3]:
                     if st.button("💾 Save changes", key="dict_save_changes"):
                         view.loc[view.index[start:end], "RedFlag"] = edited["RedFlag"].values
                         new_quality = {}
+                        quality_map = ss_get("symptom_quality", {})
                         new_quality.update(quality_map)
                         dict_df_updates = dict_df.set_index("Symptom")
                         view_updates = view.set_index("Symptom")["RedFlag"]
@@ -1632,7 +1701,7 @@ with tabs[3]:
 
 
 # ==============================
-# Tab: Conflicts (inspector & resolver + APPLY + UNDO)
+# Tab: Conflicts (inspector & resolver + APPLY + UNDO + Preview Panel)
 # ==============================
 with tabs[4]:
     st.header("⚖️ Conflicts inspector")
@@ -1656,6 +1725,29 @@ with tabs[4]:
             overrides_sheet = overrides_all.get(sheet, {})
             store = infer_branch_options_with_overrides(df, overrides_sheet)
 
+            # === Preview Panel: parents violating 5 ===
+            st.subheader("Preview: Parents violating the 5-child rule")
+            bad_rows = []
+            for key, children in store.items():
+                if "|" not in key: 
+                    continue
+                lvl_s, path = key.split("|", 1)
+                try:
+                    L = int(lvl_s[1:])
+                except:
+                    continue
+                non_empty = [c for c in children if normalize_text(c)]
+                if len(non_empty) != 5:
+                    parent_tuple = tuple([] if path=="<ROOT>" else path.split(">"))
+                    bad_rows.append({"Level": L, "Parent": " > ".join(parent_tuple) if parent_tuple else "<ROOT>", "Children Count": len(non_empty), "Children": ", ".join(non_empty)})
+
+            if bad_rows:
+                df_bad = pd.DataFrame(bad_rows).sort_values(["Level","Parent"]).reset_index(drop=True)
+                st.dataframe(df_bad, use_container_width=True)
+            else:
+                st.success("All parents have exactly 5 children.")
+
+            st.markdown("---")
             # Build conflicts by (level, parent_label)
             label_childsets: Dict[Tuple[int,str], List[Tuple[str,...]]] = {}
             for key, children in store.items():
@@ -1692,6 +1784,7 @@ with tabs[4]:
                                     "context": "conflicts",
                                     "sheet": sheet,
                                     "overrides_sheet_before": overrides_all.get(sheet, {}).copy(),
+                                    "df_before": df.copy()
                                 })
                                 ss_set("undo_stack", stack)
 
@@ -1708,8 +1801,22 @@ with tabs[4]:
                                         new_overrides[level_key_tuple(L, ptuple)] = enforce_k_five(selected)
                                 overrides_all[sheet] = new_overrides
                                 ss_set("branch_overrides", overrides_all)
+
+                                # MATERIALIZE immediately after conflict resolution
+                                df_new, rep = materialize_overrides(
+                                    df, new_overrides,
+                                    prune=True, enforce_exactly_five=True, prune_only_if_deeper_blank=True
+                                )
+                                wb[sheet] = df_new
+                                if src == "upload":
+                                    ss_set("upload_workbook", wb)
+                                else:
+                                    ss_set("gs_workbook", wb)
                                 autosave_now()
-                                st.success("Resolved and saved for all matching parents.")
+                                st.success(
+                                    f"Resolved + materialized. Filled: {len(rep['filled'])} · Added: {len(rep['added'])} · "
+                                    f"Pruned: {len(rep['pruned'])} · Kept: {len(rep['kept_protected'])}."
+                                )
 
             st.markdown("---")
             # Apply overrides to data from Conflicts
@@ -1755,6 +1862,13 @@ with tabs[4]:
                         ov = ss_get("branch_overrides", {})
                         ov[sheet] = last.get("overrides_sheet_before", {})
                         ss_set("branch_overrides", ov)
+                        # restore prior df if we captured it
+                        if last.get("df_before") is not None:
+                            wb[sheet] = last["df_before"]
+                            if src == "upload":
+                                ss_set("upload_workbook", wb)
+                            else:
+                                ss_set("gs_workbook", wb)
                         autosave_now()
                         st.success("Conflict resolution undone.")
 
