@@ -1,6 +1,6 @@
 # streamlit_app_upload.py
 # Decision Tree Builder — Unified Monolith
-# Version: v6.3.3
+# Version: v6.3.4
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ except Exception:
 # ==============================
 # VERSION / CONFIG
 # ==============================
-APP_VERSION = "v6.3.3"
+APP_VERSION = "v6.3.4"
 CANON_HEADERS = [
     "Vital Measurement", "Node 1", "Node 2", "Node 3", "Node 4", "Node 5",
     "Diagnostic Triage", "Actions"
@@ -523,7 +523,10 @@ def order_rows_for_push(
 
 
 # ==============================
-# Materialization (make overrides become rows)
+# Materialization (make overrides become rows) — v6.3.4
+#   - Fills blank child rows first (if deeper blank), then adds missing
+#   - Optionally enforces exactly 5 rows (prunes extras if deeper blank)
+#   - Bugfix: always select a single column as Series (no ndim assert)
 # ==============================
 def _parse_override_key(k: str) -> Optional[Tuple[int, Tuple[str,...]]]:
     # "L2|A>B" -> (2, ("A","B"))
@@ -541,16 +544,21 @@ def materialize_overrides(
     df: pd.DataFrame,
     overrides: Dict[str, List[str]],
     prune: bool = False,
+    enforce_exactly_five: bool = True,
     prune_only_if_deeper_blank: bool = True
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     """
     For each override key "Lk|parent_tuple", ensure rows exist so that the parent's children (exactly 5) are present.
-    - Adds missing rows with VM scoped (per-VM).
-    - Optionally prunes rows whose child at Node k is not in chosen 5 (safe: only if deeper nodes are blank).
-    Returns (new_df, report) with report['added'], report['pruned'] dataframes.
+    Behavior:
+      1) Fill existing blank child rows first (only if deeper nodes are blank).
+      2) Add remaining missing children as new rows.
+      3) If enforce_exactly_five=True, prune extras (non-selected, blanks, duplicates) when deeper nodes are blank.
+         If deeper nodes are not blank, keep and report as kept_protected.
+    Returns (new_df, report) with report['added','pruned','filled','kept_protected'] dataframes.
     """
     if df is None or df.empty:
-        return df, {"added": pd.DataFrame(columns=CANON_HEADERS), "pruned": pd.DataFrame(columns=CANON_HEADERS)}
+        empty = pd.DataFrame(columns=CANON_HEADERS)
+        return df, {"added": empty, "pruned": empty, "filled": empty, "kept_protected": empty}
 
     df2 = df.copy()
     for c in CANON_HEADERS:
@@ -565,6 +573,8 @@ def materialize_overrides(
     vms = sorted(set(df2["Vital Measurement"].astype(str).map(normalize_text)))
     added_rows: List[Dict[str,str]] = []
     pruned_rows: List[pd.Series] = []
+    kept_protected_rows: List[pd.Series] = []
+    filled_rows: List[Dict[str,str]] = []
 
     # Pre-normalize overrides children per key
     ov_children: Dict[Tuple[int, Tuple[str,...]], List[str]] = {}
@@ -590,58 +600,124 @@ def materialize_overrides(
 
     # Process per VM
     for vm in vms:
-        scope = df2[df2["Vital Measurement"].astype(str).map(normalize_text) == vm].copy()
+        scope = df2[df2["Vital Measurement"].astype(str).map(normalize_text) == normalize_text(vm)].copy()
+
         for (L, parent_tuple), desired_children in ov_children.items():
-            # existing children in this VM under this parent
-            mask_parent = pd.Series([True] * len(scope))
+            col = LEVEL_COLS[L-1]  # BUGFIX: ensure a single column (Series), not list -> no ndim error
+
+            # mask rows matching parent path up to L-1
+            mask_parent = pd.Series(True, index=scope.index)
             for i in range(L-1):
-                col = LEVEL_COLS[i]
                 want = parent_tuple[i] if i < len(parent_tuple) else ""
-                mask_parent &= (scope[col].astype(str).map(normalize_text) == want)
-            for j in range(L-1, MAX_LEVELS):
-                # ensure parent levels beyond L-1 don't preclude matches (ok if blank or anything)
+                mask_parent &= (scope[LEVEL_COLS[i]].astype(str).map(normalize_text) == want)
+
+            sub = scope.loc[mask_parent].copy()
+
+            # Existing children (non-empty)
+            existing_children = set(sub[col].astype(str).map(normalize_text))
+            existing_children.discard("")
+
+            # 1) FILL BLANKS FIRST (only if deeper blank)
+            missing = [c for c in desired_children if c not in existing_children]
+            if missing:
+                blanks_mask = (sub[col].astype(str).map(normalize_text) == "") & sub.apply(lambda r: _row_deeper_blank(r, L), axis=1)
+                blank_idxs = list(sub[blanks_mask].index)
+                for child in list(missing):
+                    if not blank_idxs:
+                        break
+                    idx = blank_idxs.pop(0)
+                    # Fill the blank child
+                    scope.loc[idx, col] = child
+                    # track filled (after state)
+                    filled_rows.append(scope.loc[idx, CANON_HEADERS].to_dict())
+                    missing.remove(child)
+                    existing_children.add(child)
+
+            # 2) ADD REMAINING MISSING
+            for child in missing:
+                new_row = {cname: "" for cname in CANON_HEADERS}
+                new_row["Vital Measurement"] = vm
+                for i in range(L-1):
+                    new_row[LEVEL_COLS[i]] = parent_tuple[i] if i < len(parent_tuple) else ""
+                new_row[col] = child
+                added_rows.append(new_row)
+
+            # Apply additions to scope at the end of this parent
+            # (we'll concat for this VM after processing all parents)
+            # For enforce step we need a fresh sub including newly filled values
+            # Build fresh sub AFTER we add new rows to df2/scope at VM level (we'll add new rows after loop over parents)
+            if enforce_exactly_five or prune:
+                # We'll postpone exact pruning until after we append 'added_rows' to scope;
+                # but to reason, we can still compute and mark candidates now using current 'scope' subset.
                 pass
-            existing_children = set(scope.loc[mask_parent, LEVEL_COLS[L-1]].astype(str).map(normalize_text))
-            existing_children.discard("")  # ignore blanks
 
-            # Add missing children
-            for child in desired_children:
-                if child not in existing_children:
-                    new_row = {c: "" for c in CANON_HEADERS}
-                    new_row["Vital Measurement"] = vm
-                    for i in range(L-1):
-                        new_row[LEVEL_COLS[i]] = parent_tuple[i] if i < len(parent_tuple) else ""
-                    new_row[LEVEL_COLS[L-1]] = child
-                    added_rows.append(new_row)
+            # ENFORCE EXACTLY 5 (and/or PRUNE extras) within the current scope
+            if enforce_exactly_five or prune:
+                # refresh sub (still on current scope before additions)
+                sub = scope.loc[mask_parent].copy()
 
-            # Prune unwanted children (if enabled)
-            if prune:
-                unwanted = existing_children - set(desired_children)
-                if unwanted:
-                    mask_unwanted = mask_parent & scope[LEVEL_COLS[L-1]].astype(str).map(normalize_text).isin(unwanted)
-                    if prune_only_if_deeper_blank:
-                        mask_unwanted = mask_unwanted & scope.apply(lambda r: _row_deeper_blank(r, L), axis=1)
-                    rows_to_prune = scope[mask_unwanted]
-                    if not rows_to_prune.empty:
-                        pruned_rows.extend([r for _, r in rows_to_prune.iterrows()])
-                        # Drop from scope (and later from df2)
-                        scope = scope.drop(rows_to_prune.index, errors="ignore")
+                # (a) prune blanks under parent
+                blanks_mask = (sub[col].astype(str).map(normalize_text) == "")
+                if blanks_mask.any():
+                    for idx, row in sub[blanks_mask].iterrows():
+                        if _row_deeper_blank(row, L):
+                            pruned_rows.append(scope.loc[idx, CANON_HEADERS])
+                            scope = scope.drop(index=idx, errors="ignore")  # drop safe blank
+                        else:
+                            kept_protected_rows.append(scope.loc[idx, CANON_HEADERS])
 
-        # Replace this VM slice with pruned scope
+                # refresh after potential blank drops
+                sub = scope.loc[mask_parent].copy()
+
+                # (b) handle duplicates of desired children: keep one (prefer deeper content), prune others if safe
+                for child in desired_children:
+                    rows_idx = list(sub[sub[col].astype(str).map(normalize_text) == child].index)
+                    if len(rows_idx) > 1:
+                        # choose keeper: prefer row with deeper content
+                        keeper = None
+                        for idx in rows_idx:
+                            if not _row_deeper_blank(sub.loc[idx], L):
+                                keeper = idx; break
+                        if keeper is None:
+                            keeper = rows_idx[0]
+                        for idx in rows_idx:
+                            if idx == keeper:
+                                continue
+                            if _row_deeper_blank(sub.loc[idx], L):
+                                pruned_rows.append(scope.loc[idx, CANON_HEADERS])
+                                scope = scope.drop(index=idx, errors="ignore")
+                            else:
+                                kept_protected_rows.append(scope.loc[idx, CANON_HEADERS])
+
+                # refresh after duplicate handling
+                sub = scope.loc[mask_parent].copy()
+
+                # (c) rows whose child not in desired (non-selected)
+                non_selected_mask = ~sub[col].astype(str).map(normalize_text).isin(desired_children)
+                if non_selected_mask.any():
+                    for idx, row in sub[non_selected_mask].iterrows():
+                        if enforce_exactly_five or prune:
+                            if _row_deeper_blank(row, L):
+                                pruned_rows.append(scope.loc[idx, CANON_HEADERS])
+                                scope = scope.drop(index=idx, errors="ignore")
+                            else:
+                                kept_protected_rows.append(scope.loc[idx, CANON_HEADERS])
+
+        # Replace this VM slice back into df2 (without added rows yet)
         df2 = pd.concat([df2[df2["Vital Measurement"] != vm], scope], ignore_index=True)
 
-    # Append added rows
-    if added_rows:
-        df_add = pd.DataFrame(added_rows, columns=CANON_HEADERS)
+    # Append added rows (after all VMs processed)
+    df_add = pd.DataFrame(added_rows, columns=CANON_HEADERS) if added_rows else pd.DataFrame(columns=CANON_HEADERS)
+    if not df_add.empty:
         df2 = pd.concat([df2, df_add], ignore_index=True)
-    else:
-        df_add = pd.DataFrame(columns=CANON_HEADERS)
 
     # Drop exact duplicates on VM + Node1..5 (+ diag/actions to be safe)
     df2 = df2.drop_duplicates(subset=CANON_HEADERS).reset_index(drop=True)
 
     df_pruned = pd.DataFrame(pruned_rows, columns=CANON_HEADERS) if pruned_rows else pd.DataFrame(columns=CANON_HEADERS)
-    report = {"added": df_add, "pruned": df_pruned}
+    df_kept = pd.DataFrame(kept_protected_rows, columns=CANON_HEADERS) if kept_protected_rows else pd.DataFrame(columns=CANON_HEADERS)
+    df_filled = pd.DataFrame(filled_rows, columns=CANON_HEADERS) if filled_rows else pd.DataFrame(columns=CANON_HEADERS)
+    report = {"added": df_add, "pruned": df_pruned, "filled": df_filled, "kept_protected": df_kept}
     return df2, report
 
 
@@ -1012,9 +1088,9 @@ with tabs[1]:
             include_scope = st.radio("Include scope (for stats only)", ["All completed parents","Only parents edited this session"], horizontal=True, key="ws_push_scope_sel")
             push_backup = st.checkbox("Create a backup tab before overwrite", value=True, key="ws_push_backup_sel")
             rf_scope_push = st.radio("RF priority for push", ["Node 2 only", "Any node (Dictionary)"], horizontal=True, key="ws_push_rf_scope")
-            materialize_on_push = st.checkbox("Add missing rows from overrides (materialize 5-child sets)", value=True, key="ws_push_mat")
-            prune_on_push = st.checkbox("Prune non-selected children (only if deeper nodes are blank)", value=False, key="ws_push_prune")
-            show_diff = st.checkbox("Show diff preview (added / pruned rows)", value=True, key="ws_push_diff")
+            enforce5_on_push = st.checkbox("Enforce exactly 5 rows (fill blanks then add; prune extras if safe)", value=True, key="ws_push_enforce5")
+            prune_on_push = st.checkbox("Additionally prune non-selected rows (only if deeper nodes are blank)", value=False, key="ws_push_prune")
+            show_diff = st.checkbox("Show diff preview (added / filled / pruned / kept)", value=True, key="ws_push_diff")
             update_session_after_push = st.checkbox("Update in-session sheet with materialized result after push", value=True, key="ws_push_update_session")
             dry_run = st.checkbox("Dry-run (build but don't write to Sheets)", value=False, key="ws_push_dry_sel")
 
@@ -1026,23 +1102,38 @@ with tabs[1]:
                     overrides_all = ss_get("branch_overrides", {})
                     overrides_sheet = overrides_all.get(sheet_ws, {})
                     df_mat = df_ws.copy()
-                    rep = {"added": pd.DataFrame(columns=CANON_HEADERS), "pruned": pd.DataFrame(columns=CANON_HEADERS)}
-                    if materialize_on_push:
-                        df_mat, rep = materialize_overrides(df_ws, overrides_sheet, prune=prune_on_push, prune_only_if_deeper_blank=True)
-                    redflag_map = ss_get("symptom_quality", {}) if rf_scope_push != "None" else None
+                    rep = {"added": pd.DataFrame(columns=CANON_HEADERS), "pruned": pd.DataFrame(columns=CANON_HEADERS),
+                           "filled": pd.DataFrame(columns=CANON_HEADERS), "kept_protected": pd.DataFrame(columns=CANON_HEADERS)}
+                    df_mat, rep = materialize_overrides(
+                        df_ws, overrides_sheet,
+                        prune=prune_on_push or enforce5_on_push,
+                        enforce_exactly_five=enforce5_on_push,
+                        prune_only_if_deeper_blank=True
+                    )
+                    redflag_map = ss_get("symptom_quality", {})
                     rf_scope_val = "node2" if rf_scope_push == "Node 2 only" else "any"
                     df_view = order_rows_for_push(df_mat, redflag_map=redflag_map, rf_scope=rf_scope_val)
 
-                    st.success(f"Preview built. Added rows: {len(rep['added'])} · Pruned rows: {len(rep['pruned'])} · Final rows: {len(df_view)}")
+                    st.success(
+                        f"Preview built. "
+                        f"Filled: {len(rep['filled'])} · Added: {len(rep['added'])} · "
+                        f"Pruned: {len(rep['pruned'])} · Kept (protected): {len(rep['kept_protected'])} · "
+                        f"Final rows: {len(df_view)}"
+                    )
                     if show_diff:
+                        if len(rep["filled"]) > 0:
+                            st.markdown("**Filled rows (used existing blanks) — first 50:**")
+                            st.dataframe(rep["filled"].head(50), use_container_width=True)
                         if len(rep["added"]) > 0:
-                            st.markdown("**Added rows (first 50):**")
+                            st.markdown("**Added rows — first 50:**")
                             st.dataframe(rep["added"].head(50), use_container_width=True)
-                            st.download_button("Download added rows (CSV)", rep["added"].to_csv(index=False).encode("utf-8"), file_name="added_rows.csv", mime="text/csv")
                         if len(rep["pruned"]) > 0:
-                            st.markdown("**Pruned rows (first 50):**")
+                            st.markdown("**Pruned rows — first 50:**")
                             st.dataframe(rep["pruned"].head(50), use_container_width=True)
-                            st.download_button("Download pruned rows (CSV)", rep["pruned"].to_csv(index=False).encode("utf-8"), file_name="pruned_rows.csv", mime="text/csv")
+                        if len(rep["kept_protected"]) > 0:
+                            st.warning("Some extra rows could not be pruned because deeper nodes contain data.")
+                            st.dataframe(rep["kept_protected"].head(50), use_container_width=True)
+
                     st.markdown("**Final view (first 50):**")
                     st.dataframe(df_view.head(50), use_container_width=True)
                     buffer = io.BytesIO()
@@ -1062,25 +1153,37 @@ with tabs[1]:
                     overrides_all = ss_get("branch_overrides", {})
                     overrides_sheet = overrides_all.get(sheet_ws, {})
 
-                    df_to_push = df_ws.copy()
-                    rep = {"added": pd.DataFrame(columns=CANON_HEADERS), "pruned": pd.DataFrame(columns=CANON_HEADERS)}
-                    if materialize_on_push:
-                        df_to_push, rep = materialize_overrides(df_ws, overrides_sheet, prune=prune_on_push, prune_only_if_deeper_blank=True)
+                    df_to_push, rep = materialize_overrides(
+                        df_ws, overrides_sheet,
+                        prune=prune_on_push or enforce5_on_push,
+                        enforce_exactly_five=enforce5_on_push,
+                        prune_only_if_deeper_blank=True
+                    )
 
                     # Order for push
-                    redflag_map = ss_get("symptom_quality", {}) if rf_scope_push != "None" else None
+                    redflag_map = ss_get("symptom_quality", {})
                     rf_scope_val = "node2" if rf_scope_push == "Node 2 only" else "any"
                     view_df = order_rows_for_push(df_to_push, redflag_map=redflag_map, rf_scope=rf_scope_val)
 
                     if dry_run:
-                        st.success(f"Dry-run complete. Added rows: {len(rep['added'])} · Pruned rows: {len(rep['pruned'])}. No changes written.")
+                        st.success(
+                            f"Dry-run complete. Filled: {len(rep['filled'])} · Added: {len(rep['added'])} · "
+                            f"Pruned: {len(rep['pruned'])} · Kept (protected): {len(rep['kept_protected'])}. "
+                            f"No changes written."
+                        )
                         if show_diff:
+                            if len(rep["filled"]) > 0:
+                                st.markdown("**Filled rows (first 50):**")
+                                st.dataframe(rep["filled"].head(50), use_container_width=True)
                             if len(rep["added"]) > 0:
                                 st.markdown("**Added rows (first 50):**")
                                 st.dataframe(rep["added"].head(50), use_container_width=True)
                             if len(rep["pruned"]) > 0:
                                 st.markdown("**Pruned rows (first 50):**")
                                 st.dataframe(rep["pruned"].head(50), use_container_width=True)
+                            if len(rep["kept_protected"]) > 0:
+                                st.warning("Kept (protected) rows due to deeper content (first 50):")
+                                st.dataframe(rep["kept_protected"].head(50), use_container_width=True)
                         st.dataframe(view_df.head(50), use_container_width=True)
                         buffer = io.BytesIO()
                         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -1102,7 +1205,10 @@ with tabs[1]:
                                 "target_tab": target_tab,
                                 "spreadsheet_id": sid,
                                 "rows_written": len(view_df),
+                                "filled_rows": int(len(rep['filled'])),
                                 "new_rows_added": int(len(rep['added'])),
+                                "pruned_rows": int(len(rep['pruned'])),
+                                "kept_protected": int(len(rep['kept_protected'])),
                                 "scope": "session" if include_scope.endswith("session") else "all",
                             })
                             ss_set("push_log", log)
@@ -1119,7 +1225,11 @@ with tabs[1]:
                                     ss_set("gs_workbook", wb_ws)
 
                             autosave_now()
-                            st.success(f"Pushed {len(view_df)} rows to '{target_tab}'. Added: {len(rep['added'])}, Pruned: {len(rep['pruned'])}.")
+                            st.success(
+                                f"Pushed {len(view_df)} rows to '{target_tab}'. "
+                                f"Filled: {len(rep['filled'])}, Added: {len(rep['added'])}, "
+                                f"Pruned: {len(rep['pruned'])}, Kept (protected): {len(rep['kept_protected'])}."
+                            )
 
 
 # ==============================
@@ -1305,20 +1415,30 @@ with tabs[2]:
             # Apply overrides to data
             st.markdown("---")
             st.subheader("Apply overrides to data (expand rows)")
-            prune_apply = st.checkbox("Prune non-selected children (only if deeper nodes are blank)", value=False, key="sym_apply_prune")
+            enforce5_apply = st.checkbox("Enforce exactly 5 rows (fill blanks then add; prune extras if safe)", value=True, key="sym_apply_enforce5")
+            prune_apply = st.checkbox("Additionally prune non-selected rows (only if deeper nodes are blank)", value=False, key="sym_apply_prune")
             if st.button("↳ Apply now for this sheet"):
                 overrides_all = ss_get("branch_overrides", {})
                 overrides_sheet = overrides_all.get(sheet, {})
-                df_new, rep = materialize_overrides(df, overrides_sheet, prune=prune_apply, prune_only_if_deeper_blank=True)
+                df_new, rep = materialize_overrides(
+                    df, overrides_sheet,
+                    prune=prune_apply or enforce5_apply,
+                    enforce_exactly_five=enforce5_apply,
+                    prune_only_if_deeper_blank=True
+                )
                 wb[sheet] = df_new
                 if where == "upload":
                     ss_set("upload_workbook", wb)
                 else:
                     ss_set("gs_workbook", wb)
                 autosave_now()
-                st.success(f"Applied. Added rows: {len(rep['added'])} · Pruned rows: {len(rep['pruned'])} · Total rows: {len(df_new)}")
-                if len(rep["added"]) > 0:
-                    st.dataframe(rep["added"].head(50), use_container_width=True)
+                st.success(
+                    f"Applied. Filled: {len(rep['filled'])} · Added: {len(rep['added'])} · "
+                    f"Pruned: {len(rep['pruned'])} · Kept (protected): {len(rep['kept_protected'])} · "
+                    f"Total rows: {len(df_new)}"
+                )
+                if len(rep["filled"]) > 0:
+                    st.dataframe(rep["filled"].head(50), use_container_width=True)
 
             # Undo
             st.markdown("---")
@@ -1593,18 +1713,29 @@ with tabs[4]:
 
             st.markdown("---")
             # Apply overrides to data from Conflicts
-            prune_apply_c = st.checkbox("Prune non-selected children (only if deeper nodes are blank)", value=False, key="conf_apply_prune")
+            st.subheader("Apply overrides to data (expand rows)")
+            enforce5_apply_c = st.checkbox("Enforce exactly 5 rows (fill blanks then add; prune extras if safe)", value=True, key="conf_apply_enforce5")
+            prune_apply_c = st.checkbox("Additionally prune non-selected rows (only if deeper nodes are blank)", value=False, key="conf_apply_prune")
             if st.button("↳ Apply overrides to data (expand rows)"):
                 overrides_all = ss_get("branch_overrides", {})
                 overrides_sheet = overrides_all.get(sheet, {})
-                df_new, rep = materialize_overrides(df, overrides_sheet, prune=prune_apply_c, prune_only_if_deeper_blank=True)
+                df_new, rep = materialize_overrides(
+                    df, overrides_sheet,
+                    prune=prune_apply_c or enforce5_apply_c,
+                    enforce_exactly_five=enforce5_apply_c,
+                    prune_only_if_deeper_blank=True
+                )
                 wb[sheet] = df_new
                 if src == "upload":
                     ss_set("upload_workbook", wb)
                 else:
                     ss_set("gs_workbook", wb)
                 autosave_now()
-                st.success(f"Applied. Added rows: {len(rep['added'])} · Pruned rows: {len(rep['pruned'])} · Total rows: {len(df_new)}")
+                st.success(
+                    f"Applied. Filled: {len(rep['filled'])} · Added: {len(rep['added'])} · "
+                    f"Pruned: {len(rep['pruned'])} · Kept (protected): {len(rep['kept_protected'])} · "
+                    f"Total rows: {len(df_new)}"
+                )
 
             if st.button("↩️ Undo last conflict resolution"):
                 stack = ss_get("undo_stack", [])
