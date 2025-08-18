@@ -15,7 +15,7 @@ from utils import (
     infer_branch_options,  # used for header badge
 )
 
-APP_VERSION = "v6.3.0"
+APP_VERSION = "v6.4.2"
 
 st.set_page_config(
     page_title=f"Decision Tree Builder {APP_VERSION}",
@@ -118,6 +118,8 @@ tab_validation  = _safe_import("ui_validation")
 tab_calculator  = _safe_import("ui_calculator")
 tab_visualizer  = _safe_import("ui_visualizer")
 tab_pushlog     = _safe_import("ui_pushlog")  # may not exist yet — we provide a fallback renderer below
+tab_triage      = _safe_import("ui_triage")   # new Diagnostic Triage tab
+tab_actions     = _safe_import("ui_actions")  # new Actions tab
 
 
 # ---------- Header ----------
@@ -153,10 +155,12 @@ st.caption("Canonical headers: Vital Measurement, Node 1, Node 2, Node 3, Node 4
 tabs = st.tabs([
     "📂 Source",
     "🗂 Workspace Selection",
-    "🧬 Symptoms",
-    "⚖️ Conflicts",
-    "📖 Dictionary",
     "🔎 Validation",
+    "⚖️ Conflicts",
+    "🩺 Diagnostic Triage",
+    "⚡ Actions",
+    "🧬 Symptoms",
+    "📖 Dictionary",
     "🧮 Calculator",
     "🌐 Visualizer",
     "📜 Push Log",
@@ -175,10 +179,10 @@ with tabs[1]:
         st.info("Workspace module not available.")
 
 with tabs[2]:
-    if tab_symptoms and hasattr(tab_symptoms, "render"):
-        tab_symptoms.render()
+    if tab_validation and hasattr(tab_validation, "render"):
+        tab_validation.render()
     else:
-        st.info("Symptoms module not available.")
+        st.info("Validation module not available.")
 
 with tabs[3]:
     if tab_conflicts and hasattr(tab_conflicts, "render"):
@@ -187,30 +191,72 @@ with tabs[3]:
         st.info("Conflicts module not available.")
 
 with tabs[4]:
+    # Diagnostic Triage tab
+    if tab_triage and hasattr(tab_triage, "render"):
+        # Get current DataFrame from session state
+        current_df = None
+        wb_upload = ss_get("upload_workbook", {})
+        wb_gs = ss_get("gs_workbook", {})
+        
+        if wb_upload:
+            current_sheet = ss_get("current_sheet")
+            if current_sheet and current_sheet in wb_upload:
+                current_df = wb_upload[current_sheet]
+        elif wb_gs:
+            current_sheet = ss_get("current_sheet")
+            if current_sheet and current_sheet in wb_gs:
+                current_df = wb_gs[current_sheet]
+        
+        tab_triage.render(current_df)
+    else:
+        st.info("Diagnostic Triage module not available.")
+
+with tabs[5]:
+    # Actions tab
+    if tab_actions and hasattr(tab_actions, "render"):
+        # Get current DataFrame from session state
+        current_df = None
+        wb_upload = ss_get("upload_workbook", {})
+        wb_gs = ss_get("gs_workbook", {})
+        
+        if wb_upload:
+            current_sheet = ss_get("current_sheet")
+            if current_sheet and current_sheet in wb_upload:
+                current_df = wb_upload[current_sheet]
+        elif wb_gs:
+            current_sheet = ss_get("current_sheet")
+            if current_sheet and current_sheet in wb_gs:
+                current_df = wb_gs[current_sheet]
+        
+        tab_actions.render(current_df)
+    else:
+        st.info("Actions module not available.")
+
+with tabs[6]:
+    if tab_symptoms and hasattr(tab_symptoms, "render"):
+        tab_symptoms.render()
+    else:
+        st.info("Symptoms module not available.")
+
+with tabs[7]:
     if tab_dictionary and hasattr(tab_dictionary, "render"):
         tab_dictionary.render()
     else:
         st.info("Dictionary module not available.")
 
-with tabs[5]:
-    if tab_validation and hasattr(tab_validation, "render"):
-        tab_validation.render()
-    else:
-        st.info("Validation module not available.")
-
-with tabs[6]:
+with tabs[8]:
     if tab_calculator and hasattr(tab_calculator, "render"):
         tab_calculator.render()
     else:
         st.info("Calculator module not available.")
 
-with tabs[7]:
+with tabs[9]:
     if tab_visualizer and hasattr(tab_visualizer, "render"):
         tab_visualizer.render()
     else:
         st.info("Visualizer module not available.")
 
-with tabs[8]:
+with tabs[10]:
     # Fallback Push Log if ui_pushlog module is not present yet
     if tab_pushlog and hasattr(tab_pushlog, "render"):
         tab_pushlog.render()

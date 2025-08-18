@@ -351,6 +351,16 @@ def build_raw_plus_v630(
     """
     Always deep-cascade with anchor-reuse for selected scope, and auto-attachment via label-level map.
     - include_scope: 'session' or 'all'
+    
+    Returns:
+        Tuple[pd.DataFrame, Dict[str,int]]: (augmented_dataframe, tstats)
+        where tstats always includes:
+        - "new_rows": int (number of new rows added)
+        - "inplace_filled": int (number of anchors filled in place)
+        - "generated": int (total generated including inplace)
+        - "new_added": int (new unique rows added)
+        - "duplicates_skipped": int (duplicates that were skipped)
+        - "final_total": int (final row count)
     """
     if df is None:
         df = pd.DataFrame(columns=CANON_HEADERS)
@@ -407,4 +417,9 @@ def build_raw_plus_v630(
     stats_total["new_added"] = len(now_keys - original_keys)
     stats_total["duplicates_skipped"] = max(0, stats_total["generated"] - stats_total["new_added"])
     stats_total["final_total"] = len(df_aug)
+    
+    # Ensure consistent tstats schema for UI compatibility
+    # Map new_added to new_rows for backward compatibility
+    stats_total["new_rows"] = stats_total["new_added"]
+    
     return df_aug, stats_total

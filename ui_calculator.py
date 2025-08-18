@@ -312,4 +312,4 @@ def render():
     if st.button("Reset path selections"):
         for k in ["calc_n1","calc_n2","calc_n3","calc_n4","calc_n5"]:
             st.session_state.pop(k, None)
-        st.experimental_rerun()
+        st.rerun()  # updated from st.experimental_rerun()

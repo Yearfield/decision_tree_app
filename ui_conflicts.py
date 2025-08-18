@@ -139,7 +139,8 @@ def render():
                 open_keys.append(key_group)
 
             # Show affected parents (toggle)
-            with st.expander("Show affected parents (paths)", expanded=False):
+            with st.container():
+                st.markdown("**Show affected parents (paths)**")
                 for childset, parents in variants.items():
                     st.markdown(f"- **Variant ({len(childset)}):** {', '.join(childset) if childset else '(empty)'}")
                     for p in parents:
@@ -189,7 +190,7 @@ def render():
                         st.session_state["conflicts_focus_key"] = key_group
                         st.session_state["conflicts_open_keys"] = open_keys
                         st.success(f"Applied Variant {i+1} to {n_aff} parent(s). Added {tstats['new_rows']} row(s), filled {tstats['inplace_filled']} anchors. 👍")
-                        st.experimental_rerun()
+                        st.rerun()  # updated from st.experimental_rerun()
 
                     # Save this variant as a preset for later reuse
                     if st.button(f"Save Variant {i+1} as preset", key=f"conf_save_preset_{lvl}_{label}_{i}"):
@@ -207,7 +208,8 @@ def render():
 
             # --- Presets section
             preset_sets = presets_sheet.get(key_group, [])
-            with st.expander("Presets for this group", expanded=False):
+            with st.container():
+                st.markdown("**Presets for this group**")
                 if not preset_sets:
                     st.caption("No presets saved yet. Use “Save Variant as preset” or save a custom set below.")
                 else:
@@ -237,7 +239,7 @@ def render():
                                 st.session_state["conflicts_focus_key"] = key_group
                                 st.session_state["conflicts_open_keys"] = open_keys
                                 st.success(f"Applied preset {j+1} to {n_aff} parent(s). Added {tstats['new_rows']} row(s), filled {tstats['inplace_filled']} anchors. 👍")
-                                st.experimental_rerun()
+                                st.rerun()  # updated from st.experimental_rerun()
                         with cols_p[2]:
                             if st.button(f"Delete preset {j+1}", key=f"conf_delete_preset_{lvl}_{label}_{j}"):
                                 presets_sheet[key_group].pop(j)
@@ -273,11 +275,11 @@ def render():
             with cquick1:
                 if st.button("Select first 5 of union", key=f"conf_quick_union5_{lvl}_{label}"):
                     st.session_state[sel_key] = options[:5]
-                    st.experimental_rerun()
+                    st.rerun()  # updated from st.experimental_rerun()
             with cquick2:
                 if st.button("Clear selection", key=f"conf_clear_sel_{lvl}_{label}"):
                     st.session_state[sel_key] = []
-                    st.experimental_rerun()
+                    st.rerun()  # updated from st.experimental_rerun()
 
             # Apply custom set to all
             if st.button("Apply custom set to all parents with this label", key=f"conf_apply_custom_{lvl}_{label}"):
@@ -312,7 +314,7 @@ def render():
                 st.session_state["conflicts_focus_key"] = key_group
                 st.session_state["conflicts_open_keys"] = open_keys
                 st.success(f"Applied custom set to {n_aff} parent(s). Added {tstats['new_rows']} row(s), filled {tstats['inplace_filled']} anchors. 👍")
-                st.experimental_rerun()
+                st.rerun()  # updated from st.experimental_rerun()
 
             # Save selection as a preset
             if st.button("Save current selection as preset", key=f"conf_save_custom_preset_{lvl}_{label}"):

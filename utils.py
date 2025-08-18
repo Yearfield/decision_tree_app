@@ -251,3 +251,43 @@ def cluster_by_node(df: pd.DataFrame, node_col: str) -> pd.DataFrame:
     df2 = df.copy()
     df2[node_col] = df2[node_col].map(normalize_text)
     return df2.sort_values([node_col] + [c for c in CANON_HEADERS if c != node_col], kind="stable").reset_index(drop=True)
+
+
+# ========= Validation & scoring =========
+
+def compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
+    """
+    Compute how many parent nodes have exactly 5 children (the ideal branching factor).
+    
+    Returns:
+        Tuple[int, int]: (ok_count, total_count) where ok_count is parents with exactly 5 children
+    """
+    store = infer_branch_options(df)
+    total = 0
+    ok = 0
+    for level in range(1, MAX_LEVELS+1):
+        parents = set()
+        for _, row in df.iterrows():
+            p = parent_key_from_row_strict(row, level)
+            if p is not None:
+                parents.add(p)
+        for p in parents:
+            total += 1
+            key = f"L{level}|" + (">".join(p) if p else "<ROOT>")
+            if len([x for x in store.get(key, []) if normalize_text(x) != ""]) == 5:
+                ok += 1
+    return ok, total
+
+
+def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
+    """
+    Compute how many rows have complete paths (all Node columns filled).
+    
+    Returns:
+        Tuple[int, int]: (complete_count, total_count) where complete_count is rows with full paths
+    """
+    if df.empty:
+        return (0, 0)
+    nodes = df[LEVEL_COLS].applymap(normalize_text)
+    full = nodes.ne("").all(axis=1)
+    return int(full.sum()), int(len(df))

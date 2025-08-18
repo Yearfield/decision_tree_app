@@ -20,40 +20,34 @@ _detect_loops = None
 _detect_missing_red_flags = None
 _validate_workbook = None
 _compute_validation_report = None
-_detect_missing_redflag_coverage = None
+_detect_missing_red_flags = None
 _detect_orphans_legacy = None
 
-# Try the "new" API we proposed in the fix
+# Import validation logic functions
 try:
-    from logic_validation import (
+    from logic_validation_functions import (
         detect_orphan_nodes as _detect_orphan_nodes,
         detect_loops as _detect_loops,
         detect_missing_red_flags as _detect_missing_red_flags,
-        validate_workbook as _validate_workbook,
+        compute_validation_report as _compute_validation_report,
     )
     API_MODE = "new"
 except Exception:
-    # Fallback 1: try older combined report
+    # Fallback: try individual functions
     try:
-        from logic_validation import compute_validation_report as _compute_validation_report
-        API_MODE = "combined"
+        from logic_validation_functions import (
+            detect_orphan_nodes as _detect_orphan_nodes,
+            detect_loops as _detect_loops,
+            detect_missing_red_flags as _detect_missing_red_flags,
+        )
+        API_MODE = "individual"
     except Exception:
-        # Fallback 2: try older individual functions (legacy names)
-        try:
-            from logic_validation import detect_orphans as _detect_orphans_legacy
-        except Exception:
-            _detect_orphans_legacy = None
-        try:
-            from logic_validation import detect_loops as _detect_loops
-        except Exception:
-            _detect_loops = None
-        try:
-            from logic_validation import detect_missing_redflag_coverage as _detect_missing_redflag_coverage
-        except Exception:
-            _detect_missing_redflag_coverage = None
-
-        if _detect_orphans_legacy or _detect_loops or _detect_missing_redflag_coverage:
-            API_MODE = "legacy"
+        # If all else fails, set to None
+        _detect_orphan_nodes = None
+        _detect_loops = None
+        _detect_missing_red_flags = None
+        _compute_validation_report = None
+        API_MODE = "none"
 
 
 # ----------------- session helpers -----------------
@@ -310,7 +304,7 @@ def render():
         elif API_MODE == "legacy":
             orphans = _detect_orphans_legacy(df, overrides=overrides_sheet, strict=False) if (chk_orphans and _detect_orphans_legacy) else []
             loops = _detect_loops(df) if (chk_loops and _detect_loops) else []
-            miss_rf = _detect_missing_redflag_coverage(df, overrides=overrides_sheet, redflag_map=quality_map) if (chk_rf and _detect_missing_redflag_coverage) else []
+            miss_rf = _detect_missing_red_flags(df) if (chk_rf and _detect_missing_red_flags) else []
 
         else:
             st.error("No validation functions available. Please ensure logic_validation.py is present.")

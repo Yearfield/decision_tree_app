@@ -11,23 +11,31 @@ from utils import (
     level_key_tuple,
 )
 
-# Prefer the combined report; gracefully fallback if only individual detectors exist
+# Import validation logic functions
 try:
-    from logic_validation import (
+    from logic_validation_functions import (
         compute_validation_report,
         detect_orphan_nodes,
         detect_loops,
-        detect_missing_redflag_coverage,
+        detect_missing_red_flags,
     )
     HAVE_COMBINED = True
 except Exception:
-    # Older compatibility: individual functions only
-    from logic_validation import (
-        detect_orphan_nodes,
-        detect_loops,
-        detect_missing_redflag_coverage,
-    )
-    HAVE_COMBINED = False
+    # Fallback: try individual functions
+    try:
+        from logic_validation_functions import (
+            detect_orphan_nodes,
+            detect_loops,
+            detect_missing_red_flags,
+        )
+        HAVE_COMBINED = False
+    except Exception:
+        # If all else fails, set to None
+        compute_validation_report = None
+        detect_orphan_nodes = None
+        detect_loops = None
+        detect_missing_red_flags = None
+        HAVE_COMBINED = False
 
 
 def _ss_get(key, default):
@@ -60,14 +68,14 @@ def _render_orphans(orphans: List[Dict[str, Any]]):
     for item in orphans:
         label = item.get("label", "")
         level = int(item.get("level", 1))
-        appears_as_parent = bool(item.get("appears_as_parent", False))
-        parent_examples = item.get("parent_examples", [])
-        example_txt = "; ".join([" > ".join(p) if p else friendly_parent_label(level, tuple()) for p in parent_examples[:5]])
+        node_id = item.get("node_id", f"Node {level}")
+        appears_as_child_in = item.get("appears_as_child_in", [])
+        example_txt = "; ".join(appears_as_child_in[:5]) if appears_as_child_in else "—"
         rows.append({
             "Node Label": label,
-            "At Level": f"Node {level}",
-            "Appears as Parent?": "Yes" if appears_as_parent else "No",
-            "Example parent paths (where used as child)": example_txt or "—",
+            "At Level": node_id,
+            "Appears as Child In": example_txt,
+            "Row Index": item.get("row_index", -1),
         })
 
     df_orph = pd.DataFrame(rows).sort_values(["At Level", "Node Label"])
@@ -90,14 +98,25 @@ def _render_loops(loops: List[Dict[str, Any]]):
 
     rows = []
     for item in loops:
-        # Expect either a 'cycle' (list of labels) or 'path'
-        cycle = item.get("cycle") or item.get("path") or []
+        path = item.get("path", [])
+        length = item.get("length", 0)
+        start_node = item.get("start_node", "")
+        cycle_type = item.get("cycle_type", "unknown")
+        
         # Display as A → B → C → A
-        if cycle and cycle[0] != cycle[-1]:
-            display = " → ".join(cycle + [cycle[0]])
+        if path and len(path) > 1:
+            display = " → ".join(path)
+            if path[0] != path[-1]:
+                display += f" → {path[0]}"
         else:
-            display = " → ".join(cycle) if cycle else "(empty)"
-        rows.append({"Cycle": display})
+            display = " → ".join(path) if path else "(empty)"
+        
+        rows.append({
+            "Cycle": display,
+            "Length": length,
+            "Start Node": start_node,
+            "Type": cycle_type
+        })
 
     df_loops = pd.DataFrame(rows)
     st.dataframe(df_loops, use_container_width=True, height=220)
@@ -113,32 +132,38 @@ def _render_loops(loops: List[Dict[str, Any]]):
 def _render_missing_redflag(miss_rf: List[Dict[str, Any]]):
     st.subheader("🚩 Missing Red Flag coverage")
 
-    st.caption("Parents that have children but none marked as Red Flag. You can fix these in the Dictionary (flag the child) or by editing branches.")
+    st.caption("Nodes that appear frequently but don't have explicit red flag indicators. Consider adding red flag coverage for these nodes.")
 
     if not miss_rf:
-        st.success("All parents with children have Red Flag coverage. 🎉")
+        st.success("All nodes have appropriate red flag coverage. 🎉")
         return
 
     rows = []
     for item in miss_rf:
+        label = item.get("label", "")
         level = int(item.get("level", 1))
-        parent_tuple = tuple(item.get("parent", []))
-        children = item.get("children", [])
-        rf_children = item.get("rf_children", [])
-        parent_pretty = " > ".join(parent_tuple) if parent_tuple else friendly_parent_label(level, tuple())
+        node_id = item.get("node_id", f"Node {level}")
+        issue_type = item.get("issue_type", "unknown")
+        suggested_action = item.get("suggested_action", "")
+        row_index = item.get("row_index", -1)
+        
         rows.append({
-            "Parent (path)": parent_pretty,
-            "At Level": f"Node {level}",
-            "Children": ", ".join(children) if children else "(none)",
-            "Red Flag children": ", ".join(rf_children) if rf_children else "(none)",
-            "Fix": "Open in Symptoms",
-            "parent_tuple": parent_tuple,   # keep for jump
-            "level_int": level,
+            "Node Label": label,
+            "At Level": node_id,
+            "Issue Type": issue_type,
+            "Suggested Action": suggested_action,
+            "Row Index": row_index,
         })
 
-    df_rf = pd.DataFrame(rows).sort_values(["At Level", "Parent (path)"])
-    st.dataframe(df_rf[["Parent (path)", "At Level", "Children", "Red Flag children", "Fix"]],
-                 use_container_width=True, height=280)
+    df_rf = pd.DataFrame(rows).sort_values(["At Level", "Node Label"])
+    st.dataframe(df_rf, use_container_width=True, height=280)
+
+    st.download_button(
+        "Download missing red flags (CSV)",
+        data=df_rf.to_csv(index=False).encode("utf-8"),
+        file_name="validation_missing_redflags.csv",
+        mime="text/csv",
+    )
 
     # Per-row jump buttons (paged)
     st.caption("Quick-jump: focus a parent in the Symptoms tab for editing.")
@@ -224,14 +249,15 @@ def render():
     # Compute report
     try:
         if HAVE_COMBINED:
-            report = compute_validation_report(df, overrides_sheet, quality_map)
-            orphans = report.get("orphans", []) if chk_orphans else []
+            # Call compute_validation_report with only the DataFrame argument
+            report = compute_validation_report(df)
+            orphans = report.get("orphan_nodes", []) if chk_orphans else []
             loops = report.get("loops", []) if chk_loops else []
-            missing_rf = report.get("missing_redflag", []) if chk_rf else []
+            missing_rf = report.get("missing_red_flags", []) if chk_rf else []
         else:
-            orphans = detect_orphan_nodes(df, overrides_sheet) if chk_orphans else []
-            loops = detect_loops(df, overrides_sheet) if chk_loops else []
-            missing_rf = detect_missing_redflag_coverage(df, overrides_sheet, quality_map) if chk_rf else []
+            orphans = detect_orphan_nodes(df) if chk_orphans and detect_orphan_nodes else []
+            loops = detect_loops(df) if chk_loops and detect_loops else []
+            missing_rf = detect_missing_red_flags(df) if chk_rf and detect_missing_red_flags else []
     except AssertionError as e:
         st.error(str(e))
         return
