@@ -16,6 +16,55 @@ from utils import (
 )
 from ui_helpers import render_preview_caption, st_success, st_warning, st_error, st_info
 
+# ========= Utility functions for dual-schema support =========
+
+def _safe_get(d, keys, default=""):
+    """Safely get value from dict using multiple possible keys."""
+    for k in keys:
+        if isinstance(d, dict) and k in d: 
+            return d[k]
+    return default
+
+
+def _coerce_list_to_df(items):
+    """Convert items to DataFrame, supporting both legacy and new structured outputs."""
+    if isinstance(items, pd.DataFrame):
+        return items.copy()
+    elif isinstance(items, list) and items and isinstance(items[0], dict):
+        return pd.DataFrame(items)
+    else:
+        return pd.DataFrame()
+
+
+def _normalize_missing_rf_df(df):
+    """
+    Normalize missing red flags DataFrame to ensure consistent column structure.
+    Supports both legacy schema (Parent (path), Children) and new schema (parent_path, children, etc.).
+    """
+    if df.empty:
+        return df
+    
+    # Ensure required columns exist with fallbacks
+    normalized = pd.DataFrame()
+    
+    # Map columns with fallbacks for dual-schema support
+    normalized["Parent (path)"] = df.get("Parent (path)", df.get("parent_path", ""))
+    normalized["Children"] = df.get("Children", df.get("children", ""))
+    normalized["Label"] = df.get("Label", df.get("label", ""))
+    normalized["Level"] = df.get("Level", df.get("level", -1))
+    normalized["Issue"] = df.get("Issue", df.get("issue", "Missing red flag"))
+    normalized["Severity"] = df.get("Severity", df.get("severity", "warning"))
+    normalized["Row"] = df.get("Row", df.get("row", -1))
+    
+    # Handle children column - if it's a list, join with commas
+    if "Children" in normalized.columns:
+        normalized["Children"] = normalized["Children"].apply(
+            lambda x: ", ".join(x) if isinstance(x, list) else str(x)
+        )
+    
+    return normalized
+
+
 # Import validation logic functions
 try:
     from logic_validation_functions import (
@@ -130,6 +179,7 @@ def _render_orphans(orphans: List[Dict[str, Any]]):
     df_orph = pd.DataFrame(rows).sort_values(["At Level", "Node Label"])
     # Limit preview to first 100 rows for speed
     st.dataframe(df_orph.head(100), use_container_width=True, height=260)
+    render_preview_caption(df_orph.head(100), df_orph, max_rows=100)
 
     st.download_button(
         "Download orphans (CSV)",
@@ -171,6 +221,7 @@ def _render_loops(loops: List[Dict[str, Any]]):
     df_loops = pd.DataFrame(rows)
     # Limit preview to first 100 rows for speed
     st.dataframe(df_loops.head(100), use_container_width=True, height=220)
+    render_preview_caption(df_loops.head(100), df_loops, max_rows=100)
 
     st.download_button(
         "Download loops (CSV)",
@@ -186,57 +237,37 @@ def _render_missing_redflag(miss_rf: List[Dict[str, Any]]):
     st.caption("Nodes that appear frequently but don't have explicit red flag indicators. Consider adding red flag coverage for these nodes.")
 
     if not miss_rf:
-        st.success("All nodes have appropriate red flag coverage. 🎉")
+        st_success("All nodes have appropriate red flag coverage. 🎉")
         return
 
-    rows = []
-    for item in miss_rf:
-        label = item.get("label", "")
-        level = int(item.get("level", 1))
-        node_id = item.get("node_id", f"Node {level}")
-        issue_type = item.get("issue_type", "unknown")
-        suggested_action = item.get("suggested_action", "")
-        row_index = item.get("row_index", -1)
-        
-        rows.append({
-            "Node Label": label,
-            "At Level": node_id,
-            "Issue Type": issue_type,
-            "Suggested Action": suggested_action,
-            "Row Index": row_index,
-        })
-
-    df_rf = pd.DataFrame(rows).sort_values(["At Level", "Node Label"])
-    # Limit preview to first 100 rows for speed
-    st.dataframe(df_rf.head(100), use_container_width=True, height=280)
-
+    # Convert to DataFrame and normalize columns for dual-schema support
+    df = _coerce_list_to_df(miss_rf)
+    df = _normalize_missing_rf_df(df)
+    
+    if df.empty:
+        st_success("✅ No missing red flag placements found.")
+        return
+    
+    # Show compact list view
+    st.caption(f"Showing {min(len(df), 100)} of {len(df)} entries")
+    for rec in df.head(100).to_dict("records"):
+        parent = _safe_get(rec, ["Parent (path)"], "-")
+        children = _safe_get(rec, ["Children"], "")
+        label = _safe_get(rec, ["Label"], "")
+        level = _safe_get(rec, ["Level"], -1)
+        issue = _safe_get(rec, ["Issue"], "Missing red flag")
+        st.write(f"• **{parent}** — children: {children or '(none)'}  ·  Label: **{label}**  ·  Node: {level}  ·  ℹ️ {issue}")
+    
+    # Also show dataframe preview
+    st.markdown("---")
+    st.markdown("#### Detailed View")
+    st.dataframe(df.head(100), use_container_width=True, height=280)
+    render_preview_caption(df.head(100), df, max_rows=100)
+    
+    # Download functionality
     st.download_button(
         "Download missing red flags (CSV)",
-        data=df_rf.to_csv(index=False).encode("utf-8"),
-        file_name="validation_missing_redflags.csv",
-        mime="text/csv",
-    )
-
-    # Per-row jump buttons (paged)
-    st.caption("Quick-jump: focus a parent in the Symptoms tab for editing.")
-    page_size = st.selectbox("Rows per page", [10, 25, 50, 100], index=1, key="val_rf_pagesize")
-    total = len(df_rf)
-    max_page = max(1, int(np.ceil(total / page_size)))
-    page = st.number_input("Page", min_value=1, max_value=max_page, value=1, step=1, key="val_rf_page")
-    start = (page - 1) * page_size
-    end = min(start + page_size, total)
-    for idx in range(start, end):
-        row = df_rf.iloc[idx]
-        c1, c2 = st.columns([6, 1])
-        with c1:
-            st.write(f"• **{row['Parent (path)']}** — children: {row['Children'] or '(none)'}")
-        with c2:
-            if st.button("Find in Symptoms", key=f"val_rf_jump_{idx}"):
-                _jump_to_symptoms(int(row["level_int"]), tuple(row["parent_tuple"]))
-
-    st.download_button(
-        "Download missing Red Flag coverage (CSV)",
-        data=df_rf.drop(columns=["parent_tuple", "level_int"]).to_csv(index=False).encode("utf-8"),
+        data=df.to_csv(index=False).encode("utf-8"),
         file_name="validation_missing_redflags.csv",
         mime="text/csv",
     )
@@ -267,6 +298,7 @@ def _render_empty_branches(empty_branches: List[Dict[str, Any]]):
     df_eb = pd.DataFrame(rows).sort_values(["At Level", "Node Label"])
     # Limit preview to first 100 rows for speed
     st.dataframe(df_eb.head(100), use_container_width=True, height=220)
+    render_preview_caption(df_eb.head(100), df_eb, max_rows=100)
 
     st.download_button(
         "Download empty branches (CSV)",
