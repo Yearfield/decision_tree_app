@@ -52,10 +52,7 @@ except Exception:
 
 # ----------------- session helpers -----------------
 
-def _ss_get(key, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-    return st.session_state[key]
+
 
 
 def _jump_to_symptoms(level: int, parent_tuple: Tuple[str, ...]):
@@ -234,9 +231,9 @@ def render():
 
     # Choose data source
     sources = []
-    if _ss_get("upload_workbook", {}):
+    if st.session_state.get("upload_workbook", {}):
         sources.append("Upload workbook")
-    if _ss_get("gs_workbook", {}):
+    if st.session_state.get("gs_workbook", {}):
         sources.append("Google Sheets workbook")
 
     if not sources:
@@ -246,10 +243,10 @@ def render():
     source = st.radio("Choose data source", sources, horizontal=True, key="val_source_sel")
 
     if source == "Upload workbook":
-        wb = _ss_get("upload_workbook", {})
+        wb = st.session_state.get("upload_workbook", {})
         override_root = "branch_overrides_upload"
     else:
-        wb = _ss_get("gs_workbook", {})
+        wb = st.session_state.get("gs_workbook", {})
         override_root = "branch_overrides_gs"
 
     if not wb:
@@ -274,14 +271,14 @@ def render():
         chk_rf = st.checkbox("Missing Red Flag coverage", value=True, key="val_chk_rf")
 
     # Pull overrides + symptom quality map (used by legacy API)
-    overrides_sheet = _ss_get(override_root, {}).get(sheet, {})
-    quality_map = _ss_get("symptom_quality", {})  # {symptom: "Red Flag"|"Normal"}
+    overrides_sheet = st.session_state.get(override_root, {}).get(sheet, {})
+    quality_map = st.session_state.get("symptom_quality", {})  # {symptom: "Red Flag"|"Normal"}
 
     st.markdown("---")
     if st.button("▶ Run validation", type="primary", key="val_run_btn"):
         st.session_state["val_run_requested"] = True
 
-    if not _ss_get("val_run_requested", True):
+    if not st.session_state.get("val_run_requested", True):
         st.info("Click **Run validation** to generate the report.")
         return
 

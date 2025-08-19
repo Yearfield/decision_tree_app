@@ -15,10 +15,7 @@ from utils import (
 # Helpers
 # -----------------------------
 
-def _ss_get(key, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-    return st.session_state[key]
+
 
 
 def _get_current_df() -> Tuple[Optional[pd.DataFrame], str]:

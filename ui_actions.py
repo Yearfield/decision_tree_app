@@ -26,6 +26,55 @@ try:
 except ImportError:
     HAVE_ACTIONS_LOGIC = False
 
+# Import sheets functions for Google Sheets integration
+try:
+    from app.sheets import get_gspread_client_from_secrets, open_spreadsheet, write_dataframe
+    HAVE_SHEETS = True
+except ImportError:
+    HAVE_SHEETS = False
+
+
+# Common helpers
+def _ensure_cols(df, cols):
+    import pandas as pd
+    if df is None or df.empty:
+        return pd.DataFrame({c: [] for c in cols})
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = ""
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def _actions_metrics(df):
+    if df is None or df.empty:
+        return {"total": 0, "filled": 0, "coverage_pct": 0.0, "missing": 0}
+    total = len(df)
+    filled = int(df["Actions"].astype(str).str.strip().ne("").sum())
+    missing = total - filled
+    pct = 0.0 if total == 0 else round(100.0*filled/total, 1)
+    return {"total": total, "filled": filled, "coverage_pct": pct, "missing": missing}
+
+
+def _apply_filters(df, vm_filter, q):
+    from typing import List
+    import pandas as pd
+    if df is None or df.empty:
+        return df
+    view = df.copy()
+    if vm_filter and vm_filter != "(All)":
+        view = view[view["Vital Measurement"].astype(str).str.strip().str.lower() == str(vm_filter).strip().lower()]
+    if q:
+        ql = str(q).strip().lower()
+        cols = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5"]
+        mask = False
+        for c in cols:
+            if c in view.columns:
+                mask = mask | view[c].astype(str).str.lower().str.contains(ql, na=False)
+        view = view[mask]
+    return view
+
 
 @st.cache_data(show_spinner=False, ttl=600)
 def _cached_compute_actions_metrics(df: pd.DataFrame) -> Dict[str, Any]:
@@ -74,22 +123,171 @@ def render(df: pd.DataFrame):
         st.error("❌ Invalid data format. Expected canonical headers.")
         return
     
-    # Check if Actions column exists
-    if "Actions" not in df.columns:
-        st.error("❌ 'Actions' column not found in the data.")
+    # Ensure required columns exist
+    required_cols = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Actions"]
+    df = _ensure_cols(df, required_cols)
+    
+    # Filters row
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        vm_options = ["(All)"] + sorted(df["Vital Measurement"].astype(str).unique().tolist())
+        vm_filter = st.selectbox("Vital Measurement", vm_options, key="actions_vm_filter")
+    with col2:
+        search_query = st.text_input("Search", placeholder="Search in all columns...", key="actions_search")
+    
+    # Apply filters
+    filtered_df = _apply_filters(df, vm_filter, search_query)
+    
+    # Compute metrics
+    metrics = _actions_metrics(filtered_df)
+    
+    # Show KPIs prominently
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total rows", metrics["total"])
+    with col2:
+        st.metric("Filled actions", metrics["filled"])
+    with col3:
+        st.metric("Coverage %", f"{metrics['coverage_pct']}%")
+    
+    # Progress bar
+    st.progress(metrics["coverage_pct"]/100.0)
+    
+    st.markdown("---")
+    
+    # Editor
+    if filtered_df.empty:
+        st.info("ℹ️ No data matches the current filters.")
         return
     
-    # Filter data for actions view
-    actions_df = _prepare_actions_view(df)
+    # Limit to first 100 rows for performance
+    edit_df = filtered_df.head(100)
     
-    # Display summary metrics
-    _render_actions_summary(actions_df)
+    # Column configuration
+    column_config = {
+        "Vital Measurement": st.column_config.TextColumn("Vital Measurement", disabled=True),
+        "Node 1": st.column_config.TextColumn("Node 1", disabled=True),
+        "Node 2": st.column_config.TextColumn("Node 2", disabled=True),
+        "Node 3": st.column_config.TextColumn("Node 3", disabled=True),
+        "Node 4": st.column_config.TextColumn("Node 4", disabled=True),
+        "Node 5": st.column_config.TextColumn("Node 5", disabled=True),
+        "Actions": st.column_config.TextColumn("Actions", max_chars=None),
+    }
     
-    # Main actions interface
-    _render_actions_editor(actions_df)
+    # Data editor
+    edited_df = st.data_editor(
+        edit_df,
+        column_config=column_config,
+        use_container_width=True,
+        key="actions_editor"
+    )
     
-    # Add new actions form
-    _render_add_actions_form()
+    # Save controls
+    st.markdown("---")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        save_mode = st.radio("Save mode", ["Overwrite", "Append"], index=0, key="actions_save_mode")
+    with col2:
+        st.download_button(
+            "Download CSV",
+            data=filtered_df.to_csv(index=False).encode("utf-8"),
+            file_name="actions_data.csv",
+            mime="text/csv"
+        )
+    
+    # Save to session button
+    if st.button("💾 Save to session", key="actions_save_session"):
+        if filtered_df.empty:
+            st.warning("⚠️ No data to save.")
+            return
+        
+        # Get current work context
+        work_context = st.session_state.get("work_context", {})
+        source = work_context.get("source")
+        sheet_name = work_context.get("sheet")
+        
+        if not source or not sheet_name:
+            st.error("❌ No active sheet context. Please select a sheet first.")
+            return
+        
+        # Update the underlying DataFrame
+        try:
+            if source == "upload":
+                wb = st.session_state.get("upload_workbook", {})
+                if sheet_name in wb:
+                    # Update rows in the original DataFrame
+                    original_df = wb[sheet_name]
+                    for idx, row in edited_df.iterrows():
+                        # Find matching row in original DataFrame
+                        mask = (
+                            (original_df["Vital Measurement"] == row["Vital Measurement"]) &
+                            (original_df["Node 1"] == row["Node 1"]) &
+                            (original_df["Node 2"] == row["Node 2"]) &
+                            (original_df["Node 3"] == row["Node 3"]) &
+                            (original_df["Node 4"] == row["Node 4"]) &
+                            (original_df["Node 5"] == row["Node 5"])
+                        )
+                        if mask.any():
+                            original_df.loc[mask, "Actions"] = row["Actions"]
+                    
+                    wb[sheet_name] = original_df
+                    st.session_state["upload_workbook"] = wb
+                    st.success("✅ Actions data saved to session successfully!")
+                    st.rerun()
+                else:
+                    st.error("❌ Sheet not found in upload workbook.")
+            elif source == "gs":
+                wb = st.session_state.get("gs_workbook", {})
+                if sheet_name in wb:
+                    # Similar update logic for Google Sheets workbook
+                    original_df = wb[sheet_name]
+                    for idx, row in edited_df.iterrows():
+                        mask = (
+                            (original_df["Vital Measurement"] == row["Vital Measurement"]) &
+                            (original_df["Node 1"] == row["Node 1"]) &
+                            (original_df["Node 2"] == row["Node 2"]) &
+                            (original_df["Node 3"] == row["Node 3"]) &
+                            (original_df["Node 4"] == row["Node 4"]) &
+                            (original_df["Node 5"] == row["Node 5"])
+                        )
+                        if mask.any():
+                            original_df.loc[mask, "Actions"] = row["Actions"]
+                    
+                    wb[sheet_name] = original_df
+                    st.session_state["gs_workbook"] = wb
+                    st.success("✅ Actions data saved to session successfully!")
+                    st.rerun()
+                else:
+                    st.error("❌ Sheet not found in Google Sheets workbook.")
+        except Exception as e:
+            st.error(f"❌ Error saving to session: {str(e)}")
+    
+    # Push to Google Sheets button
+    if HAVE_SHEETS and "gcp_service_account" in st.secrets:
+        spreadsheet_id = st.session_state.get("gs_spreadsheet_id")
+        if spreadsheet_id and sheet_name:
+            if st.button("☁️ Push to Google Sheets", key="actions_push_gsheets"):
+                if filtered_df.empty:
+                    st.warning("⚠️ No data to push.")
+                    return
+                
+                try:
+                    with st.spinner("Pushing to Google Sheets..."):
+                        client = get_gspread_client_from_secrets(st.secrets["gcp_service_account"])
+                        spreadsheet = open_spreadsheet(client, spreadsheet_id)
+                        
+                        # Get the full DataFrame for pushing
+                        full_df = st.session_state.get("gs_workbook", {}).get(sheet_name, pd.DataFrame())
+                        if full_df.empty:
+                            st.error("❌ No data available for pushing.")
+                            return
+                        
+                        write_dataframe(spreadsheet, sheet_name, full_df, mode=save_mode.lower())
+                        st.success("✅ Successfully pushed to Google Sheets!")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error pushing to Google Sheets: {str(e)}")
 
 
 def _prepare_actions_view(df: pd.DataFrame) -> pd.DataFrame:
@@ -143,260 +341,3 @@ def _render_actions_summary(actions_df: pd.DataFrame):
         st.dataframe(action_df.head(100), use_container_width=True)
 
 
-def _analyze_action_types(actions_df: pd.DataFrame) -> Dict[str, int]:
-    """
-    Analyze the types of actions present in the data.
-    """
-    action_types = {}
-    
-    for _, row in actions_df.iterrows():
-        actions = normalize_text(row.get("Actions", ""))
-        if actions:
-            # Split by common delimiters and count types
-            action_list = [a.strip() for a in actions.replace(";", ",").replace("|", ",").split(",") if a.strip()]
-            for action in action_list:
-                # Extract action type (first word or common prefixes)
-                action_type = action.split()[0] if action else "Unknown"
-                action_types[action_type] = action_types.get(action_type, 0) + 1
-    
-    return dict(sorted(action_types.items(), key=lambda x: x[1], reverse=True))
-
-
-def _render_actions_editor(actions_df: pd.DataFrame):
-    """
-    Render the main actions data editor.
-    """
-    st.subheader("✏️ Edit Actions Data")
-    
-    # Show current actions data in editable format
-    edited_actions_df = st.data_editor(
-        actions_df,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "Vital Measurement": st.column_config.TextColumn(
-                "Vital Measurement",
-                help="The vital measurement being assessed",
-                disabled=True
-            ),
-            "Node 1": st.column_config.TextColumn(
-                "Node 1",
-                help="First decision node",
-                disabled=True
-            ),
-            "Node 2": st.column_config.TextColumn(
-                "Node 2", 
-                help="Second decision node",
-                disabled=True
-            ),
-            "Node 3": st.column_config.TextColumn(
-                "Node 3",
-                help="Third decision node", 
-                disabled=True
-            ),
-            "Node 4": st.column_config.TextColumn(
-                "Node 4",
-                help="Fourth decision node",
-                disabled=True
-            ),
-            "Node 5": st.column_config.TextColumn(
-                "Node 5",
-                help="Fifth decision node",
-                disabled=True
-            ),
-            "Actions": st.column_config.TextColumn(
-                "Actions",
-                help="Actions to take (e.g., 'Refer to specialist', 'Order tests', 'Monitor')",
-                placeholder="Enter actions...",
-                max_chars=None
-            )
-        }
-    )
-    
-    # Check for changes
-    if not actions_df.equals(edited_actions_df):
-        st.session_state["actions_has_changes"] = True
-        st.session_state["edited_actions_df"] = edited_actions_df
-        st.success("✅ Changes detected. Use the save button below to persist changes.")
-    else:
-        st.session_state["actions_has_changes"] = False
-    
-    # Save controls
-    _render_actions_save_controls(edited_actions_df)
-
-
-def _render_add_actions_form():
-    """
-    Render form for adding new actions.
-    """
-    st.subheader("➕ Add New Actions")
-    
-    with st.form("add_actions_form"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            action_label = st.text_input(
-                "Action label:",
-                placeholder="e.g., 'Refer to specialist'",
-                help="Enter a descriptive action label"
-            )
-            
-            action_category = st.selectbox(
-                "Action category:",
-                options=["", "Diagnostic", "Treatment", "Follow-up", "Referral", "Monitoring", "Other"],
-                help="Categorize the action type"
-            )
-        
-        with col2:
-            action_priority = st.selectbox(
-                "Priority:",
-                options=["", "High", "Medium", "Low", "Urgent"],
-                help="Set the priority level for this action"
-            )
-            
-            action_duration = st.text_input(
-                "Duration/Timeframe:",
-                placeholder="e.g., 'Within 24 hours'",
-                help="When this action should be completed"
-            )
-        
-        action_description = st.text_area(
-            "Detailed description:",
-            placeholder="Provide additional details about this action...",
-            height=80
-        )
-        
-        submitted = st.form_submit_button("➕ Add Action", type="primary")
-        
-        if submitted:
-            if action_label.strip():
-                # Store the new action for potential use
-                new_action = {
-                    "label": action_label,
-                    "category": action_category,
-                    "priority": action_priority,
-                    "duration": action_duration,
-                    "description": action_description
-                }
-                
-                # Add to session state for potential use
-                if "new_actions" not in st.session_state:
-                    st.session_state["new_actions"] = []
-                st.session_state["new_actions"].append(new_action)
-                
-                st.success(f"✅ Action '{action_label}' added successfully!")
-                st.info("💡 Use the action label in the Actions column above to apply this action to specific rows.")
-            else:
-                st.warning("⚠️ Please enter an action label.")
-
-
-def _render_actions_save_controls(edited_df: pd.DataFrame):
-    """
-    Render save controls for actions data.
-    """
-    st.subheader("💾 Save Changes")
-    
-    # Check if there are changes to save
-    has_changes = st.session_state.get("actions_has_changes", False)
-    
-    if not has_changes:
-        st.info("ℹ️ No changes to save.")
-        return
-    
-    # Save mode selection
-    save_mode = st.radio(
-        "Save mode:",
-        options=["overwrite", "append"],
-        format_func=lambda x: "Overwrite existing data" if x == "overwrite" else "Append new data",
-        horizontal=True,
-        index=0
-    )
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Download backup
-        csv_data = edited_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Download CSV backup",
-            data=csv_data,
-            file_name="actions_data_backup.csv",
-            mime="text/csv",
-            help="Download current actions data as CSV before saving"
-        )
-    
-    with col2:
-        # Save button
-        if st.button("💾 Save Actions Data", type="primary"):
-            with st.spinner("💾 Saving actions data..."):
-                success = _save_actions_data(edited_df, save_mode)
-                if success:
-                    st.success("✅ Actions data saved successfully!")
-                    st.session_state["actions_has_changes"] = False
-                    st.rerun()
-                else:
-                    st.error("❌ Failed to save actions data. Please try again.")
-
-
-def _save_actions_data(edited_df: pd.DataFrame, save_mode: str) -> bool:
-    """
-    Save actions data back to the current workbook.
-    
-    Args:
-        edited_df: The edited actions DataFrame
-        save_mode: "overwrite" or "append"
-        
-    Returns:
-        bool: True if save was successful
-    """
-    try:
-        # Get current workbook
-        wb_upload = st.session_state.get("upload_workbook", {})
-        wb_gs = st.session_state.get("gs_workbook", {})
-        
-        if wb_upload:
-            # Save to upload workbook
-            current_sheet = st.session_state.get("current_sheet")
-            if current_sheet and current_sheet in wb_upload:
-                if save_mode == "overwrite":
-                    # Update the actions column in the original DataFrame
-                    original_df = wb_upload[current_sheet]
-                    original_df["Actions"] = edited_df["Actions"]
-                    wb_upload[current_sheet] = original_df
-                else:
-                    # Append mode - add new rows
-                    wb_upload[current_sheet] = pd.concat([wb_upload[current_sheet], edited_df], ignore_index=True)
-                
-                st.session_state["upload_workbook"] = wb_upload
-                return True
-                
-        elif wb_gs:
-            # Save to Google Sheets
-            current_sheet = st.session_state.get("current_sheet")
-            spreadsheet_id = st.session_state.get("current_spreadsheet_id")
-            
-            if current_sheet and spreadsheet_id:
-                from app.sheets import get_gspread_client_from_secrets, open_spreadsheet, write_dataframe
-                
-                client = get_gspread_client_from_secrets(st.secrets["gcp_service_account"])
-                spreadsheet = open_spreadsheet(client, spreadsheet_id)
-                
-                if save_mode == "overwrite":
-                    # Update the actions column
-                    original_df = wb_gs[current_sheet]
-                    original_df["Actions"] = edited_df["Actions"]
-                    write_dataframe(spreadsheet, current_sheet, original_df, mode="overwrite")
-                else:
-                    # Append mode
-                    write_dataframe(spreadsheet, current_sheet, edited_df, mode="append")
-                
-                # Update local copy
-                wb_gs[current_sheet] = edited_df
-                st.session_state["gs_workbook"] = wb_gs
-                return True
-        
-        return False
-        
-    except Exception as e:
-        st.error(f"❌ Error saving actions data: {str(e)}")
-        return False

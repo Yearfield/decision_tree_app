@@ -15,22 +15,23 @@ from utils import (
     infer_branch_options,  # used for header badge
 )
 
-APP_VERSION = "v6.4.2"
+APP_VERSION = "v6.5.1"
 
 st.set_page_config(
-    page_title=f"Decision Tree Builder {APP_VERSION}",
+    page_title=f"Decision Tree Builder — {APP_VERSION}",
     page_icon="🌳",
     layout="wide",
 )
 
-# ---------- Session helpers ----------
-def ss_get(key, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-    return st.session_state[key]
+# ---------- Session state safety ----------
+for _k in ["current_sheet", "df", "save_mode"]:
+    if _k not in st.session_state:
+        st.session_state[_k] = None
 
-def ss_set(key, value):
-    st.session_state[key] = value
+# ---------- Sidebar ----------
+with st.sidebar:
+    if st.button("🔄 Reload app"):
+        st.rerun()
 
 
 # ---------- Mini metrics for header badge ----------
@@ -129,8 +130,8 @@ with left:
 with right:
     # Try to show a quick badge based on the first available sheet (Upload or Google Sheets workbook)
     badge_html = ""
-    wb_upload = ss_get("upload_workbook", {})
-    wb_gs     = ss_get("gs_workbook", {})
+    wb_upload = st.session_state.get("upload_workbook", {})
+    wb_gs     = st.session_state.get("gs_workbook", {})
     df0 = None
     if wb_upload:
         df0 = wb_upload[next(iter(wb_upload))]
@@ -195,15 +196,15 @@ with tabs[4]:
     if tab_triage and hasattr(tab_triage, "render"):
         # Get current DataFrame from session state
         current_df = None
-        wb_upload = ss_get("upload_workbook", {})
-        wb_gs = ss_get("gs_workbook", {})
+        wb_upload = st.session_state.get("upload_workbook", {})
+        wb_gs = st.session_state.get("gs_workbook", {})
         
         if wb_upload:
-            current_sheet = ss_get("current_sheet")
+            current_sheet = st.session_state.get("current_sheet")
             if current_sheet and current_sheet in wb_upload:
                 current_df = wb_upload[current_sheet]
         elif wb_gs:
-            current_sheet = ss_get("current_sheet")
+            current_sheet = st.session_state.get("current_sheet")
             if current_sheet and current_sheet in wb_gs:
                 current_df = wb_gs[current_sheet]
         
@@ -216,15 +217,15 @@ with tabs[5]:
     if tab_actions and hasattr(tab_actions, "render"):
         # Get current DataFrame from session state
         current_df = None
-        wb_upload = ss_get("upload_workbook", {})
-        wb_gs = ss_get("gs_workbook", {})
+        wb_upload = st.session_state.get("upload_workbook", {})
+        wb_gs = st.session_state.get("gs_workbook", {})
         
         if wb_upload:
-            current_sheet = ss_get("current_sheet")
+            current_sheet = st.session_state.get("current_sheet")
             if current_sheet and current_sheet in wb_upload:
                 current_df = wb_upload[current_sheet]
         elif wb_gs:
-            current_sheet = ss_get("current_sheet")
+            current_sheet = st.session_state.get("current_sheet")
             if current_sheet and current_sheet in wb_gs:
                 current_df = wb_gs[current_sheet]
         
@@ -262,7 +263,7 @@ with tabs[10]:
         tab_pushlog.render()
     else:
         st.subheader("📜 Push Log")
-        log = ss_get("push_log", [])
+        log = st.session_state.get("push_log", [])
         if not log:
             st.info("No pushes recorded this session.")
         else:
@@ -279,4 +280,4 @@ st.markdown(
 )
 
 # App version footer
-st.markdown("###### App version v6.4.2", unsafe_allow_html=True)
+st.markdown(f"---\nApp Version: **{APP_VERSION}**")

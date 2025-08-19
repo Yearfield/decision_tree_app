@@ -31,13 +31,10 @@ def _cached_conflict_summary(conf_map: Dict, level: Optional[int] = None) -> Lis
 
 # ----------------- session helpers -----------------
 
-def _ss_get(key, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-    return st.session_state[key]
+
 
 def _mark_session_edit(sheet: str, keyname: str):
-    ek = _ss_get("session_edited_keys", {})
+    ek = st.session_state.get("session_edited_keys", {})
     cur = set(ek.get(sheet, []))
     cur.add(keyname)
     ek[sheet] = list(cur)
@@ -51,9 +48,9 @@ def render():
 
     # Source + sheet selection
     sources = []
-    if _ss_get("upload_workbook", {}):
+    if st.session_state.get("upload_workbook", {}):
         sources.append("Upload workbook")
-    if _ss_get("gs_workbook", {}):
+    if st.session_state.get("gs_workbook", {}):
         sources.append("Google Sheets workbook")
     if not sources:
         st.info("ℹ️ Load a workbook first in the **Source** tab.")
@@ -61,10 +58,10 @@ def render():
 
     source = st.radio("Choose data source", sources, horizontal=True, key="conf_source_sel")
     if source == "Upload workbook":
-        wb = _ss_get("upload_workbook", {})
+        wb = st.session_state.get("upload_workbook", {})
         override_root = "branch_overrides_upload"
     else:
-        wb = _ss_get("gs_workbook", {})
+        wb = st.session_state.get("gs_workbook", {})
         override_root = "branch_overrides_gs"
 
     if not wb:
@@ -78,7 +75,7 @@ def render():
         return
 
     # Build store & conflicts
-    overrides_all = _ss_get(override_root, {})
+    overrides_all = st.session_state.get(override_root, {})
     overrides_sheet = overrides_all.get(sheet, {})
     store = build_store(df, overrides_sheet)
 
@@ -108,7 +105,7 @@ def render():
         st.success("✅ No conflicts found at the selected scope. 🎉")
 
     # Persisted expand state & focus handling to prevent UI jump
-    open_keys: List[Tuple[int, str]] = _ss_get("conflicts_open_keys", [])
+    open_keys: List[Tuple[int, str]] = st.session_state.get("conflicts_open_keys", [])
     focus_key = st.session_state.get("conflicts_focus_key")  # (level, parent_label) after save
 
     # Iterate conflict groups
@@ -127,7 +124,7 @@ def render():
     groups.sort(key=lambda g: (-len(g[2]), g[0], str(g[1])))
 
     # Presets store
-    presets_root = _ss_get("conflict_presets", {})  # {sheet: {(lvl,label): [list_of_sets]}}
+    presets_root = st.session_state.get("conflict_presets", {})  # {sheet: {(lvl,label): [list_of_sets]}}
     presets_sheet = presets_root.get(sheet, {})
 
     # Navigation helpers
@@ -183,12 +180,12 @@ def render():
                             _mark_session_edit(sheet, level_key_tuple(lvl, p))
 
                         # Persist overrides
-                        overrides_all = _ss_get(override_root, {})
+                        overrides_all = st.session_state.get(override_root, {})
                         overrides_all[sheet] = new_overrides
                         st.session_state[override_root] = overrides_all
 
                         # Auto-cascade with enhanced engine
-                        edited_keys_for_sheet = set(_ss_get("session_edited_keys", {}).get(sheet, []))
+                        edited_keys_for_sheet = set(st.session_state.get("session_edited_keys", {}).get(sheet, []))
                         df_new, tstats = build_raw_plus_v630(df, new_overrides, include_scope="session", edited_keys_for_sheet=edited_keys_for_sheet)
 
                         # Persist workbook
@@ -238,10 +235,10 @@ def render():
                                 parents_affected = parents_for_label_at_level(store, lvl, label, friendly_labels=True)
                                 for p in parents_affected:
                                     _mark_session_edit(sheet, level_key_tuple(lvl, p))
-                                overrides_all = _ss_get(override_root, {})
+                                overrides_all = st.session_state.get(override_root, {})
                                 overrides_all[sheet] = new_overrides
                                 st.session_state[override_root] = overrides_all
-                                edited_keys_for_sheet = set(_ss_get("session_edited_keys", {}).get(sheet, []))
+                                edited_keys_for_sheet = set(st.session_state.get("session_edited_keys", {}).get(sheet, []))
                                 df_new, tstats = build_raw_plus_v630(df, new_overrides, include_scope="session", edited_keys_for_sheet=edited_keys_for_sheet)
                                 wb[sheet] = df_new
                                 if source == "Upload workbook":
@@ -269,7 +266,7 @@ def render():
             add_key = f"conf_custom_add_{lvl}_{label}"
 
             options = list(union_children)
-            selected = _ss_get(sel_key, [])
+            selected = st.session_state.get(sel_key, [])
             selected = [x for x in selected if x in options]  # prune any stale values
 
             # Allow adding a new child label not present in union
@@ -307,12 +304,12 @@ def render():
                     _mark_session_edit(sheet, level_key_tuple(lvl, p))
 
                 # Persist overrides
-                overrides_all = _ss_get(override_root, {})
+                overrides_all = st.session_state.get(override_root, {})
                 overrides_all[sheet] = new_overrides
                 st.session_state[override_root] = overrides_all
 
                 # Auto-cascade
-                edited_keys_for_sheet = set(_ss_get("session_edited_keys", {}).get(sheet, []))
+                edited_keys_for_sheet = set(st.session_state.get("session_edited_keys", {}).get(sheet, []))
                 df_new, tstats = build_raw_plus_v630(df, new_overrides, include_scope="session", edited_keys_for_sheet=edited_keys_for_sheet)
 
                 # Persist workbook

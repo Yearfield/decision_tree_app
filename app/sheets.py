@@ -21,9 +21,11 @@ from typing import Optional
 
 
 @st.cache_resource(show_spinner=False, ttl=600)
-def get_gspread_client_from_secrets(secrets_dict: dict) -> gspread.Client:
+def get_gspread_client_from_secrets(_secrets_dict: dict) -> gspread.Client:
     """
     Create a gspread client using service account credentials from Streamlit secrets.
+    
+    Note: Leading underscore in `_secrets_dict` prevents Streamlit caching from trying to hash the secrets object, which would otherwise raise an error.
     """
     try:
         from google.oauth2.service_account import Credentials
@@ -33,7 +35,7 @@ def get_gspread_client_from_secrets(secrets_dict: dict) -> gspread.Client:
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
-        credentials = Credentials.from_service_account_info(secrets_dict, scopes=SCOPES)
+        credentials = Credentials.from_service_account_info(_secrets_dict, scopes=SCOPES)
 
         # Authorize gspread client
         client = gspread.authorize(credentials)

@@ -193,14 +193,11 @@ def _cascade_local(
 # Small session helpers
 # -----------------------------
 
-def _ss_get(key, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-    return st.session_state[key]
+
 
 
 def _mark_session_edit(sheet: str, keyname: str):
-    ek = _ss_get("session_edited_keys", {})
+    ek = st.session_state.get("session_edited_keys", {})
     cur = set(ek.get(sheet, []))
     cur.add(keyname)
     ek[sheet] = list(cur)
@@ -273,9 +270,9 @@ def render():
     ctx = st.session_state.get("work_context", {})
     default_src = {"upload": "Upload workbook", "gs": "Google Sheets workbook"}.get(ctx.get("source"))
     sources_avail = []
-    if _ss_get("upload_workbook", {}):
+    if st.session_state.get("upload_workbook", {}):
         sources_avail.append("Upload workbook")
-    if _ss_get("gs_workbook", {}):
+    if st.session_state.get("gs_workbook", {}):
         sources_avail.append("Google Sheets workbook")
 
     if not sources_avail:
@@ -285,11 +282,11 @@ def render():
     source = st.radio("Choose data source", sources_avail, horizontal=True, index=(sources_avail.index(default_src) if default_src in sources_avail else 0), key="sym_source_sel")
 
     if source == "Upload workbook":
-        wb = _ss_get("upload_workbook", {})
+        wb = st.session_state.get("upload_workbook", {})
         override_root = "branch_overrides_upload"
         current_source_code = "upload"
     else:
-        wb = _ss_get("gs_workbook", {})
+        wb = st.session_state.get("gs_workbook", {})
         override_root = "branch_overrides_gs"
         current_source_code = "gs"
 
@@ -309,7 +306,7 @@ def render():
         return
 
     # Build store (inferred + overrides)
-    overrides_all = _ss_get(override_root, {})
+    overrides_all = st.session_state.get(override_root, {})
     overrides_sheet = overrides_all.get(sheet, {})
     if _infer_with_overrides:
         store = _infer_with_overrides(df, overrides_sheet)
@@ -379,7 +376,7 @@ def render():
 
     # Undo control (session-wide)
     if st.button("↩️ Undo last edit in this tab"):
-        stack = _ss_get("undo_stack", [])
+        stack = st.session_state.get("undo_stack", [])
         if not stack:
             st.info("Nothing to undo.")
         else:
@@ -387,7 +384,7 @@ def render():
             st.session_state["undo_stack"] = stack
             if last.get("context") == "symptoms" and last.get("sheet") == sheet and last.get("override_root") == override_root:
                 # restore overrides & df snapshot
-                overrides_all = _ss_get(override_root, {})
+                overrides_all = st.session_state.get(override_root, {})
                 overrides_all[sheet] = last.get("overrides_sheet_before", {})
                 st.session_state[override_root] = overrides_all
                 if last.get("df_before") is not None:
@@ -409,7 +406,7 @@ def render():
         return
 
     # A place to remember which parent we just saved (to show a 👍)
-    saved_parents_marks: Set[str] = set(_ss_get("sym_saved_marks", set()))
+    saved_parents_marks: Set[str] = set(st.session_state.get("sym_saved_marks", set()))
 
     for parent_tuple, children, status in entries:
         keyname = level_key_tuple(level, parent_tuple)
@@ -493,7 +490,7 @@ def render():
                     fixed = build_final_values()
 
                     # Snapshot for undo
-                    stack = _ss_get("undo_stack", [])
+                    stack = st.session_state.get("undo_stack", [])
                     stack.append({
                         "context": "symptoms",
                         "override_root": override_root,
@@ -506,7 +503,7 @@ def render():
                     st.session_state["undo_stack"] = stack
 
                     # Update overrides
-                    overrides_all = _ss_get(override_root, {})
+                    overrides_all = st.session_state.get(override_root, {})
                     overrides_sheet = overrides_all.get(sheet, {}).copy()
                     overrides_sheet[keyname] = fixed
                     overrides_all[sheet] = overrides_sheet

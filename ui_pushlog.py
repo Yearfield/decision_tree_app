@@ -8,10 +8,7 @@ import pandas as pd
 import streamlit as st
 
 
-def _ss_get(key, default):
-    if key not in st.session_state:
-        st.session_state[key] = default
-    return st.session_state[key]
+
 
 
 def _normalize_log_df(items: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -72,7 +69,7 @@ def _normalize_log_df(items: List[Dict[str, Any]]) -> pd.DataFrame:
 def render():
     st.header("📜 Push Log")
 
-    log = _ss_get("push_log", [])
+    log = st.session_state.get("push_log", [])
 
     if not log:
         st.info("No pushes recorded this session.")
