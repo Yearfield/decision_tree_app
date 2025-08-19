@@ -18,6 +18,7 @@ from utils import (
     normalize_text, validate_headers,
     friendly_parent_label, level_key_tuple,
 )
+from ui_helpers import render_kpis, render_progress_bar, render_preview_caption, st_success, st_warning, st_error, st_info
 
 # Import logic functions if they exist
 try:
@@ -137,22 +138,16 @@ def render(df: pd.DataFrame):
     
     # Show KPIs prominently
     st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total rows", metrics["total"])
-    with col2:
-        st.metric("Filled triage", metrics["filled"])
-    with col3:
-        st.metric("Coverage %", f"{metrics['coverage_pct']}%")
+    render_kpis(metrics, columns=3)
     
     # Progress bar
-    st.progress(metrics["coverage_pct"]/100.0)
+    render_progress_bar(metrics["coverage_pct"]/100.0, "Triage Coverage")
     
     st.markdown("---")
     
     # Editor
     if filtered_df.empty:
-        st.info("ℹ️ No data matches the current filters.")
+        st_info("No data matches the current filters.")
         return
     
     # Limit to first 100 rows for performance
@@ -177,6 +172,9 @@ def render(df: pd.DataFrame):
         key="triage_editor"
     )
     
+    # Show preview caption
+    render_preview_caption(edit_df, filtered_df, max_rows=100)
+    
     # Save controls
     st.markdown("---")
     col1, col2 = st.columns([1, 1])
@@ -193,7 +191,7 @@ def render(df: pd.DataFrame):
     # Save to session button
     if st.button("💾 Save to session", key="triage_save_session"):
         if filtered_df.empty:
-            st.warning("⚠️ No data to save.")
+            st_warning("No data to save.")
             return
         
         # Get current work context
@@ -202,7 +200,7 @@ def render(df: pd.DataFrame):
         sheet_name = work_context.get("sheet")
         
         if not source or not sheet_name:
-            st.error("❌ No active sheet context. Please select a sheet first.")
+            st_error("No active sheet context. Please select a sheet first.")
             return
         
         # Update the underlying DataFrame
@@ -227,10 +225,10 @@ def render(df: pd.DataFrame):
                     
                     wb[sheet_name] = original_df
                     st.session_state["upload_workbook"] = wb
-                    st.success("✅ Triage data saved to session successfully!")
+                    st_success("Triage data saved to session successfully!")
                     st.rerun()
                 else:
-                    st.error("❌ Sheet not found in upload workbook.")
+                    st_error("Sheet not found in upload workbook.")
             elif source == "gs":
                 wb = st.session_state.get("gs_workbook", {})
                 if sheet_name in wb:
@@ -250,12 +248,12 @@ def render(df: pd.DataFrame):
                     
                     wb[sheet_name] = original_df
                     st.session_state["gs_workbook"] = wb
-                    st.success("✅ Triage data saved to session successfully!")
+                    st_success("Triage data saved to session successfully!")
                     st.rerun()
                 else:
-                    st.error("❌ Sheet not found in Google Sheets workbook.")
+                    st_error("Sheet not found in Google Sheets workbook.")
         except Exception as e:
-            st.error(f"❌ Error saving to session: {str(e)}")
+            st_error(f"Error saving to session: {str(e)}")
     
     # Push to Google Sheets button
     if HAVE_SHEETS and "gcp_service_account" in st.secrets:
@@ -263,7 +261,7 @@ def render(df: pd.DataFrame):
         if spreadsheet_id and sheet_name:
             if st.button("☁️ Push to Google Sheets", key="triage_push_gsheets"):
                 if filtered_df.empty:
-                    st.warning("⚠️ No data to push.")
+                    st_warning("No data to push.")
                     return
                 
                 try:
@@ -274,11 +272,11 @@ def render(df: pd.DataFrame):
                         # Get the full DataFrame for pushing
                         full_df = st.session_state.get("gs_workbook", {}).get(sheet_name, pd.DataFrame())
                         if full_df.empty:
-                            st.error("❌ No data available for pushing.")
+                            st_error("No data available for pushing.")
                             return
                         
                         write_dataframe(spreadsheet, sheet_name, full_df, mode=save_mode.lower())
-                        st.success("✅ Successfully pushed to Google Sheets!")
+                        st_success("Successfully pushed to Google Sheets!")
                         st.rerun()
                 except Exception as e:
-                    st.error(f"❌ Error pushing to Google Sheets: {str(e)}")
+                    st_error(f"Error pushing to Google Sheets: {str(e)}")

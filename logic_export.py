@@ -33,11 +33,7 @@ except Exception:  # pragma: no cover
 
 
 # ===== Canonical schema =====
-CANON_HEADERS = [
-    "Vital Measurement", "Node 1", "Node 2", "Node 3", "Node 4", "Node 5",
-    "Diagnostic Triage", "Actions",
-]
-LEVEL_COLS = ["Node 1", "Node 2", "Node 3", "Node 4", "Node 5"]
+from constants import CANON_HEADERS, LEVEL_COLS
 
 
 # ===== Basic helpers =====

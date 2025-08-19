@@ -14,6 +14,7 @@ from utils import (
     normalize_text, validate_headers, friendly_parent_label,
     level_key_tuple, order_decision_tree,
 )
+from ui_helpers import render_preview_caption, st_success, st_warning, st_error, st_info
 
 # Import validation logic functions
 try:
@@ -278,6 +279,12 @@ def _render_empty_branches(empty_branches: List[Dict[str, Any]]):
 def render():
     st.header("🔎 Validation")
 
+    # Get DataFrame from session state
+    df = st.session_state.get("current_df", pd.DataFrame())
+    if df.empty:
+        st.warning("⚠️ No data loaded. Please load a sheet in the Workspace tab.")
+        return
+
     # Choose data source
     sources = []
     if st.session_state.get("upload_workbook", {}):
@@ -286,7 +293,7 @@ def render():
         sources.append("Google Sheets workbook")
 
     if not sources:
-        st.info("ℹ️ Load a workbook first in the **Source** tab.")
+        st_info("Load a workbook first in the **Source** tab.")
         return
 
     source = st.radio("Choose data source", sources, horizontal=True, key="val_source_sel")
@@ -299,14 +306,14 @@ def render():
         override_root = "branch_overrides_gs"
 
     if not wb:
-        st.warning("⚠️ No sheets found in the selected source.")
+        st_warning("No sheets found in the selected source.")
         return
 
     # Sheet selector
     sheet = st.selectbox("Sheet", list(wb.keys()), key="val_sheet_sel")
     df = wb.get(sheet, pd.DataFrame())
     if df.empty or not validate_headers(df):
-        st.info("ℹ️ Selected sheet is empty or headers mismatch.")
+        st_info("Selected sheet is empty or headers mismatch.")
         return
 
     # Options
@@ -330,7 +337,7 @@ def render():
         st.session_state["val_run_requested"] = True
 
     if not st.session_state.get("val_run_requested", True):
-        st.info("ℹ️ Click **Run validation** to generate the report.")
+        st_info("Click **Run validation** to generate the report.")
         return
 
     # Compute report
@@ -341,10 +348,10 @@ def render():
         missing_rf = report.get("missing_red_flags", []) if chk_rf else []
         empty_branches = report.get("empty_branches", []) if chk_eb else []
     except AssertionError as e:
-        st.error(f"❌ {str(e)}")
+        st_error(f"{str(e)}")
         return
     except Exception as e:
-        st.error(f"❌ Validation failed: {e}")
+        st_error(f"Validation failed: {e}")
         return
 
     # Summary chips

@@ -16,13 +16,9 @@ import numpy as np
 
 # ========= Canonical schema & settings =========
 
-APP_VERSION_DEFAULT = "v6.3.0"
+from constants import CANON_HEADERS, LEVEL_COLS
 
-CANON_HEADERS: List[str] = [
-    "Vital Measurement", "Node 1", "Node 2", "Node 3", "Node 4", "Node 5",
-    "Diagnostic Triage", "Actions",
-]
-LEVEL_COLS: List[str] = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
+APP_VERSION_DEFAULT = "v6.3.0"
 MAX_LEVELS: int = 5
 
 # Friendly wording for the root parent label (Node 1 parents)
@@ -447,6 +443,6 @@ def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
     """
     if df.empty:
         return (0, 0)
-    nodes = df[LEVEL_COLS].applymap(normalize_text)
+    nodes = df[LEVEL_COLS].map(lambda col: col.map(normalize_text))
     full = nodes.ne("").all(axis=1)
     return int(full.sum()), int(len(df))

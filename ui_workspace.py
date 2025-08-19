@@ -21,6 +21,7 @@ from utils import (
     friendly_parent_label, level_key_tuple, enforce_k_five,
     order_decision_tree,
 )
+from ui_helpers import render_preview_caption, st_success, st_warning, st_error, st_info
 
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -89,7 +90,7 @@ def render():
         sources.append("Google Sheets workbook")
 
     if not sources:
-        st.info("ℹ️ Load a workbook in the **Source** tab first (upload file or Google Sheets).")
+        st_info("Load a workbook in the **Source** tab first (upload file or Google Sheets).")
         return
 
     # Default from work_context if available
@@ -109,7 +110,7 @@ def render():
         current_source_code = "gs"
 
     if not wb_ws:
-        st.warning("⚠️ No sheets found in the selected source. Load data from the **Source** tab.")
+        st_warning("No sheets found in the selected source. Load data from the **Source** tab.")
         return
 
     # Sheet picker (default to context if present)
@@ -121,10 +122,14 @@ def render():
 
     # Remember current work context for other tabs
     st.session_state["work_context"] = {"source": current_source_code, "sheet": sheet_ws}
+    
+    # Propagate current DataFrame to session state for downstream tabs
+    st.session_state["current_df"] = df_ws
+    st.info(f"ℹ️ current_df updated with {len(df_ws)} rows")
 
     # ===== Summary + Preview =====
     if df_ws.empty or not validate_headers(df_ws):
-        st.info("ℹ️ Selected sheet is empty or headers mismatch.")
+        st_info("Selected sheet is empty or headers mismatch.")
     else:
         st.write(f"Found {len(wb_ws)} sheet(s). Choose one to process:")
 
@@ -142,19 +147,19 @@ def render():
         try:
             df_ws_ordered = order_decision_tree(df_ws)
             if not df_ws_ordered.equals(df_ws):
-                st.info("ℹ️ Data displayed in logical tree order (parents followed by children)")
+                st_info("Data displayed in logical tree order (parents followed by children)")
         except Exception as e:
-            st.warning(f"⚠️ Could not apply tree ordering: {e}")
+            st_warning(f"Could not apply tree ordering: {e}")
             df_ws_ordered = df_ws
         
         total_rows = len(df_ws_ordered)
         st.markdown("#### Preview (50 rows)")
         if total_rows <= 50:
-            st.caption(f"Showing all {total_rows} rows.")
             st.dataframe(df_ws_ordered, use_container_width=True)
+            render_preview_caption(df_ws_ordered, df_ws_ordered, max_rows=50)
         elif total_rows <= 100:
-            st.caption(f"Showing first 100 rows of {total_rows} total rows.")
             st.dataframe(df_ws_ordered.head(100), use_container_width=True)
+            render_preview_caption(df_ws_ordered.head(100), df_ws_ordered, max_rows=100)
         else:
             state_key = f"preview_start_{sheet_ws}"
             start_idx = int(st.session_state.get(state_key, 0))
@@ -178,8 +183,8 @@ def render():
                     start_idx = min(max(0, total_rows - 50), start_idx + 50)
             st.session_state[state_key] = start_idx
             end_idx = min(start_idx + 50, total_rows)
-            st.caption(f"Showing rows **{start_idx+1}–{end_idx}** of **{total_rows}**.")
             st.dataframe(df_ws_ordered.iloc[start_idx:end_idx], use_container_width=True)
+            render_preview_caption(df_ws_ordered.iloc[start_idx:end_idx], df_ws_ordered, max_rows=50)
 
     st.markdown("---")
 

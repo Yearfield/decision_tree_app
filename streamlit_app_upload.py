@@ -64,7 +64,7 @@ def compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
 def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
     if df.empty:
         return (0,0)
-    nodes = df[LEVEL_COLS].applymap(normalize_text)
+    nodes = df[LEVEL_COLS].map(lambda col: col.map(normalize_text))
     full = nodes.ne("").all(axis=1)
     return int(full.sum()), int(len(df))
 

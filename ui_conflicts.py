@@ -13,6 +13,7 @@ from utils import (
     CANON_HEADERS, LEVEL_COLS, MAX_LEVELS,
     normalize_text, validate_headers, enforce_k_five, level_key_tuple, friendly_parent_label,
 )
+from ui_helpers import render_preview_caption, st_success, st_warning, st_error, st_info
 from logic_conflicts import (
     build_store, compute_conflicts, conflict_summary,
     resolve_keep_set_for_all, resolve_custom_set_for_all,
@@ -50,6 +51,12 @@ def _mark_session_edit(sheet: str, keyname: str):
 def render():
     st.header("⚖️ Conflicts Inspector")
 
+    # Get DataFrame from session state
+    df = st.session_state.get("current_df", pd.DataFrame())
+    if df.empty:
+        st.warning("⚠️ No data loaded. Please load a sheet in the Workspace tab.")
+        return
+
     # Source + sheet selection
     sources = []
     if st.session_state.get("upload_workbook", {}):
@@ -57,7 +64,7 @@ def render():
     if st.session_state.get("gs_workbook", {}):
         sources.append("Google Sheets workbook")
     if not sources:
-        st.info("ℹ️ Load a workbook first in the **Source** tab.")
+        st_info("Load a workbook first in the **Source** tab.")
         return
 
     source = st.radio("Choose data source", sources, horizontal=True, key="conf_source_sel")
@@ -69,13 +76,13 @@ def render():
         override_root = "branch_overrides_gs"
 
     if not wb:
-        st.warning("⚠️ No sheets found in the selected source.")
+        st_warning("No sheets found in the selected source.")
         return
 
     sheet = st.selectbox("Sheet", list(wb.keys()), key="conf_sheet_sel")
     df = wb.get(sheet, pd.DataFrame())
     if df.empty or not validate_headers(df):
-        st.info("ℹ️ Selected sheet is empty or headers mismatch.")
+        st_info("Selected sheet is empty or headers mismatch.")
         return
 
     # Build store & conflicts
@@ -101,12 +108,13 @@ def render():
     if summary_rows:
         df_summary = pd.DataFrame(summary_rows)
         st.dataframe(df_summary.head(100), use_container_width=True, height=220)
+        render_preview_caption(df_summary.head(100), df_summary, max_rows=100)
         st.download_button("Download conflict summary (CSV)",
                            data=df_summary.to_csv(index=False).encode("utf-8"),
                            file_name=f"{sheet}_conflicts_summary.csv",
                            mime="text/csv")
     else:
-        st.success("✅ No conflicts found at the selected scope. 🎉")
+        st_success("No conflicts found at the selected scope. 🎉")
 
     # Persisted expand state & focus handling to prevent UI jump
     open_keys: List[Tuple[int, str]] = st.session_state.get("conflicts_open_keys", [])
