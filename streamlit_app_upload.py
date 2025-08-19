@@ -6,6 +6,8 @@ import io
 import importlib
 import traceback
 import types
+import time
+import json
 
 import numpy as np
 import pandas as pd
@@ -27,6 +29,37 @@ st.set_page_config(
 
 # ---------- Debug mode toggle ----------
 st.sidebar.checkbox("🐞 Debug mode", value=False, key="__debug")
+
+# ---------- Render-cycle watchdog ----------
+now = time.time()
+rc = st.session_state.get("__render_count", 0) + 1
+last = st.session_state.get("__last_render_ts", 0.0)
+hist = st.session_state.get("__render_hist", [])
+hist = (hist + [now])[-20:]
+
+st.session_state["__render_count"] = rc
+st.session_state["__last_render_ts"] = now
+st.session_state["__render_hist"] = hist
+
+# If >10 renders in 5 seconds, show SOS panel
+recent = [t for t in hist if now - t <= 5.0]
+if len(recent) > 10:
+    st.error("🚨 Potential rerun loop detected (10+ renders in 5s). Showing diagnostics.")
+    with st.expander("Diagnostics", expanded=True):
+        ctx = st.session_state.get("work_context", {})
+        upk = list(st.session_state.get("upload_workbook", {}).keys())[:5]
+        gsk = list(st.session_state.get("gs_workbook", {}).keys())[:5]
+        st.write({
+            "render_count": rc,
+            "recent_5s": len(recent),
+            "work_context": ctx,
+            "upload_keys_sample": upk,
+            "gs_keys_sample": gsk,
+        })
+    # Soft-stop heavy rendering this cycle:
+    st.session_state["__freeze_heavy_tabs"] = True
+else:
+    st.session_state["__freeze_heavy_tabs"] = False
 
 # ---------- Session state safety ----------
 for _k in ["current_sheet", "df", "save_mode"]:

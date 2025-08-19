@@ -310,6 +310,11 @@ def _render_empty_branches(empty_branches: List[Dict[str, Any]]):
 
 def render():
     st.header("🔎 Validation")
+    
+    # Heavy tab freeze guard
+    if st.session_state.get("__freeze_heavy_tabs"):
+        st.warning("⏸️ Heavy tab rendering paused due to suspected rerun loop. Toggle off in a few seconds or use the sidebar to reload.")
+        st.stop()
 
     # Get DataFrame using shared helper
     df, sheet_name, source_code = get_current_df_and_sheet()

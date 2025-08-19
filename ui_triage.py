@@ -110,6 +110,11 @@ def render(df: pd.DataFrame):
     """
     st.header("🩺 Diagnostic Triage")
     
+    # Heavy tab freeze guard
+    if st.session_state.get("__freeze_heavy_tabs"):
+        st.warning("⏸️ Heavy tab rendering paused due to suspected rerun loop. Toggle off in a few seconds or use the sidebar to reload.")
+        st.stop()
+    
     if df is None or df.empty:
         st.warning("⚠️ No decision tree data loaded. Please upload or connect to a sheet.")
         return

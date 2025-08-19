@@ -328,3 +328,57 @@ def _mark_session_edit(sheet: str, keyname: str):
 
     # Persist expand state list
     st.session_state["conflicts_open_keys"] = open_keys
+
+def render():
+    """Render the Conflicts Inspector tab."""
+    st.header("⚖️ Conflicts Inspector")
+    
+    # Heavy tab freeze guard
+    if st.session_state.get("__freeze_heavy_tabs"):
+        st.warning("⏸️ Heavy tab rendering paused due to suspected rerun loop. Toggle off in a few seconds or use the sidebar to reload.")
+        st.stop()
+    
+    # Get DataFrame using shared helper
+    df, sheet_name, source_code = get_current_df_and_sheet()
+    if df is None or df.empty or not validate_headers(df):
+        st_warning("⚠️ No data loaded. Please load a sheet in the **Workspace** tab.")
+        if st.session_state.get("__debug"):
+            ctx = st.session_state.get("work_context", {})
+            st.caption(f"🔎 ctx={ctx} · upload={len(st.session_state.get('upload_workbook', {}))} sheets · gs={len(st.session_state.get('gs_workbook', {}))} sheets")
+        st.stop()
+    
+    # Determine override root based on source
+    override_root = "branch_overrides_edit" if source_code == "upload" else "branch_overrides_gs"
+    
+    # Build store & conflicts
+    overrides_all = st.session_state.get(override_root, {})
+    overrides_sheet = overrides_all.get(sheet_name, {})
+    store = build_store(df, overrides_sheet)
+    
+    # Filters
+    colf1, colf2, colf3, colf4 = st.columns([1, 1, 2, 1])
+    with colf1:
+        level_filter = st.selectbox("Node", ["All", 1, 2, 3, 4, 5], key="conf_level_filter")
+    with colf2:
+        only_conflicts = st.checkbox("Only items with conflicts", value=True, key="conf_only_conf")
+    with colf3:
+        search = str(st.text_input("Search parent label", key="conf_search")).strip().lower()
+    with colf4:
+        exp_all_toggle = st.checkbox("Expand all", value=False, key="conf_expand_all_toggle")
+    
+    conf_map = _cached_compute_conflicts(store, friendly_labels=True)
+    # Build summary
+    summary_rows = _cached_conflict_summary(conf_map, level=None if level_filter == "All" else level_filter)
+    # Dataframe for export
+    if summary_rows:
+        df_summary = pd.DataFrame(summary_rows)
+        st.dataframe(df_summary.head(100), use_container_width=True, height=200)
+        render_preview_caption(df_summary.head(100), df_summary, max_rows=100)
+        st.download_button("Download conflict summary (CSV)",
+                           data=df_summary.to_csv(index=False).encode("utf-8"),
+                           file_name=f"{sheet_name}_conflicts_summary.csv",
+                           mime="text/csv")
+    else:
+        st_success("No conflicts found at the selected scope. 🎉")
+    
+    st.caption("Tip: Use the filters above to focus on specific conflict areas.")
