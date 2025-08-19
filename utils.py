@@ -436,13 +436,17 @@ def compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
 
 def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
     """
-    Compute how many rows have complete paths (all Node columns filled).
-    
-    Returns:
-        Tuple[int, int]: (complete_count, total_count) where complete_count is rows with full paths
+    Rows with 'full path' = all LEVEL_COLS non-empty (after normalization).
+    Robust to missing columns and avoids deprecated applymap.
     """
-    if df.empty:
+    if df is None or df.empty:
         return (0, 0)
-    nodes = df[LEVEL_COLS].map(lambda col: col.map(normalize_text))
+
+    # Ensure all level columns exist; missing ones are treated as blanks
+    nodes = (
+        df.reindex(columns=LEVEL_COLS, fill_value="")
+          .astype(str)
+          .apply(lambda col: col.map(normalize_text))
+    )
     full = nodes.ne("").all(axis=1)
     return int(full.sum()), int(len(df))
