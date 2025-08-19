@@ -14,8 +14,7 @@ from utils import (
     normalize_text, validate_headers,
     infer_branch_options,  # used for header badge
 )
-
-APP_VERSION = "v6.5.1"
+from constants import APP_VERSION, TAB_ICONS
 
 st.set_page_config(
     page_title=f"Decision Tree Builder — {APP_VERSION}",

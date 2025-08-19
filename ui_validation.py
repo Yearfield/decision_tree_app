@@ -1,5 +1,9 @@
 # ui_validation.py
 
+# TODO[Step10]: UX consistency pass:
+# - Standardize header icon text, KPI row, and Save/Push controls
+# - Ensure previews cap at .head(100) and metrics are cached
+
 from typing import Dict, List, Tuple, Any
 import pandas as pd
 import numpy as np

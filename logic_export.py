@@ -13,6 +13,9 @@ GCP service account credentials from st.secrets["gcp_service_account"].
 
 # TODO Step 9: Implement branch grouping so Node 1 children are displayed/exported consecutively.
 
+# TODO[Step10]: Implement export audit logging (sheet name, row count, timestamp, app version).
+# Consider a helper: audit_export_event(details: dict) -> None
+
 from __future__ import annotations
 
 import io

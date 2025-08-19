@@ -98,6 +98,13 @@ def detect_orphan_nodes(df: pd.DataFrame) -> List[Dict[str, Any]]:
                     })
         
         return orphan_nodes
+
+
+# TODO[Step10]: Add advanced validation heuristics:
+# - duplicate node detection (same label across conflicting contexts)
+# - deeper circular references
+# - dangling red flags (referenced but undefined)
+# Provide structured dict outputs for UI consumption.
     except Exception:
         return []
 

@@ -157,12 +157,12 @@ def create_worksheet(spreadsheet: gspread.Spreadsheet, title: str, rows: int = 1
 
 
 @st.cache_data(show_spinner=False, ttl=600)
-def read_worksheet(spreadsheet: gspread.Spreadsheet, title: str) -> pd.DataFrame:
+def read_worksheet(_spreadsheet: gspread.Spreadsheet, title: str) -> pd.DataFrame:
     """
     Read a worksheet and return its data as a pandas DataFrame.
     
     Args:
-        spreadsheet: The spreadsheet object
+        _spreadsheet: The spreadsheet object (private to avoid cache hashing)
         title: Name of the worksheet to read
         
     Returns:
@@ -174,7 +174,7 @@ def read_worksheet(spreadsheet: gspread.Spreadsheet, title: str) -> pd.DataFrame
     """
     try:
         # Get the worksheet
-        worksheet = spreadsheet.worksheet(title)
+        worksheet = _spreadsheet.worksheet(title)
         
         # Read data using gspread_dataframe
         df = get_as_dataframe(worksheet, evaluate_formulas=True)
@@ -201,12 +201,12 @@ def read_worksheet(spreadsheet: gspread.Spreadsheet, title: str) -> pd.DataFrame
 
 
 @st.cache_data(show_spinner=False, ttl=600)
-def read_worksheet_with_canonical_headers(spreadsheet: gspread.Spreadsheet, title: str, canonical_headers: list[str]) -> pd.DataFrame:
+def read_worksheet_with_canonical_headers(_spreadsheet: gspread.Spreadsheet, title: str, canonical_headers: list[str]) -> pd.DataFrame:
     """
     Read a worksheet and return DataFrame with canonical headers (for decision tree app).
     
     Args:
-        spreadsheet: The spreadsheet object
+        _spreadsheet: The spreadsheet object (private to avoid cache hashing)
         title: Name of the worksheet to read
         canonical_headers: List of required column headers
         
@@ -219,7 +219,7 @@ def read_worksheet_with_canonical_headers(spreadsheet: gspread.Spreadsheet, titl
     """
     try:
         # Get the worksheet
-        worksheet = spreadsheet.worksheet(title)
+        worksheet = _spreadsheet.worksheet(title)
         
         # Get raw values to handle header normalization
         values = worksheet.get_all_values()

@@ -1,5 +1,9 @@
 # ui_actions.py
 
+# TODO[Step10]: UX consistency pass:
+# - Standardize header icon text, KPI row, and Save/Push controls
+# - Ensure previews cap at .head(100) and metrics are cached
+
 import io
 import json
 from typing import Dict, List, Tuple, Optional, Set, Any
