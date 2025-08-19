@@ -126,6 +126,11 @@ def render():
     # Propagate current DataFrame to session state for downstream tabs
     st.session_state["current_df"] = df_ws
     st.info(f"ℹ️ current_df updated with {len(df_ws)} rows")
+    
+    # Optional tiny debug banner
+    st.caption(f"🔎 ctx: source={current_source_code}, sheet={sheet_ws} · "
+               f"upload_keys={list(st.session_state.get('upload_workbook', {}).keys())[:3]} · "
+               f"gs_keys={list(st.session_state.get('gs_workbook', {}).keys())[:3]}")
 
     # ===== Summary + Preview =====
     if df_ws.empty or not validate_headers(df_ws):

@@ -27,6 +27,13 @@ for _k in ["current_sheet", "df", "save_mode"]:
     if _k not in st.session_state:
         st.session_state[_k] = None
 
+# ---------- Default context initialization ----------
+if "work_context" not in st.session_state:
+    # Best-effort default: pick first available sheet automatically
+    from utils import get_current_df_and_sheet
+    _df0, _name0, _src0 = get_current_df_and_sheet()
+    # (get_current_df_and_sheet will set work_context if anything is available)
+
 # ---------- Sidebar ----------
 with st.sidebar:
     if st.button("🔄 Reload app"):

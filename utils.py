@@ -450,3 +450,48 @@ def compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
     )
     full = nodes.ne("").all(axis=1)
     return int(full.sum()), int(len(df))
+
+
+# ========= UI Helper Functions (Streamlit-dependent) =========
+
+def get_current_df_and_sheet() -> Tuple[Optional[pd.DataFrame], Optional[str], Optional[str]]:
+    """
+    Returns (df, sheet_name, source_code) where source_code is 'upload' or 'gs'.
+    Falls back to the first available sheet in either workbook when context is missing.
+    
+    Note: This function requires Streamlit and should only be imported by UI modules.
+    """
+    import streamlit as st
+    
+    ctx = st.session_state.get("work_context", {}) or {}
+    src = ctx.get("source")
+    sheet = ctx.get("sheet")
+
+    def _pick_first(wb: dict) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        if not isinstance(wb, dict) or not wb:
+            return None, None
+        for name, dfx in wb.items():
+            if isinstance(dfx, pd.DataFrame):
+                return dfx, name
+        return None, None
+
+    # try explicit context first
+    if src in ("upload", "gs") and isinstance(sheet, str):
+        wb = st.session_state.get("upload_workbook", {}) if src == "upload" else st.session_state.get("gs_workbook", {})
+        if isinstance(wb, dict) and sheet in wb:
+            return wb[sheet], sheet, src
+
+    # fallback: choose the first available sheet, preferring upload then gs
+    wb_u = st.session_state.get("upload_workbook", {})
+    df_u, name_u = _pick_first(wb_u)
+    if df_u is not None:
+        st.session_state["work_context"] = {"source": "upload", "sheet": name_u}
+        return df_u, name_u, "upload"
+
+    wb_g = st.session_state.get("gs_workbook", {})
+    df_g, name_g = _pick_first(wb_g)
+    if df_g is not None:
+        st.session_state["work_context"] = {"source": "gs", "sheet": name_g}
+        return df_g, name_g, "gs"
+
+    return None, None, None

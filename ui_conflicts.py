@@ -12,6 +12,7 @@ import streamlit as st
 from utils import (
     CANON_HEADERS, LEVEL_COLS, MAX_LEVELS,
     normalize_text, validate_headers, enforce_k_five, level_key_tuple, friendly_parent_label,
+    get_current_df_and_sheet,
 )
 from ui_helpers import render_preview_caption, st_success, st_warning, st_error, st_info
 from logic_conflicts import (
@@ -48,46 +49,22 @@ def _mark_session_edit(sheet: str, keyname: str):
 
 # ----------------- UI: Conflicts Inspector -----------------
 
-def render():
-    st.header("⚖️ Conflicts Inspector")
-
-    # Get DataFrame from session state
-    df = st.session_state.get("current_df", pd.DataFrame())
-    if df.empty:
-        st.warning("⚠️ No data loaded. Please load a sheet in the Workspace tab.")
+    # Get DataFrame using shared helper
+    df, sheet_name, source_code = get_current_df_and_sheet()
+    if df is None or df.empty or not validate_headers(df):
+        st_warning("No data loaded. Please load a sheet in the **Workspace** tab.")
+        # Optional micro-debug
+        ctx = st.session_state.get("work_context", {})
+        st.caption(f"🔎 ctx={ctx} · upload={len(st.session_state.get("upload_workbook", {}))} sheets · "
+                   f"gs={len(st.session_state.get("gs_workbook", {}))} sheets")
         return
 
-    # Source + sheet selection
-    sources = []
-    if st.session_state.get("upload_workbook", {}):
-        sources.append("Upload workbook")
-    if st.session_state.get("gs_workbook", {}):
-        sources.append("Google Sheets workbook")
-    if not sources:
-        st_info("Load a workbook first in the **Source** tab.")
-        return
-
-    source = st.radio("Choose data source", sources, horizontal=True, key="conf_source_sel")
-    if source == "Upload workbook":
-        wb = st.session_state.get("upload_workbook", {})
-        override_root = "branch_overrides_upload"
-    else:
-        wb = st.session_state.get("gs_workbook", {})
-        override_root = "branch_overrides_gs"
-
-    if not wb:
-        st_warning("No sheets found in the selected source.")
-        return
-
-    sheet = st.selectbox("Sheet", list(wb.keys()), key="conf_sheet_sel")
-    df = wb.get(sheet, pd.DataFrame())
-    if df.empty or not validate_headers(df):
-        st_info("Selected sheet is empty or headers mismatch.")
-        return
+    # Determine override root based on source
+    override_root = "branch_overrides_edit" if source_code == "upload" else "branch_overrides_gs"
 
     # Build store & conflicts
     overrides_all = st.session_state.get(override_root, {})
-    overrides_sheet = overrides_all.get(sheet, {})
+    overrides_sheet = overrides_all.get(sheet_name, {})
     store = build_store(df, overrides_sheet)
 
     # Filters

@@ -311,18 +311,42 @@ def _render_empty_branches(empty_branches: List[Dict[str, Any]]):
 def render():
     st.header("🔎 Validation")
 
-    # Get DataFrame using shared helper
-    df, sheet_name, source_code = get_current_df_and_sheet()
-    if df is None or df.empty or not validate_headers(df):
-        st_warning("No data loaded. Please load a sheet in the **Workspace** tab.")
-        # Optional micro-debug
-        ctx = st.session_state.get("work_context", {})
-        st.caption(f"🔎 ctx={ctx} · upload={len(st.session_state.get("upload_workbook", {}))} sheets · "
-                   f"gs={len(st.session_state.get("gs_workbook", {}))} sheets")
+    # Get DataFrame from session state
+    df = st.session_state.get("current_df", pd.DataFrame())
+    if df.empty:
+        st.warning("⚠️ No data loaded. Please load a sheet in the Workspace tab.")
         return
 
-    # Determine override root based on source
-    override_root = "branch_overrides_upload" if source_code == "upload" else "branch_overrides_gs"
+    # Choose data source
+    sources = []
+    if st.session_state.get("upload_workbook", {}):
+        sources.append("Upload workbook")
+    if st.session_state.get("gs_workbook", {}):
+        sources.append("Google Sheets workbook")
+
+    if not sources:
+        st_info("Load a workbook first in the **Source** tab.")
+        return
+
+    source = st.radio("Choose data source", sources, horizontal=True, key="val_source_sel")
+
+    if source == "Upload workbook":
+        wb = st.session_state.get("upload_workbook", {})
+        override_root = "branch_overrides_upload"
+    else:
+        wb = st.session_state.get("gs_workbook", {})
+        override_root = "branch_overrides_gs"
+
+    if not wb:
+        st_warning("No sheets found in the selected source.")
+        return
+
+    # Sheet selector
+    sheet = st.selectbox("Sheet", list(wb.keys()), key="val_sheet_sel")
+    df = wb.get(sheet, pd.DataFrame())
+    if df.empty or not validate_headers(df):
+        st_info("Selected sheet is empty or headers mismatch.")
+        return
 
     # Options
     st.markdown("#### Checks to run")
@@ -337,7 +361,7 @@ def render():
         chk_eb = st.checkbox("Empty branches", value=True, key="val_chk_eb")
 
     # Pull overrides + symptom quality map
-    overrides_sheet = st.session_state.get(override_root, {}).get(sheet_name, {})
+    overrides_sheet = st.session_state.get(override_root, {}).get(sheet, {})
     quality_map = st.session_state.get("symptom_quality", {})  # {symptom: "Red Flag"|"Normal"}
 
     st.markdown("---")
