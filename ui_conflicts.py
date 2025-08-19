@@ -52,12 +52,12 @@ def _mark_session_edit(sheet: str, keyname: str):
     # Get DataFrame using shared helper
     df, sheet_name, source_code = get_current_df_and_sheet()
     if df is None or df.empty or not validate_headers(df):
-        st_warning("No data loaded. Please load a sheet in the **Workspace** tab.")
-        # Optional micro-debug
-        ctx = st.session_state.get("work_context", {})
-        st.caption(f"🔎 ctx={ctx} · upload={len(st.session_state.get("upload_workbook", {}))} sheets · "
-                   f"gs={len(st.session_state.get("gs_workbook", {}))} sheets")
-        return
+        st_warning("⚠️ No data loaded. Please load a sheet in the **Workspace** tab.")
+        if st.session_state.get("__debug"):
+            ctx = st.session_state.get("work_context", {})
+            st.caption(f"🔎 ctx={ctx} · upload={len(st.session_state.get('upload_workbook', {}))} sheets · "
+                       f"gs={len(st.session_state.get('gs_workbook', {}))} sheets")
+        st.stop()
 
     # Determine override root based on source
     override_root = "branch_overrides_edit" if source_code == "upload" else "branch_overrides_gs"

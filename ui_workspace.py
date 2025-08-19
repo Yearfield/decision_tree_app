@@ -120,17 +120,22 @@ def render():
     sheet_ws = st.selectbox("Sheet", sheet_names, index=sheet_idx, key="ws_sheet_sel")
     df_ws = wb_ws.get(sheet_ws, pd.DataFrame())
 
-    # Remember current work context for other tabs
-    st.session_state["work_context"] = {"source": current_source_code, "sheet": sheet_ws}
+    # Remember current work context for other tabs (only when it changes)
+    new_ctx = {"source": current_source_code, "sheet": sheet_ws}
+    if st.session_state.get("work_context") != new_ctx:
+        st.session_state["work_context"] = new_ctx
+        # Optional: immediate refresh after explicit user selection only:
+        # st.rerun()
     
     # Propagate current DataFrame to session state for downstream tabs
     st.session_state["current_df"] = df_ws
     st.info(f"ℹ️ current_df updated with {len(df_ws)} rows")
     
-    # Optional tiny debug banner
-    st.caption(f"🔎 ctx: source={current_source_code}, sheet={sheet_ws} · "
-               f"upload_keys={list(st.session_state.get('upload_workbook', {}).keys())[:3]} · "
-               f"gs_keys={list(st.session_state.get('gs_workbook', {}).keys())[:3]}")
+    # Optional tiny debug banner (shows only if Debug mode is on)
+    if st.session_state.get("__debug"):
+        upk = list(st.session_state.get("upload_workbook", {}).keys())[:3]
+        gsk = list(st.session_state.get("gs_workbook", {}).keys())[:3]
+        st.caption(f"🔎 ctx={st.session_state.get('work_context')} · upload_keys={upk} · gs_keys={gsk}")
 
     # ===== Summary + Preview =====
     if df_ws.empty or not validate_headers(df_ws):

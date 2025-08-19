@@ -3,6 +3,9 @@
 from typing import Dict, List, Tuple, Optional, Set
 from datetime import datetime
 import io
+import importlib
+import traceback
+import types
 
 import numpy as np
 import pandas as pd
@@ -22,6 +25,9 @@ st.set_page_config(
     layout="wide",
 )
 
+# ---------- Debug mode toggle ----------
+st.sidebar.checkbox("🐞 Debug mode", value=False, key="__debug")
+
 # ---------- Session state safety ----------
 for _k in ["current_sheet", "df", "save_mode"]:
     if _k not in st.session_state:
@@ -33,6 +39,15 @@ if "work_context" not in st.session_state:
     from utils import get_current_df_and_sheet
     _df0, _name0, _src0 = get_current_df_and_sheet()
     # (get_current_df_and_sheet will set work_context if anything is available)
+
+# ---------- Robust safe-import system ----------
+def _safe_import(mod_name: str):
+    try:
+        mod = importlib.import_module(mod_name)
+        return mod, None
+    except Exception as e:
+        tb = traceback.format_exc()
+        return None, f"{e.__class__.__name__}: {e}\n{tb}"
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -108,25 +123,43 @@ def progress_badge_html(df: pd.DataFrame) -> str:
     return html
 
 
-# ---------- Import UI modules (with graceful fallbacks) ----------
-def _safe_import(modname: str):
-    try:
-        return __import__(modname)
-    except Exception as e:
-        st.warning(f"Module `{modname}` not found or failed to import: {e}")
-        return None
+# ---------- Import UI modules (with robust error handling) ----------
+tab_source, tab_source_err = _safe_import("ui_source")
+tab_workspace, tab_workspace_err = _safe_import("ui_workspace")
+tab_validation, tab_validation_err = _safe_import("ui_validation")
+tab_conflicts, tab_conflicts_err = _safe_import("ui_conflicts")
+tab_triage, tab_triage_err = _safe_import("ui_triage")
+tab_actions, tab_actions_err = _safe_import("ui_actions")
+tab_symptoms, tab_symptoms_err = _safe_import("ui_symptoms")
+tab_dictionary, tab_dictionary_err = _safe_import("ui_dictionary")
+tab_calculator, tab_calculator_err = _safe_import("ui_calculator")
+tab_visualizer, tab_visualizer_err = _safe_import("ui_visualizer")
+tab_pushlog, tab_pushlog_err = _safe_import("ui_pushlog")
 
-tab_source      = _safe_import("ui_source")
-tab_workspace   = _safe_import("ui_workspace")
-tab_symptoms    = _safe_import("ui_symptoms")
-tab_conflicts   = _safe_import("ui_conflicts")
-tab_dictionary  = _safe_import("ui_dictionary")
-tab_validation  = _safe_import("ui_validation")
-tab_calculator  = _safe_import("ui_calculator")
-tab_visualizer  = _safe_import("ui_visualizer")
-tab_pushlog     = _safe_import("ui_pushlog")  # may not exist yet — we provide a fallback renderer below
-tab_triage      = _safe_import("ui_triage")   # new Diagnostic Triage tab
-tab_actions     = _safe_import("ui_actions")  # new Actions tab
+_IMPORT_ERRORS = {
+    "Source": tab_source_err,
+    "Validation": tab_validation_err,
+    "Conflicts": tab_conflicts_err,
+    "Diagnostic Triage": tab_triage_err,
+    "Actions": tab_actions_err,
+    "Symptoms": tab_symptoms_err,
+    "Dictionary": tab_dictionary_err,
+    "Calculator": tab_calculator_err,
+    "Visualizer": tab_visualizer_err,
+    "Push Log": tab_pushlog_err,
+}
+
+def _render_or_error(tab_name: str, module):
+    err = _IMPORT_ERRORS.get(tab_name)
+    if err:
+        st.error(f"❌ {tab_name} module failed to import.")
+        with st.expander("Show import error", expanded=st.session_state.get("__debug", False)):
+            st.code(err, language="text")
+        return False
+    if module is None or not hasattr(module, "render"):
+        st.error(f"❌ {tab_name} module not available.")
+        return False
+    return True
 
 
 # ---------- Header ----------
@@ -174,98 +207,50 @@ tabs = st.tabs([
 ])
 
 with tabs[0]:
-    if tab_source and hasattr(tab_source, "render"):
+    if _render_or_error("Source", tab_source):
         tab_source.render()
-    else:
-        st.info("Source module not available.")
 
 with tabs[1]:
-    if tab_workspace and hasattr(tab_workspace, "render"):
+    if _render_or_error("Workspace", tab_workspace):
         tab_workspace.render()
-    else:
-        st.info("Workspace module not available.")
 
 with tabs[2]:
-    if tab_validation and hasattr(tab_validation, "render"):
+    if _render_or_error("Validation", tab_validation):
         tab_validation.render()
-    else:
-        st.info("Validation module not available.")
 
 with tabs[3]:
-    if tab_conflicts and hasattr(tab_conflicts, "render"):
+    if _render_or_error("Conflicts", tab_conflicts):
         tab_conflicts.render()
-    else:
-        st.info("Conflicts module not available.")
 
 with tabs[4]:
     # Diagnostic Triage tab
-    if tab_triage and hasattr(tab_triage, "render"):
-        # Get current DataFrame from session state
-        current_df = None
-        wb_upload = st.session_state.get("upload_workbook", {})
-        wb_gs = st.session_state.get("gs_workbook", {})
-        
-        if wb_upload:
-            current_sheet = st.session_state.get("current_sheet")
-            if current_sheet and current_sheet in wb_upload:
-                current_df = wb_upload[current_sheet]
-        elif wb_gs:
-            current_sheet = st.session_state.get("current_sheet")
-            if current_sheet and current_sheet in wb_gs:
-                current_df = wb_gs[current_sheet]
-        
-        tab_triage.render(current_df)
-    else:
-        st.info("Diagnostic Triage module not available.")
+    if _render_or_error("Diagnostic Triage", tab_triage):
+        tab_triage.render()
 
 with tabs[5]:
     # Actions tab
-    if tab_actions and hasattr(tab_actions, "render"):
-        # Get current DataFrame from session state
-        current_df = None
-        wb_upload = st.session_state.get("upload_workbook", {})
-        wb_gs = st.session_state.get("gs_workbook", {})
-        
-        if wb_upload:
-            current_sheet = st.session_state.get("current_sheet")
-            if current_sheet and current_sheet in wb_upload:
-                current_df = wb_upload[current_sheet]
-        elif wb_gs:
-            current_sheet = st.session_state.get("current_sheet")
-            if current_sheet and current_sheet in wb_gs:
-                current_df = wb_gs[current_sheet]
-        
-        tab_actions.render(current_df)
-    else:
-        st.info("Actions module not available.")
+    if _render_or_error("Actions", tab_actions):
+        tab_actions.render()
 
 with tabs[6]:
-    if tab_symptoms and hasattr(tab_symptoms, "render"):
+    if _render_or_error("Symptoms", tab_symptoms):
         tab_symptoms.render()
-    else:
-        st.info("Symptoms module not available.")
 
 with tabs[7]:
-    if tab_dictionary and hasattr(tab_dictionary, "render"):
+    if _render_or_error("Dictionary", tab_dictionary):
         tab_dictionary.render()
-    else:
-        st.info("Dictionary module not available.")
 
 with tabs[8]:
-    if tab_calculator and hasattr(tab_calculator, "render"):
+    if _render_or_error("Calculator", tab_calculator):
         tab_calculator.render()
-    else:
-        st.info("Calculator module not available.")
 
 with tabs[9]:
-    if tab_visualizer and hasattr(tab_visualizer, "render"):
+    if _render_or_error("Visualizer", tab_visualizer):
         tab_visualizer.render()
-    else:
-        st.info("Visualizer module not available.")
 
 with tabs[10]:
     # Fallback Push Log if ui_pushlog module is not present yet
-    if tab_pushlog and hasattr(tab_pushlog, "render"):
+    if _render_or_error("Push Log", tab_pushlog):
         tab_pushlog.render()
     else:
         st.subheader("📜 Push Log")
