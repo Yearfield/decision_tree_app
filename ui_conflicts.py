@@ -17,6 +17,18 @@ from logic_conflicts import (
 from logic_cascade import build_raw_plus_v630
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def _cached_compute_conflicts(store: Dict, friendly_labels: bool = True) -> Dict:
+    """Cached version of compute_conflicts to prevent recomputation."""
+    return compute_conflicts(store, friendly_labels=friendly_labels)
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def _cached_conflict_summary(conf_map: Dict, level: Optional[int] = None) -> List[Dict]:
+    """Cached version of conflict_summary to prevent recomputation."""
+    return conflict_summary(conf_map, level=level)
+
+
 # ----------------- session helpers -----------------
 
 def _ss_get(key, default):
@@ -44,7 +56,7 @@ def render():
     if _ss_get("gs_workbook", {}):
         sources.append("Google Sheets workbook")
     if not sources:
-        st.info("Load a workbook first in the **Source** tab.")
+        st.info("ℹ️ Load a workbook first in the **Source** tab.")
         return
 
     source = st.radio("Choose data source", sources, horizontal=True, key="conf_source_sel")
@@ -56,13 +68,13 @@ def render():
         override_root = "branch_overrides_gs"
 
     if not wb:
-        st.warning("No sheets found in the selected source.")
+        st.warning("⚠️ No sheets found in the selected source.")
         return
 
     sheet = st.selectbox("Sheet", list(wb.keys()), key="conf_sheet_sel")
     df = wb.get(sheet, pd.DataFrame())
     if df.empty or not validate_headers(df):
-        st.info("Selected sheet is empty or headers mismatch.")
+        st.info("ℹ️ Selected sheet is empty or headers mismatch.")
         return
 
     # Build store & conflicts
@@ -81,19 +93,19 @@ def render():
     with colf4:
         exp_all_toggle = st.checkbox("Expand all", value=False, key="conf_expand_all_toggle")
 
-    conf_map = compute_conflicts(store, friendly_labels=True)
+    conf_map = _cached_compute_conflicts(store, friendly_labels=True)
     # Build summary
-    summary_rows = conflict_summary(conf_map, level=None if level_filter == "All" else level_filter)
+    summary_rows = _cached_conflict_summary(conf_map, level=None if level_filter == "All" else level_filter)
     # Dataframe for export
     if summary_rows:
         df_summary = pd.DataFrame(summary_rows)
-        st.dataframe(df_summary, use_container_width=True, height=220)
+        st.dataframe(df_summary.head(100), use_container_width=True, height=220)
         st.download_button("Download conflict summary (CSV)",
                            data=df_summary.to_csv(index=False).encode("utf-8"),
                            file_name=f"{sheet}_conflicts_summary.csv",
                            mime="text/csv")
     else:
-        st.success("No conflicts found at the selected scope. 🎉")
+        st.success("✅ No conflicts found at the selected scope. 🎉")
 
     # Persisted expand state & focus handling to prevent UI jump
     open_keys: List[Tuple[int, str]] = _ss_get("conflicts_open_keys", [])
@@ -189,7 +201,7 @@ def render():
                         # Keep this group open after re-run
                         st.session_state["conflicts_focus_key"] = key_group
                         st.session_state["conflicts_open_keys"] = open_keys
-                        st.success(f"Applied Variant {i+1} to {n_aff} parent(s). Added {tstats['new_rows']} row(s), filled {tstats['inplace_filled']} anchors. 👍")
+                        st.success(f"✅ Applied Variant {i+1} to {n_aff} parent(s). Added {tstats['new_rows']} row(s), filled {tstats['inplace_filled']} anchors. 👍")
                         st.rerun()  # updated from st.experimental_rerun()
 
                     # Save this variant as a preset for later reuse
@@ -200,9 +212,9 @@ def render():
                             presets_sheet[key_group].append(preset_set)
                             presets_root[sheet] = presets_sheet
                             st.session_state["conflict_presets"] = presets_root
-                            st.success("Preset saved. 👍")
+                            st.success("✅ Preset saved. 👍")
                         else:
-                            st.info("Preset already saved for this group.")
+                            st.info("ℹ️ Preset already saved for this group.")
 
             st.markdown("---")
 
@@ -238,14 +250,14 @@ def render():
                                     st.session_state["gs_workbook"] = wb
                                 st.session_state["conflicts_focus_key"] = key_group
                                 st.session_state["conflicts_open_keys"] = open_keys
-                                st.success(f"Applied preset {j+1} to {n_aff} parent(s). Added {tstats['new_rows']} row(s), filled {tstats['inplace_filled']} anchors. 👍")
+                                st.success(f"✅ Applied preset {j+1} to {n_aff} parent(s). Added {tstats['new_rows']} row(s), filled {tstats['inplace_filled']} anchors. 👍")
                                 st.rerun()  # updated from st.experimental_rerun()
                         with cols_p[2]:
                             if st.button(f"Delete preset {j+1}", key=f"conf_delete_preset_{lvl}_{label}_{j}"):
                                 presets_sheet[key_group].pop(j)
                                 presets_root[sheet] = presets_sheet
                                 st.session_state["conflict_presets"] = presets_root
-                                st.success("Preset deleted.")
+                                st.success("✅ Preset deleted.")
 
             st.markdown("---")
 
@@ -268,7 +280,7 @@ def render():
             # Multi-select with cap (enforced after selection)
             selected = st.multiselect("Select up to 5 children", options=options, default=selected, key=sel_key)
             if len(selected) > 5:
-                st.warning("Please select at most 5 items. Extra selections will be ignored on save.")
+                st.warning("⚠️ Please select at most 5 items. Extra selections will be ignored on save.")
 
             # Quick buttons to fill common sets
             cquick1, cquick2 = st.columns([1, 1])
@@ -313,7 +325,7 @@ def render():
                 # Keep this group open after re-run
                 st.session_state["conflicts_focus_key"] = key_group
                 st.session_state["conflicts_open_keys"] = open_keys
-                st.success(f"Applied custom set to {n_aff} parent(s). Added {tstats['new_rows']} row(s), filled {tstats['inplace_filled']} anchors. 👍")
+                st.success(f"✅ Applied custom set to {n_aff} parent(s). Added {tstats['new_rows']} row(s), filled {tstats['inplace_filled']} anchors. 👍")
                 st.rerun()  # updated from st.experimental_rerun()
 
             # Save selection as a preset
@@ -324,9 +336,9 @@ def render():
                     presets_sheet[key_group].append(chosen)
                     presets_root[sheet] = presets_sheet
                     st.session_state["conflict_presets"] = presets_root
-                    st.success("Preset saved. 👍")
+                    st.success("✅ Preset saved. 👍")
                 else:
-                    st.info("Nothing new to save or already saved.")
+                    st.info("ℹ️ Nothing new to save or already saved.")
 
     # Persist expand state list
     st.session_state["conflicts_open_keys"] = open_keys

@@ -18,6 +18,7 @@ try:
         detect_orphan_nodes,
         detect_loops,
         detect_missing_red_flags,
+        detect_empty_branches,
     )
     HAVE_COMBINED = True
 except Exception:
@@ -27,6 +28,7 @@ except Exception:
             detect_orphan_nodes,
             detect_loops,
             detect_missing_red_flags,
+            detect_empty_branches,
         )
         HAVE_COMBINED = False
     except Exception:
@@ -35,7 +37,52 @@ except Exception:
         detect_orphan_nodes = None
         detect_loops = None
         detect_missing_red_flags = None
+        detect_empty_branches = None
         HAVE_COMBINED = False
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def _cached_compute_validation_report(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Cached version of compute_validation_report to prevent endless reruns.
+    """
+    if df is None or df.empty:
+        return {
+            "orphan_nodes": [],
+            "loops": [],
+            "missing_red_flags": [],
+            "empty_branches": [],
+            "summary": {
+                "total_orphans": 0,
+                "total_loops": 0,
+                "total_missing_red_flags": 0,
+                "total_empty_branches": 0,
+                "total_issues": 0
+            }
+        }
+    
+    if HAVE_COMBINED and compute_validation_report:
+        return compute_validation_report(df)
+    else:
+        # Fallback to individual functions
+        orphans = detect_orphan_nodes(df) if detect_orphan_nodes else []
+        loops = detect_loops(df) if detect_loops else []
+        missing_rf = detect_missing_red_flags(df) if detect_missing_red_flags else []
+        empty_branches = detect_empty_branches(df) if detect_empty_branches else []
+        
+        return {
+            "orphan_nodes": orphans,
+            "loops": loops,
+            "missing_red_flags": missing_rf,
+            "empty_branches": empty_branches,
+            "summary": {
+                "total_orphans": len(orphans),
+                "total_loops": len(loops),
+                "total_missing_red_flags": len(missing_rf),
+                "total_empty_branches": len(empty_branches),
+                "total_issues": len(orphans) + len(loops) + len(missing_rf) + len(empty_branches)
+            }
+        }
 
 
 def _ss_get(key, default):
@@ -60,7 +107,7 @@ def _render_orphans(orphans: List[Dict[str, Any]]):
     st.caption("A node label appears as a child but never as a parent for its next level, where a branch might reasonably continue.")
 
     if not orphans:
-        st.success("No orphans detected. 🎉")
+        st.success("✅ No orphans detected. 🎉")
         return
 
     # Build table
@@ -79,7 +126,8 @@ def _render_orphans(orphans: List[Dict[str, Any]]):
         })
 
     df_orph = pd.DataFrame(rows).sort_values(["At Level", "Node Label"])
-    st.dataframe(df_orph, use_container_width=True, height=260)
+    # Limit preview to first 100 rows for speed
+    st.dataframe(df_orph.head(100), use_container_width=True, height=260)
 
     st.download_button(
         "Download orphans (CSV)",
@@ -93,7 +141,7 @@ def _render_loops(loops: List[Dict[str, Any]]):
     st.subheader("🔁 Loops (cycles)")
 
     if not loops:
-        st.success("No cycles detected. 🎉")
+        st.success("✅ No cycles detected. 🎉")
         return
 
     rows = []
@@ -119,7 +167,8 @@ def _render_loops(loops: List[Dict[str, Any]]):
         })
 
     df_loops = pd.DataFrame(rows)
-    st.dataframe(df_loops, use_container_width=True, height=220)
+    # Limit preview to first 100 rows for speed
+    st.dataframe(df_loops.head(100), use_container_width=True, height=220)
 
     st.download_button(
         "Download loops (CSV)",
@@ -156,7 +205,8 @@ def _render_missing_redflag(miss_rf: List[Dict[str, Any]]):
         })
 
     df_rf = pd.DataFrame(rows).sort_values(["At Level", "Node Label"])
-    st.dataframe(df_rf, use_container_width=True, height=280)
+    # Limit preview to first 100 rows for speed
+    st.dataframe(df_rf.head(100), use_container_width=True, height=280)
 
     st.download_button(
         "Download missing red flags (CSV)",
@@ -190,6 +240,40 @@ def _render_missing_redflag(miss_rf: List[Dict[str, Any]]):
     )
 
 
+def _render_empty_branches(empty_branches: List[Dict[str, Any]]):
+    st.subheader("🌿 Empty Branches")
+
+    st.caption("Nodes that have no children but are not marked as terminal (no actions or triage). Consider adding children or marking as terminal.")
+
+    if not empty_branches:
+        st.success("✅ No empty branches detected. 🎉")
+        return
+
+    rows = []
+    for item in empty_branches:
+        label = item.get("label", "")
+        level = int(item.get("level", 1))
+        node_id = item.get("node_id", f"Node {level}")
+        row_index = item.get("row_index", -1)
+        
+        rows.append({
+            "Node Label": label,
+            "At Level": node_id,
+            "Row Index": row_index,
+        })
+
+    df_eb = pd.DataFrame(rows).sort_values(["At Level", "Node Label"])
+    # Limit preview to first 100 rows for speed
+    st.dataframe(df_eb.head(100), use_container_width=True, height=220)
+
+    st.download_button(
+        "Download empty branches (CSV)",
+        data=df_eb.to_csv(index=False).encode("utf-8"),
+        file_name="validation_empty_branches.csv",
+        mime="text/csv",
+    )
+
+
 def render():
     st.header("🔎 Validation")
 
@@ -201,7 +285,7 @@ def render():
         sources.append("Google Sheets workbook")
 
     if not sources:
-        st.info("Load a workbook first in the **Source** tab.")
+        st.info("ℹ️ Load a workbook first in the **Source** tab.")
         return
 
     source = st.radio("Choose data source", sources, horizontal=True, key="val_source_sel")
@@ -214,25 +298,27 @@ def render():
         override_root = "branch_overrides_gs"
 
     if not wb:
-        st.warning("No sheets found in the selected source.")
+        st.warning("⚠️ No sheets found in the selected source.")
         return
 
     # Sheet selector
     sheet = st.selectbox("Sheet", list(wb.keys()), key="val_sheet_sel")
     df = wb.get(sheet, pd.DataFrame())
     if df.empty or not validate_headers(df):
-        st.info("Selected sheet is empty or headers mismatch.")
+        st.info("ℹ️ Selected sheet is empty or headers mismatch.")
         return
 
     # Options
     st.markdown("#### Checks to run")
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
     with c1:
         chk_orphans = st.checkbox("Orphan nodes", value=True, key="val_chk_orphans")
     with c2:
         chk_loops = st.checkbox("Loops", value=True, key="val_chk_loops")
     with c3:
         chk_rf = st.checkbox("Missing Red Flag coverage", value=True, key="val_chk_rf")
+    with c4:
+        chk_eb = st.checkbox("Empty branches", value=True, key="val_chk_eb")
 
     # Pull overrides + symptom quality map
     overrides_sheet = _ss_get(override_root, {}).get(sheet, {})
@@ -243,37 +329,34 @@ def render():
         st.session_state["val_run_requested"] = True
 
     if not _ss_get("val_run_requested", True):
-        st.info("Click **Run validation** to generate the report.")
+        st.info("ℹ️ Click **Run validation** to generate the report.")
         return
 
     # Compute report
     try:
-        if HAVE_COMBINED:
-            # Call compute_validation_report with only the DataFrame argument
-            report = compute_validation_report(df)
-            orphans = report.get("orphan_nodes", []) if chk_orphans else []
-            loops = report.get("loops", []) if chk_loops else []
-            missing_rf = report.get("missing_red_flags", []) if chk_rf else []
-        else:
-            orphans = detect_orphan_nodes(df) if chk_orphans and detect_orphan_nodes else []
-            loops = detect_loops(df) if chk_loops and detect_loops else []
-            missing_rf = detect_missing_red_flags(df) if chk_rf and detect_missing_red_flags else []
+        report = _cached_compute_validation_report(df)
+        orphans = report.get("orphan_nodes", []) if chk_orphans else []
+        loops = report.get("loops", []) if chk_loops else []
+        missing_rf = report.get("missing_red_flags", []) if chk_rf else []
+        empty_branches = report.get("empty_branches", []) if chk_eb else []
     except AssertionError as e:
-        st.error(str(e))
+        st.error(f"❌ {str(e)}")
         return
     except Exception as e:
-        st.error(f"Validation failed: {e}")
+        st.error(f"❌ Validation failed: {e}")
         return
 
     # Summary chips
     st.markdown("#### Summary")
-    chip_cols = st.columns([1, 1, 1])
+    chip_cols = st.columns([1, 1, 1, 1])
     with chip_cols[0]:
         st.metric("Orphan nodes", len(orphans))
     with chip_cols[1]:
         st.metric("Loops found", len(loops))
     with chip_cols[2]:
         st.metric("Missing Red Flag (parents)", len(missing_rf))
+    with chip_cols[3]:
+        st.metric("Empty branches", len(empty_branches))
 
     st.markdown("---")
 
@@ -287,6 +370,9 @@ def render():
     if chk_rf:
         _render_missing_redflag(missing_rf)
         st.markdown("---")
+    if chk_eb:
+        _render_empty_branches(empty_branches)
+        st.markdown("---")
 
     # Combined export (JSON)
     combined = {
@@ -294,6 +380,7 @@ def render():
         "orphans": orphans if chk_orphans else [],
         "loops": loops if chk_loops else [],
         "missing_redflag": missing_rf if chk_rf else [],
+        "empty_branches": empty_branches if chk_eb else [],
     }
     try:
         import json

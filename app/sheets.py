@@ -20,6 +20,7 @@ import streamlit as st
 from typing import Optional
 
 
+@st.cache_resource(show_spinner=False, ttl=600)
 def get_gspread_client_from_secrets(secrets_dict: dict) -> gspread.Client:
     """
     Create a gspread client using service account credentials from Streamlit secrets.
@@ -153,6 +154,7 @@ def create_worksheet(spreadsheet: gspread.Spreadsheet, title: str, rows: int = 1
         raise Exception(f"❌ Error creating worksheet: {str(e)}") from e
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def read_worksheet(spreadsheet: gspread.Spreadsheet, title: str) -> pd.DataFrame:
     """
     Read a worksheet and return its data as a pandas DataFrame.
@@ -196,6 +198,7 @@ def read_worksheet(spreadsheet: gspread.Spreadsheet, title: str) -> pd.DataFrame
         raise Exception(f"❌ Error reading worksheet: {str(e)}") from e
 
 
+@st.cache_data(show_spinner=False, ttl=600)
 def read_worksheet_with_canonical_headers(spreadsheet: gspread.Spreadsheet, title: str, canonical_headers: list[str]) -> pd.DataFrame:
     """
     Read a worksheet and return DataFrame with canonical headers (for decision tree app).
@@ -285,6 +288,10 @@ def write_dataframe(spreadsheet: gspread.Spreadsheet, title: str, df: pd.DataFra
         worksheet = spreadsheet.worksheet(title)
         
         if mode == "overwrite":
+            # Show warning for overwrite mode
+            import streamlit as st
+            st.warning(f"⚠️ You are about to overwrite worksheet '{title}'. It is recommended to create a backup first.")
+            
             # Clear existing data and write new data
             worksheet.clear()
             if not df.empty:

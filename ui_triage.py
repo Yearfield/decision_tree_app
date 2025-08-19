@@ -2,7 +2,7 @@
 
 import io
 import json
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Any
 from datetime import datetime
 
 import numpy as np
@@ -27,6 +27,26 @@ except ImportError:
     HAVE_TRIAGE_LOGIC = False
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def _cached_compute_triage_metrics(df: pd.DataFrame) -> Dict[str, Any]:
+    """Cached version of compute_triage_metrics to prevent recomputation."""
+    if HAVE_TRIAGE_LOGIC and compute_triage_metrics:
+        return compute_triage_metrics(df)
+    else:
+        # Fallback metrics calculation
+        total_rows = len(df)
+        triaged_rows = df["Diagnostic Triage"].notna().sum()
+        triaged_rows = triaged_rows + (df["Diagnostic Triage"].astype(str).str.strip() != "").sum()
+        coverage_pct = (triaged_rows / total_rows * 100) if total_rows > 0 else 0
+        
+        return {
+            "total_rows": total_rows,
+            "triaged_rows": triaged_rows,
+            "coverage_pct": coverage_pct,
+            "remaining": total_rows - triaged_rows
+        }
+
+
 def render(df: pd.DataFrame):
     """
     Render the Diagnostic Triage tab.
@@ -37,7 +57,7 @@ def render(df: pd.DataFrame):
     st.header("🩺 Diagnostic Triage")
     
     if df is None or df.empty:
-        st.warning("No decision tree data loaded. Please upload or connect to a sheet.")
+        st.warning("⚠️ No decision tree data loaded. Please upload or connect to a sheet.")
         return
     
     if not validate_headers(df):
@@ -82,32 +102,28 @@ def _render_triage_summary(triage_df: pd.DataFrame):
     """
     st.subheader("📊 Triage Overview")
     
-    # Calculate metrics
-    total_rows = len(triage_df)
-    triaged_rows = triage_df["Diagnostic Triage"].notna().sum()
-    triaged_rows = triaged_rows + (triage_df["Diagnostic Triage"].astype(str).str.strip() != "").sum()
-    coverage_pct = (triaged_rows / total_rows * 100) if total_rows > 0 else 0
+    # Get cached metrics
+    metrics = _cached_compute_triage_metrics(triage_df)
     
     # Display metrics
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Rows", total_rows)
+        st.metric("Total Rows", metrics["total_rows"])
     
     with col2:
-        st.metric("Triaged Rows", triaged_rows)
+        st.metric("Triaged Rows", metrics["triaged_rows"])
     
     with col3:
-        st.metric("Coverage", f"{coverage_pct:.1f}%")
+        st.metric("Coverage", f"{metrics['coverage_pct']:.1f}%")
     
     with col4:
-        remaining = total_rows - triaged_rows
-        st.metric("Remaining", remaining)
+        st.metric("Remaining", metrics["remaining"])
     
     # Progress bar
-    if total_rows > 0:
-        st.progress(triaged_rows / total_rows)
-        st.caption(f"Triage progress: {triaged_rows}/{total_rows} rows completed")
+    if metrics["total_rows"] > 0:
+        st.progress(metrics["coverage_pct"] / 100)
+        st.caption(f"Triage progress: {metrics['triaged_rows']}/{metrics['total_rows']} rows completed")
 
 
 def _render_triage_editor(triage_df: pd.DataFrame):
@@ -155,7 +171,8 @@ def _render_triage_editor(triage_df: pd.DataFrame):
             "Diagnostic Triage": st.column_config.TextColumn(
                 "Diagnostic Triage",
                 help="Triage priority and notes (e.g., 'High Priority', 'Urgent', 'Routine')",
-                placeholder="Enter triage priority..."
+                placeholder="Enter triage priority...",
+                max_chars=None
             )
         }
     )

@@ -11,6 +11,8 @@ This module assumes it is used inside a Streamlit app and will read
 GCP service account credentials from st.secrets["gcp_service_account"].
 """
 
+# TODO Step 9: Implement branch grouping so Node 1 children are displayed/exported consecutively.
+
 from __future__ import annotations
 
 import io

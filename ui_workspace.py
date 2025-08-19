@@ -18,6 +18,19 @@ from utils import (
     order_decision_tree,
 )
 
+
+@st.cache_data(show_spinner=False, ttl=600)
+def _cached_compute_parent_depth_score(df: pd.DataFrame) -> Tuple[int, int]:
+    """Cached version of compute_parent_depth_score to prevent recomputation."""
+    return compute_parent_depth_score(df)
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def _cached_compute_row_path_score(df: pd.DataFrame) -> Tuple[int, int]:
+    """Cached version of compute_row_path_score to prevent recomputation."""
+    return compute_row_path_score(df)
+
+
 # --- Google Sheets helpers (using app.sheets module) ---
 def _push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFrame) -> bool:
     """Push DataFrame to Google Sheets using app.sheets module."""
@@ -37,7 +50,7 @@ def _push_to_google_sheets(spreadsheet_id: str, sheet_name: str, df: pd.DataFram
         return True
 
     except Exception as e:
-        st.error(f"Push to Google Sheets failed: {e}")
+        st.error(f"❌ Push to Google Sheets failed: {e}")
         return False
 
 
@@ -55,7 +68,7 @@ def _backup_sheet_copy(spreadsheet_id: str, source_sheet: str) -> Optional[str]:
         return backup_title
         
     except Exception as e:
-        st.error(f"Backup failed: {e}")
+        st.error(f"❌ Backup failed: {e}")
         return None
 
 
@@ -72,7 +85,7 @@ def render():
         sources.append("Google Sheets workbook")
 
     if not sources:
-        st.info("Load a workbook in the **Source** tab first (upload file or Google Sheets).")
+        st.info("ℹ️ Load a workbook in the **Source** tab first (upload file or Google Sheets).")
         return
 
     # Default from work_context if available
@@ -92,7 +105,7 @@ def render():
         current_source_code = "gs"
 
     if not wb_ws:
-        st.warning("No sheets found in the selected source. Load data from the **Source** tab.")
+        st.warning("⚠️ No sheets found in the selected source. Load data from the **Source** tab.")
         return
 
     # Sheet picker (default to context if present)
@@ -107,12 +120,12 @@ def render():
 
     # ===== Summary + Preview =====
     if df_ws.empty or not validate_headers(df_ws):
-        st.info("Selected sheet is empty or headers mismatch.")
+        st.info("ℹ️ Selected sheet is empty or headers mismatch.")
     else:
         st.write(f"Found {len(wb_ws)} sheet(s). Choose one to process:")
 
-        ok_p, total_p = compute_parent_depth_score(df_ws)
-        ok_r, total_r = compute_row_path_score(df_ws)
+        ok_p, total_p = _cached_compute_parent_depth_score(df_ws)
+        ok_r, total_r = _cached_compute_row_path_score(df_ws)
         p1, p2 = st.columns(2)
         with p1:
             st.metric("Parents with 5 children", f"{ok_p}/{total_p}")
@@ -125,7 +138,7 @@ def render():
         try:
             df_ws_ordered = order_decision_tree(df_ws)
             if not df_ws_ordered.equals(df_ws):
-                st.info("📊 Data displayed in logical tree order (parents followed by children)")
+                st.info("ℹ️ Data displayed in logical tree order (parents followed by children)")
         except Exception as e:
             st.warning(f"⚠️ Could not apply tree ordering: {e}")
             df_ws_ordered = df_ws
@@ -135,6 +148,9 @@ def render():
         if total_rows <= 50:
             st.caption(f"Showing all {total_rows} rows.")
             st.dataframe(df_ws_ordered, use_container_width=True)
+        elif total_rows <= 100:
+            st.caption(f"Showing first 100 rows of {total_rows} total rows.")
+            st.dataframe(df_ws_ordered.head(100), use_container_width=True)
         else:
             state_key = f"preview_start_{sheet_ws}"
             start_idx = int(st.session_state.get(state_key, 0))
@@ -178,7 +194,7 @@ def render():
                 try:
                     imported = json.loads(upfile.getvalue().decode("utf-8"))
                     if not isinstance(imported, dict):
-                        st.error("Invalid JSON: expected an object mapping keys to lists.")
+                        st.error("❌ Invalid JSON: expected an object mapping keys to lists.")
                     else:
                         if import_mode == "Replace":
                             new_over = {}
@@ -197,17 +213,17 @@ def render():
                                     cur[k] = enforce_k_five(v if isinstance(v, list) else [v])
                             overrides_all[sheet_ws] = cur
                         st.session_state[override_root] = overrides_all
-                        st.success("Overrides imported (stored in-session).")
+                        st.success("✅ Overrides imported (stored in-session).")
                 except Exception as e:
-                    st.error(f"Import failed: {e}")
+                    st.error(f"❌ Import failed: {e}")
 
     # ========== 🧼 Data quality tools ==========
     with st.expander("🧼 Data quality tools (applies to this sheet)"):
         if df_ws.empty or not validate_headers(df_ws):
-            st.info("Load a valid sheet first.")
+            st.info("ℹ️ Load a valid sheet first.")
         else:
-            ok_p, total_p = compute_parent_depth_score(df_ws)
-            ok_r, total_r = compute_row_path_score(df_ws)
+            ok_p, total_p = _cached_compute_parent_depth_score(df_ws)
+            ok_r, total_r = _cached_compute_row_path_score(df_ws)
             st.write(f"Parents with 5 children: **{ok_p}/{total_p}**")
             st.write(f"Rows with full path: **{ok_r}/{total_r}**")
 
@@ -252,21 +268,22 @@ def render():
                 wb_ws[sheet_ws] = df_norm
                 if current_source_code == "upload":
                     st.session_state["upload_workbook"] = wb_ws
-                    st.success("Sheet normalized in-session. Download from Source tab to persist locally.")
+                    st.success("✅ Sheet normalized in-session. Download from Source tab to persist locally.")
                 else:
                     st.session_state["gs_workbook"] = wb_ws
-                    st.success("Sheet normalized in-session. Use Push Settings below to write to Google Sheets.")
+                    st.success("✅ Sheet normalized in-session. Use Push Settings below to write to Google Sheets.")
 
     # ========== 🧩 Group rows (Node 1 / Node 2) ==========
     with st.expander("🧩 Group rows (cluster identical labels together)"):
         st.caption("Group rows so identical **Node 1** or **Node 2** values are contiguous. This is a stable grouping.")
         if df_ws.empty or not validate_headers(df_ws):
-            st.info("Load a valid sheet first.")
+            st.info("ℹ️ Load a valid sheet first.")
         else:
             group_mode = st.radio("Grouping mode", ["Off", "Node 1", "Node 2"], horizontal=True, key="ws_group_mode_sel")
             scope = st.radio("Grouping scope", ["Whole sheet", "Within Vital Measurement"], horizontal=True, key="ws_group_scope_sel")
             preview = st.checkbox("Show preview (does not modify data)", value=True, key="ws_group_preview_sel")
 
+            # TODO Step 9: Implement branch grouping so Node 1 children are displayed/exported consecutively.
             def grouped_df(df0: pd.DataFrame, by_col: Optional[str], scope_mode: str) -> pd.DataFrame:
                 if by_col is None:
                     return df0.copy()
@@ -305,15 +322,15 @@ def render():
                     wb_ws[sheet_ws] = df_prev
                     if current_source_code == "upload":
                         st.session_state["upload_workbook"] = wb_ws
-                        st.success("Applied grouping in-session (Upload workbook).")
+                        st.success("✅ Applied grouping in-session (Upload workbook).")
                     else:
                         st.session_state["gs_workbook"] = wb_ws
-                        st.success("Applied grouping in-session (Google Sheets workbook).")
+                        st.success("✅ Applied grouping in-session (Google Sheets workbook).")
             with colg2:
                 sid_group = st.session_state.get("gs_spreadsheet_id","")
                 if current_source_code == "gs" and sid_group and st.button("Apply & push grouping to Google Sheets", key="ws_group_push_sel"):
                     ok = _push_to_google_sheets(sid_group, sheet_ws, df_prev)
-                    if ok: st.success("Grouping pushed to Google Sheets.")
+                    if ok: st.success("✅ Grouping pushed to Google Sheets.")
 
     # ========== 🔧 Google Sheets Push Settings (BOTTOM) ==========
     st.markdown("---")
@@ -334,13 +351,14 @@ def render():
 
     if st.button("📤 Push current view to Google Sheets", type="primary", key="ws_push_btn_sel"):
         if not sid or not target_tab:
-            st.error("Missing Spreadsheet ID or target tab.")
+            st.error("❌ Missing Spreadsheet ID or target tab.")
         elif df_ws.empty or not validate_headers(df_ws):
-            st.error("Current sheet is empty or headers mismatch.")
+            st.error("❌ Current sheet is empty or headers mismatch.")
         else:
             if dry_run:
-                st.success("Dry-run complete. No changes written to Google Sheets.")
-                st.dataframe(df_ws.head(50), use_container_width=True)
+                st.success("✅ Dry-run complete. No changes written to Google Sheets.")
+                # Limit preview to first 100 rows for speed
+                st.dataframe(df_ws.head(100), use_container_width=True)
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                     df_ws.to_excel(writer, index=False, sheet_name=sheet_ws[:31] or "Sheet1")
@@ -351,7 +369,7 @@ def render():
                 if push_backup:
                     bak = _backup_sheet_copy(sid, target_tab)
                     if bak:
-                        st.info(f"Backed up current '{target_tab}' to '{bak}'.")
+                        st.info(f"ℹ️ Backed up current '{target_tab}' to '{bak}'.")
                 ok = _push_to_google_sheets(sid, target_tab, df_ws)
                 if ok:
                     log = st.session_state.get("push_log", [])
@@ -369,4 +387,4 @@ def render():
                     saved.setdefault(sheet_ws, {})
                     saved[sheet_ws]["tab"] = target_tab
                     st.session_state["saved_targets"] = saved
-                    st.success(f"Pushed {len(df_ws)} rows to '{target_tab}'.")
+                    st.success(f"✅ Pushed {len(df_ws)} rows to '{target_tab}'.")

@@ -277,3 +277,6 @@ st.markdown(
     f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>",
     unsafe_allow_html=True,
 )
+
+# App version footer
+st.markdown("###### App version v6.4.2", unsafe_allow_html=True)

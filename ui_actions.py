@@ -2,7 +2,7 @@
 
 import io
 import json
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Any
 from datetime import datetime
 
 import numpy as np
@@ -27,6 +27,36 @@ except ImportError:
     HAVE_ACTIONS_LOGIC = False
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def _cached_compute_actions_metrics(df: pd.DataFrame) -> Dict[str, Any]:
+    """Cached version of compute_actions_metrics to prevent recomputation."""
+    if HAVE_ACTIONS_LOGIC and compute_actions_metrics:
+        return compute_actions_metrics(df)
+    else:
+        # Fallback metrics calculation
+        total_rows = len(df)
+        actions_rows = df["Actions"].notna().sum()
+        actions_rows = actions_rows + (df["Actions"].astype(str).str.strip() != "").sum()
+        coverage_pct = (actions_rows / total_rows * 100) if total_rows > 0 else 0
+        
+        # Analyze action types
+        action_types = _analyze_action_types(df)
+        
+        return {
+            "total_rows": total_rows,
+            "actions_rows": actions_rows,
+            "coverage_pct": coverage_pct,
+            "remaining": total_rows - actions_rows,
+            "action_types": action_types
+        }
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def _cached_analyze_action_types(actions_df: pd.DataFrame) -> Dict[str, int]:
+    """Cached version of _analyze_action_types to prevent recomputation."""
+    return _analyze_action_types(actions_df)
+
+
 def render(df: pd.DataFrame):
     """
     Render the Actions tab.
@@ -37,7 +67,7 @@ def render(df: pd.DataFrame):
     st.header("⚡ Actions")
     
     if df is None or df.empty:
-        st.warning("No decision tree data loaded. Please upload or connect to a sheet.")
+        st.warning("⚠️ No decision tree data loaded. Please upload or connect to a sheet.")
         return
     
     if not validate_headers(df):
@@ -82,41 +112,35 @@ def _render_actions_summary(actions_df: pd.DataFrame):
     """
     st.subheader("📊 Actions Overview")
     
-    # Calculate metrics
-    total_rows = len(actions_df)
-    actions_rows = actions_df["Actions"].notna().sum()
-    actions_rows = actions_rows + (actions_df["Actions"].astype(str).str.strip() != "").sum()
-    coverage_pct = (actions_rows / total_rows * 100) if total_rows > 0 else 0
-    
-    # Count action types
-    action_types = _analyze_action_types(actions_df)
+    # Get cached metrics
+    metrics = _cached_compute_actions_metrics(actions_df)
     
     # Display metrics
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Rows", total_rows)
+        st.metric("Total Rows", metrics["total_rows"])
     
     with col2:
-        st.metric("With Actions", actions_rows)
+        st.metric("With Actions", metrics["actions_rows"])
     
     with col3:
-        st.metric("Coverage", f"{coverage_pct:.1f}%")
+        st.metric("Coverage", f"{metrics['coverage_pct']:.1f}%")
     
     with col4:
-        remaining = total_rows - actions_rows
-        st.metric("Missing Actions", remaining)
+        st.metric("Missing Actions", metrics["remaining"])
     
     # Progress bar
-    if total_rows > 0:
-        st.progress(actions_rows / total_rows)
-        st.caption(f"Actions coverage: {actions_rows}/{total_rows} rows have actions")
+    if metrics["total_rows"] > 0:
+        st.progress(metrics["coverage_pct"] / 100)
+        st.caption(f"Actions coverage: {metrics['actions_rows']}/{metrics['total_rows']} rows have actions")
     
     # Action types breakdown
-    if action_types:
+    if metrics["action_types"]:
         st.subheader("🔍 Action Types Breakdown")
-        action_df = pd.DataFrame(action_types.items(), columns=["Action Type", "Count"])
-        st.dataframe(action_df, use_container_width=True)
+        action_df = pd.DataFrame(metrics["action_types"].items(), columns=["Action Type", "Count"])
+        # Limit preview to first 100 rows for speed
+        st.dataframe(action_df.head(100), use_container_width=True)
 
 
 def _analyze_action_types(actions_df: pd.DataFrame) -> Dict[str, int]:
@@ -183,7 +207,8 @@ def _render_actions_editor(actions_df: pd.DataFrame):
             "Actions": st.column_config.TextColumn(
                 "Actions",
                 help="Actions to take (e.g., 'Refer to specialist', 'Order tests', 'Monitor')",
-                placeholder="Enter actions..."
+                placeholder="Enter actions...",
+                max_chars=None
             )
         }
     )

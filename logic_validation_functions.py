@@ -267,6 +267,78 @@ def detect_missing_red_flags(df: pd.DataFrame) -> List[Dict[str, Any]]:
         return []
 
 
+def detect_empty_branches(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Detect nodes that have no children but are not marked as terminal.
+    
+    Args:
+        df: DataFrame with decision tree data
+        
+    Returns:
+        List of dictionaries with empty branch details:
+        {
+            "label": str,           # Node label
+            "row_index": int,       # Row index in DataFrame
+            "level": int,           # Node level (1-5)
+            "node_id": str,         # Node identifier
+            "issue": str            # Issue description
+        }
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return []
+        
+        empty_branches = []
+        
+        # Check each level for nodes that might be empty branches
+        for level in range(1, MAX_LEVELS):
+            node_col = f"Node {level}"
+            next_node_col = f"Node {level + 1}"
+            
+            if node_col not in df.columns or next_node_col not in df.columns:
+                continue
+            
+            # Group by current node to find those with no children
+            for node_label in df[node_col].dropna().unique():
+                node_label = normalize_text(node_label)
+                if not node_label:
+                    continue
+                
+                # Find rows where this node appears
+                node_rows = df[df[node_col] == node_label]
+                
+                # Check if this node has any children in the next level
+                has_children = False
+                row_index = -1
+                
+                for idx, row in node_rows.iterrows():
+                    row_index = idx
+                    next_node = normalize_text(row.get(next_node_col, ""))
+                    if next_node:
+                        has_children = True
+                        break
+                
+                # If no children found and this isn't the last level, it's an empty branch
+                if not has_children and row_index >= 0:
+                    # Check if this node is marked as terminal (has actions or triage)
+                    actions = normalize_text(node_rows.iloc[0].get("Actions", ""))
+                    triage = normalize_text(node_rows.iloc[0].get("Diagnostic Triage", ""))
+                    
+                    # If no terminal indicators, it's an empty branch issue
+                    if not actions and not triage:
+                        empty_branches.append({
+                            "label": node_label,
+                            "row_index": row_index,
+                            "level": level,
+                            "node_id": f"Node {level}",
+                            "issue": "empty branch"
+                        })
+        
+        return empty_branches
+    except Exception:
+        return []
+
+
 def compute_validation_report(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Compute a comprehensive validation report for the decision tree.
@@ -280,6 +352,7 @@ def compute_validation_report(df: pd.DataFrame) -> Dict[str, Any]:
             "orphan_nodes": List[Dict[str, Any]],      # Orphan node details
             "loops": List[Dict[str, Any]],             # Loop details
             "missing_red_flags": List[Dict[str, Any]], # Missing red flag details
+            "empty_branches": List[Dict[str, Any]],    # Empty branch details
             "summary": Dict[str, Any]                  # Summary statistics
         }
         
@@ -294,10 +367,12 @@ def compute_validation_report(df: pd.DataFrame) -> Dict[str, Any]:
                 "orphan_nodes": [],
                 "loops": [],
                 "missing_red_flags": [],
+                "empty_branches": [],
                 "summary": {
                     "total_orphans": 0,
                     "total_loops": 0,
                     "total_missing_red_flags": 0,
+                    "total_empty_branches": 0,
                     "total_issues": 0
                 }
             }
@@ -305,16 +380,19 @@ def compute_validation_report(df: pd.DataFrame) -> Dict[str, Any]:
         orphan_nodes = detect_orphan_nodes(df)
         loops = detect_loops(df)
         missing_red_flags = detect_missing_red_flags(df)
+        empty_branches = detect_empty_branches(df)
         
         return {
             "orphan_nodes": orphan_nodes,
             "loops": loops,
             "missing_red_flags": missing_red_flags,
+            "empty_branches": empty_branches,
             "summary": {
                 "total_orphans": len(orphan_nodes),
                 "total_loops": len(loops),
                 "total_missing_red_flags": len(missing_red_flags),
-                "total_issues": len(orphan_nodes) + len(loops) + len(missing_red_flags)
+                "total_empty_branches": len(empty_branches),
+                "total_issues": len(orphan_nodes) + len(loops) + len(missing_red_flags) + len(empty_branches)
             }
         }
     except Exception:
@@ -322,10 +400,12 @@ def compute_validation_report(df: pd.DataFrame) -> Dict[str, Any]:
             "orphan_nodes": [],
             "loops": [],
             "missing_red_flags": [],
+            "empty_branches": [],
             "summary": {
                 "total_orphans": 0,
                 "total_loops": 0,
                 "total_missing_red_flags": 0,
+                "total_empty_branches": 0,
                 "total_issues": 0
             }
         }
