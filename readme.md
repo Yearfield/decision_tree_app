@@ -17,6 +17,10 @@ A modular Streamlit app to build, validate, and visualize hierarchical decision 
 
 ## Quickstart
 
+### Prerequisites
+- **Python**: 3.10, 3.11, or 3.12
+- **Streamlit**: 1.31.0 or higher
+
 ### 1. Install Dependencies
 ```bash
 # Create virtual environment

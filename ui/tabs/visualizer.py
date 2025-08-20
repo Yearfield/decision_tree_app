@@ -6,12 +6,30 @@ from typing import Dict, Any, List
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
+from utils.state import (
+    get_active_workbook, get_current_sheet, get_active_df, 
+    has_active_workbook, get_workbook_status
+)
 
 
 def render():
     """Render the Visualizer tab for decision tree visualization."""
     try:
         st.header("🌐 Visualizer")
+        
+        # Status badge
+        has_wb, sheet_count, current_sheet = get_workbook_status()
+        if has_wb and current_sheet:
+            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
+        else:
+            st.caption("Workbook: ❌ not loaded")
+        
+        # Guard against no active workbook
+        wb = get_active_workbook()
+        sheet = get_current_sheet()
+        if not wb or not sheet:
+            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
+            return
 
         # Get active DataFrame
         df = get_active_df()
@@ -23,10 +41,6 @@ def render():
             st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
             return
 
-        # Get sheet name from context
-        ctx = st.session_state.get("work_context", {})
-        sheet = ctx.get("sheet", "Unknown")
-
         # Main sections
         _render_visualization_options(df, sheet)
         
@@ -36,19 +50,6 @@ def render():
 
     except Exception as e:
         st.exception(e)
-
-
-def get_active_df():
-    """Get the currently active DataFrame from session state."""
-    wb_u = st.session_state.get("upload_workbook", {})
-    wb_g = st.session_state.get("gs_workbook", {})
-    ctx = st.session_state.get("work_context", {})
-    sheet = ctx.get("sheet")
-    if sheet and sheet in wb_u: 
-        return wb_u[sheet]
-    if sheet and sheet in wb_g: 
-        return wb_g[sheet]
-    return None
 
 
 def _render_visualization_options(df: pd.DataFrame, sheet_name: str):

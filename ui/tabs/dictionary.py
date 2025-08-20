@@ -6,12 +6,31 @@ from typing import Dict, Any, List
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
+from utils.state import (
+    get_active_workbook, get_current_sheet, get_active_df, 
+    has_active_workbook, get_workbook_status
+)
+from ui.utils.rerun import safe_rerun
 
 
 def render():
     """Render the Dictionary tab for managing vocabulary and term definitions."""
     try:
         st.header("📖 Dictionary")
+        
+        # Status badge
+        has_wb, sheet_count, current_sheet = get_workbook_status()
+        if has_wb and current_sheet:
+            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
+        else:
+            st.caption("Workbook: ❌ not loaded")
+        
+        # Guard against no active workbook
+        wb = get_active_workbook()
+        sheet = get_current_sheet()
+        if not wb or not sheet:
+            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
+            return
 
         # Get active DataFrame
         df = get_active_df()
@@ -22,10 +41,6 @@ def render():
         if not validate_headers(df):
             st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
             return
-
-        # Get sheet name from context
-        ctx = st.session_state.get("work_context", {})
-        sheet = ctx.get("sheet", "Unknown")
 
         # Get dictionary data
         dictionary = st.session_state.get("term_dictionary", {})
@@ -43,19 +58,6 @@ def render():
 
     except Exception as e:
         st.exception(e)
-
-
-def get_active_df():
-    """Get the currently active DataFrame from session state."""
-    wb_u = st.session_state.get("upload_workbook", {})
-    wb_g = st.session_state.get("gs_workbook", {})
-    ctx = st.session_state.get("work_context", {})
-    sheet = ctx.get("sheet")
-    if sheet and sheet in wb_u: 
-        return wb_u[sheet]
-    if sheet and sheet in wb_g: 
-        return wb_g[sheet]
-    return None
 
 
 def _render_vocabulary_overview(df: pd.DataFrame, sheet_name: str):
@@ -150,11 +152,11 @@ def _render_term_definitions(df: pd.DataFrame, dictionary: Dict, sheet_name: str
                     dictionary[selected_term] = new_definition
                     st.session_state["term_dictionary"] = dictionary
                     st.success("Definition saved!")
-                    st.rerun()
+                    safe_rerun()
             
             with col2:
                 if st.button("🗑️ Clear", key=f"clear_{selected_term}"):
-                    st.rerun()
+                    safe_rerun()
         
         # Show existing definition if any
         if current_definition:
@@ -206,7 +208,7 @@ def _render_dictionary_management(dictionary: Dict, sheet_name: str):
             if st.checkbox("Confirm reset all definitions"):
                 st.session_state["term_dictionary"] = {}
                 st.success("Dictionary reset!")
-                st.rerun()
+                safe_rerun()
     
     # Dictionary search
     st.markdown("---")

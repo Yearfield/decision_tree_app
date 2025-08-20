@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decision-tree-app"
+        version = "6.0.0"
+description = "A Streamlit application for managing decision tree structures"
+authors = [
+    {name = "Decision Tree App Team"}
+]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "streamlit>=1.31.0",
+    "pandas>=1.5.0",
+    "numpy>=1.21.0",
+    "openpyxl>=3.0.0",
+    "gspread>=5.0.0",
+    "gspread-dataframe>=3.0.0",
+    "altair>=5.0.0",
+    "matplotlib>=3.5.0"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = []
+
+[tool.ruff.per-file-ignores]
+"ui/utils/rerun.py" = ["F401"]  # allow import variations
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["utils", "ui", "logic", "io_utils"]
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 100
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

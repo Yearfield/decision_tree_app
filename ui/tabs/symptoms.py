@@ -1,11 +1,18 @@
 # ui/tabs/symptoms.py
 import streamlit as st
 import pandas as pd
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
+from utils.state import (
+    get_active_workbook, get_current_sheet, get_active_df, 
+    has_active_workbook, get_workbook_status, get_wb_nonce
+)
+from utils.constants import MAX_CHILDREN_PER_PARENT
+from utils.helpers import normalize_child_set
+from ui.utils.rerun import safe_rerun
 from logic.tree import infer_branch_options, build_label_children_index
 
 
@@ -13,6 +20,20 @@ def render():
     """Render the Symptoms tab for managing symptom quality and branch building."""
     try:
         st.header("🧬 Symptoms")
+        
+        # Status badge
+        has_wb, sheet_count, current_sheet = get_workbook_status()
+        if has_wb and current_sheet:
+            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
+        else:
+            st.caption("Workbook: ❌ not loaded")
+        
+        # Guard against no active workbook
+        wb = get_active_workbook()
+        sheet = get_current_sheet()
+        if not wb or not sheet:
+            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
+            return
 
         # Get active DataFrame
         df = get_active_df()
@@ -24,10 +45,6 @@ def render():
             st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
             return
 
-        # Get sheet name from context
-        ctx = st.session_state.get("work_context", {})
-        sheet = ctx.get("sheet", "Unknown")
-
         # Get symptom quality data
         symptom_quality = st.session_state.get("symptom_quality", {})
 
@@ -37,22 +54,13 @@ def render():
         st.markdown("---")
         
         _render_branch_building_section(df, symptom_quality, sheet)
+        
+        st.markdown("---")
+        
+        _render_branch_editor_section(df, sheet)
 
     except Exception as e:
         st.exception(e)
-
-
-def get_active_df():
-    """Get the currently active DataFrame from session state."""
-    wb_u = st.session_state.get("upload_workbook", {})
-    wb_g = st.session_state.get("gs_workbook", {})
-    ctx = st.session_state.get("work_context", {})
-    sheet = ctx.get("sheet")
-    if sheet and sheet in wb_u: 
-        return wb_u[sheet]
-    if sheet and sheet in wb_g: 
-        return wb_g[sheet]
-    return None
 
 
 def _render_symptom_quality_section(df: pd.DataFrame, symptom_quality: Dict, sheet_name: str):
@@ -105,7 +113,7 @@ def _render_symptom_quality_section(df: pd.DataFrame, symptom_quality: Dict, she
                     symptom_quality[selected_term] = new_quality
                     st.session_state["symptom_quality"] = symptom_quality
                     st.success(f"Updated '{selected_term}' quality to {new_quality}")
-                    st.rerun()
+                    safe_rerun()
     
     # Bulk quality operations
     st.markdown("---")
@@ -122,7 +130,7 @@ def _render_symptom_quality_section(df: pd.DataFrame, symptom_quality: Dict, she
             if st.checkbox("Confirm reset all quality scores"):
                 st.session_state["symptom_quality"] = {}
                 st.success("All quality scores reset!")
-                st.rerun()
+                safe_rerun()
     
     with col3:
         if st.button("💾 Export Quality Data"):
@@ -212,7 +220,7 @@ def _auto_assign_quality_scores(df: pd.DataFrame, symptom_quality: Dict):
             
             st.session_state["symptom_quality"] = symptom_quality
             st.success(f"Auto-assigned quality scores to {len(term_counts)} terms!")
-            st.rerun()
+            safe_rerun()
             
     except Exception as e:
         st.error(f"Error auto-assigning quality scores: {e}")
@@ -402,3 +410,235 @@ def _create_branch(df: pd.DataFrame, parent: str, target_level: int, children: L
         
     except Exception as e:
         st.error(f"Error creating branch: {e}")
+
+
+def _render_branch_editor_section(df: pd.DataFrame, sheet_name: str):
+    """Render the branch editor section for existing parents."""
+    st.subheader("✏️ Branch Editor")
+    st.markdown("Edit children for existing parents in the decision tree.")
+    
+    # Guard: require active df
+    if df is None or df.empty:
+        st.warning("No active DataFrame available.")
+        return
+    
+    # Level selector (2-5, because level 1's parent is <ROOT>)
+    level = st.selectbox("Node level", [2, 3, 4, 5], key="branch_editor_level")
+    
+    # Show hint for Level-1 editing
+    st.info("💡 **Note:** Level-1 (ROOT) children are managed in the ⚖️ Conflicts tab. Use the Level-1 editor there to set the Node-1 options.")
+    
+    # Get distinct parent paths at level-1
+    parent_paths = _get_parent_paths_at_level(df, level, get_wb_nonce())
+    
+    if not parent_paths:
+        st.info(f"No parent paths found at level {level}.")
+        return
+    
+    # Parent picker
+    selected_parent_path = st.selectbox(
+        "Select parent path",
+        parent_paths,
+        format_func=lambda x: " > ".join(x) if x else "<ROOT>",
+        key="branch_editor_parent"
+    )
+    
+    if not selected_parent_path:
+        st.info("Please select a parent path.")
+        return
+    
+    # Show current children for the selected parent
+    current_children = _get_current_children_for_parent(df, level, selected_parent_path, get_wb_nonce())
+    
+    st.write(f"**Current children for '{' > '.join(selected_parent_path)}' at level {level}:**")
+    if current_children:
+        st.write(f"**{len(current_children)} children:** {', '.join(current_children)}")
+    else:
+        st.write("**No children defined yet.**")
+    
+    # Multi-select existing children to include
+    st.markdown("---")
+    st.write("**Select children to include:**")
+    
+    # Get all possible children at this level from the store
+    from logic.tree import infer_branch_options
+    store = infer_branch_options(df)
+    
+    # Find the key for this parent at this level
+    parent_key = _build_parent_key(level, selected_parent_path)
+    
+    # Get existing children from store or current data
+    all_possible_children = set()
+    if parent_key in store:
+        all_possible_children.update(store[parent_key])
+    all_possible_children.update(current_children)
+    
+    if not all_possible_children:
+        st.info("No existing children found. You can add new ones below.")
+        all_possible_children = set()
+    
+    # Multi-select existing children (trim to 5)
+    selected_existing = st.multiselect(
+        "Select from existing children:",
+        sorted(all_possible_children),
+        max_selections=5,
+        key="branch_editor_existing"
+    )
+    
+    # Add new child input
+    new_child = st.text_input(
+        "Add new child (optional):",
+        placeholder="Type a new child name...",
+        key="branch_editor_new_child"
+    )
+    
+    # Build final children list
+    final_children = list(selected_existing)
+    
+    if new_child.strip():
+        new_child_clean = normalize_text(new_child)
+        if new_child_clean and new_child_clean not in final_children:
+            final_children.append(new_child_clean)
+    
+    # Use normalize_child_set to cap at MAX_CHILDREN_PER_PARENT
+    final_children = normalize_child_set(final_children)
+    
+    if len(final_children) > MAX_CHILDREN_PER_PARENT:
+        st.warning(f"Children list capped to {MAX_CHILDREN_PER_PARENT} (maximum allowed).")
+    
+    # Show final selection
+    if final_children:
+        st.write(f"**Final children set ({len(final_children)}):** {', '.join(final_children)}")
+        
+        # Apply button
+        if st.button("Apply Changes", type="primary", key="branch_editor_apply"):
+            _apply_branch_editor_changes(df, level, selected_parent_path, final_children, sheet_name)
+    else:
+        st.info("Please select at least one child to continue.")
+
+
+@st.cache_data(ttl=600)
+def _get_parent_paths_at_level(df: pd.DataFrame, level: int, nonce: str) -> List[Tuple[str, ...]]:
+    """Get distinct parent paths at a specific level."""
+    try:
+        if level < 2:
+            return []
+        
+        # Build parent columns (up to level-1)
+        parent_cols = [f"Node {i}" for i in range(1, level)]
+        if not all(col in df.columns for col in parent_cols):
+            return []
+        
+        # Get unique parent paths
+        parent_paths = df[parent_cols].apply(
+            lambda r: tuple(normalize_text(v) for v in r), axis=1
+        )
+        parent_paths = parent_paths[parent_paths.apply(
+            lambda x: all(v != "" for v in x)
+        )]
+        
+        # Return unique paths, sorted
+        unique_paths = sorted(parent_paths.unique())
+        return unique_paths
+        
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600)
+def _get_current_children_for_parent(df: pd.DataFrame, level: int, parent_path: Tuple[str, ...], nonce: str) -> List[str]:
+    """Get current children for a specific parent at a level."""
+    try:
+        if level > 5:
+            return []
+        
+        node_col = f"Node {level}"
+        if node_col not in df.columns:
+            return []
+        
+        # Find rows matching the parent path
+        matching_rows = df.copy()
+        for i, expected_value in enumerate(parent_path):
+            col = f"Node {i + 1}"
+            if col in df.columns:
+                mask = df[col].map(normalize_text) == expected_value
+                matching_rows = matching_rows[mask]
+        
+        if matching_rows.empty:
+            return []
+        
+        # Get children at this level
+        children_values = matching_rows[node_col].map(normalize_text).dropna()
+        children_values = children_values[children_values != ""]
+        
+        return sorted(children_values.unique())
+        
+    except Exception:
+        return []
+
+
+def _build_parent_key(level: int, parent_path: Tuple[str, ...]) -> str:
+    """Build the parent key for the store."""
+    if not parent_path:
+        return f"L{level}|"
+    else:
+        return f"L{level}|" + ">".join(parent_path)
+
+
+def _apply_branch_editor_changes(df: pd.DataFrame, level: int, parent_path: Tuple[str, ...], 
+                                new_children: List[str], sheet_name: str):
+    """Apply branch editor changes using override/materialization pipeline."""
+    try:
+        with st.spinner("Applying branch changes..."):
+            # Create override key
+            override_key = (level, parent_path)
+            
+            # Get current overrides
+            overrides_all = st.session_state.get("branch_overrides", {})
+            if sheet_name not in overrides_all:
+                overrides_all[sheet_name] = {}
+            
+            # Set the override for this specific parent only
+            overrides_all[sheet_name][override_key] = new_children
+            st.session_state["branch_overrides"] = overrides_all
+            
+            # Apply the override using logic.tree
+            from logic.tree import build_raw_plus_v630
+            
+            # Get the active workbook
+            from utils.state import get_active_workbook, set_active_workbook
+            active_wb = get_active_workbook()
+            
+            if active_wb and sheet_name in active_wb:
+                # Apply overrides and rebuild the sheet
+                updated_df = build_raw_plus_v630(df, overrides_all[sheet_name])
+                
+                # Update the active workbook
+                active_wb[sheet_name] = updated_df
+                set_active_workbook(active_wb, source="symptoms_editor")
+                
+                # Clear stale caches to ensure immediate refresh
+                st.cache_data.clear()
+                
+                # Show diff/preview
+                rows_affected = len(updated_df) - len(df)
+                st.success("✅ Branch changes applied successfully!")
+                st.info(f"**Delta:** {rows_affected:+d} rows affected.")
+                st.write(f"**New children set:** {', '.join(new_children)}")
+                
+                # Show small preview of changes
+                if rows_affected != 0:
+                    st.write("**Preview of changes:**")
+                    if rows_affected > 0:
+                        st.write(f"Added {rows_affected} new rows with the updated children set.")
+                    else:
+                        st.write(f"Removed {abs(rows_affected)} rows to standardize the children set.")
+                
+                # Rerun to show updated state
+                safe_rerun()
+            else:
+                st.error("Could not update active workbook.")
+                
+    except Exception as e:
+        st.error(f"Error applying branch changes: {e}")
+        st.exception(e)

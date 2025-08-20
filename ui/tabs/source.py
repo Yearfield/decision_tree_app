@@ -6,6 +6,10 @@ from typing import Dict, Any
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
+from utils.state import (
+    set_active_workbook, get_active_workbook, set_current_sheet, 
+    get_current_sheet, has_active_workbook, get_workbook_status
+)
 from logic.tree import build_raw_plus_v630 # Not fully used yet, but imported
 from io_utils.sheets import read_google_sheet
 
@@ -15,6 +19,13 @@ def render():
     try:
         st.header("📂 Source")
         st.markdown("Load/create your decision tree data.")
+        
+        # Status badge
+        has_wb, sheet_count, current_sheet = get_workbook_status()
+        if has_wb and current_sheet:
+            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
+        else:
+            st.caption("Workbook: ❌ not loaded")
 
         _render_upload_section()
         st.markdown("---")
@@ -66,19 +77,79 @@ def _render_upload_section():
                 sheets[name] = dfx
             wb = sheets
         
-        st.session_state["upload_workbook"] = wb
+        # Validate that we got proper DataFrames
+        from utils.state import coerce_workbook_to_dataframes
+        clean_wb = coerce_workbook_to_dataframes(wb)
+        if not clean_wb:
+            st.error("Uploaded workbook did not contain any valid sheets (as DataFrames).")
+            return
+        
+        # Store filename for display
         st.session_state["upload_filename"] = file.name
-        st.success(f"Loaded {len(wb)} sheet(s) into session.")
+        
+        # Set as active workbook using canonical API
+        set_active_workbook(clean_wb, source="upload")
+        
+        # Clear stale caches to ensure immediate refresh
+        st.cache_data.clear()
+        
+        # Sanity assertions (temporary; safe to remove later)
+        from utils.state import get_active_workbook, get_current_sheet
+        wb_check, sheet_check = get_active_workbook(), get_current_sheet()
+        assert wb_check is not None, "active workbook missing after upload"
+        assert isinstance(wb_check, dict), "active workbook should be Dict[str, DataFrame]"
+        assert sheet_check is None or sheet_check in wb_check, "current_sheet must be a key of active workbook"
+        
+        st.success(f"Loaded {len(clean_wb)} sheet(s) into session.")
 
 
 def _render_google_sheets_section():
     """Render the Google Sheets loading section."""
     st.subheader("🔄 Google Sheets")
-    sid = st.text_input("Spreadsheet ID", value=st.session_state.get("gs_spreadsheet_id", ""))
-    if sid:
-        st.session_state["gs_spreadsheet_id"] = sid
     
-    gs_sheet = st.text_input("Sheet name to load (e.g., BP)", value=st.session_state.get("gs_default_sheet", "BP"))
+    # Re-sync button for current sheet
+    if has_active_workbook() and get_current_sheet():
+        if st.button("🔄 Re-sync current sheet"):
+            sheet_id = st.session_state.get("sheet_id")
+            sheet_name = st.session_state.get("sheet_name")
+            if sheet_id and sheet_name:
+                try:
+                    if "gcp_service_account" not in st.secrets:
+                        st.error("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
+                    else:
+                        # Re-read sheet and replace that entry in active workbook
+                        with st.spinner("Re-syncing..."):
+                            new_df = read_google_sheet(sheet_id, sheet_name, st.secrets["gcp_service_account"])
+                            if not new_df.empty:
+                                wb = get_active_workbook() or {}
+                                wb[sheet_name] = new_df
+                                set_active_workbook(wb, source="sheets")
+                                
+                                # Clear stale caches to ensure immediate refresh
+                                st.cache_data.clear()
+                                
+                                # Sanity assertions (temporary; safe to remove later)
+                                from utils.state import get_active_workbook, get_current_sheet
+                                wb_check, sheet_check = get_active_workbook(), get_current_sheet()
+                                assert wb_check is not None, "active workbook missing after re-sync"
+                                assert isinstance(wb_check, dict), "active workbook should be Dict[str, DataFrame]"
+                                assert sheet_check is None or sheet_check in wb_check, "current_sheet must be a key of active workbook"
+                                
+                                st.success(f"Re-synced '{sheet_name}' from Google Sheets.")
+                            else:
+                                st.warning("Selected sheet is empty or not found.")
+                except Exception as e:
+                    st.error(f"Google Sheets error: {e}")
+            else:
+                st.info("No stored Google Sheet ID/name to re-sync.")
+    
+    sid = st.text_input("Spreadsheet ID", value=st.session_state.get("sheet_id", ""))
+    if sid:
+        st.session_state["sheet_id"] = sid
+    
+    gs_sheet = st.text_input("Sheet name to load (e.g., BP)", value=st.session_state.get("sheet_name", "BP"))
+    if gs_sheet:
+        st.session_state["sheet_name"] = gs_sheet
     
     if st.button("Load / Refresh from Google Sheets"):
         try:
@@ -89,11 +160,54 @@ def _render_google_sheets_section():
                 if df_g.empty and gs_sheet:
                     st.warning("Selected sheet is empty or not found.")
                 else:
-                    wb_g = st.session_state.get("gs_workbook", {})
-                    wb_g[gs_sheet] = df_g
-                    st.session_state["gs_workbook"] = wb_g
-                    st.session_state["gs_default_sheet"] = gs_sheet
-                    st.success(f"Loaded '{gs_sheet}' from Google Sheets.")
+                    # Validate that we got a proper DataFrame
+                    if not isinstance(df_g, pd.DataFrame):
+                        st.error("Google Sheets loader returned invalid data type. Expected DataFrame.")
+                        return
+                    
+                    # Create workbook with the loaded sheet
+                    wb_g = {gs_sheet: df_g}
+                    
+                    # Use the new verification utilities to ensure proper DataFrame storage
+                    from utils.state import set_active_workbook, verify_active_workbook, coerce_workbook_to_dataframes
+                    
+                    clean_wb = coerce_workbook_to_dataframes(wb_g)
+                    if not clean_wb:
+                        st.error("Loaded workbook contained no valid (non-empty) sheets. Check the sheet content.")
+                        return
+                    
+                    # Choose default sheet deterministically:
+                    default_sheet = gs_sheet if gs_sheet in clean_wb else list(clean_wb.keys())[0]
+                    
+                    # Store sheet metadata
+                    st.session_state["sheet_id"] = sid
+                    st.session_state["sheet_name"] = default_sheet
+                    
+                    # Set as active workbook using canonical API
+                    set_active_workbook(clean_wb, default_sheet=default_sheet, source="sheets")
+                    
+                    # Clear stale caches - the nonce-based system should handle this automatically,
+                    # but we'll clear explicitly to ensure immediate refresh
+                    st.cache_data.clear()
+                    
+                    # Show verification report for debugging
+                    rep = verify_active_workbook()
+                    with st.expander("Workbook verification (loader)", expanded=False):
+                        st.json(rep)
+                    
+                    # Sanity assertions (temporary; safe to remove later)
+                    from utils.state import get_active_workbook, get_current_sheet
+                    wb, sheet = get_active_workbook(), get_current_sheet()
+                    assert wb is not None, "active workbook missing after load"
+                    assert isinstance(wb, dict), "active workbook should be Dict[str, DataFrame]"
+                    assert sheet is None or sheet in wb, "current_sheet must be a key of active workbook"
+                    
+                    # As a sanity test for BP sheet
+                    if "BP" in clean_wb:
+                        st.write("BP head():")
+                        st.dataframe(clean_wb["BP"].head(5), use_container_width=True)
+                    
+                    st.success(f"Loaded '{default_sheet}' from Google Sheets and stored in session state.")
         except Exception as e:
             st.error(f"Google Sheets error: {e}")
 
@@ -102,56 +216,72 @@ def _render_vm_builder_section():
     """Render the VM Builder section."""
     st.subheader("🧩 VM Builder (add VMs to an existing sheet)")
     
-    # Pick target workbook + sheet
-    vm_target_src = st.radio("Target workbook", ["Upload workbook", "Google Sheets workbook"], horizontal=True, key="vm_builder_target")
-    target_wb = (st.session_state.get("upload_workbook", {}) if vm_target_src == "Upload workbook" 
-                 else st.session_state.get("gs_workbook", {}))
+    # Check active workbook status
+    active_wb = get_active_workbook()
+    current_sheet = get_current_sheet()
     
-    if not target_wb:
-        st.info("Load a workbook first above.")
+    if not active_wb:
+        st.info("No active workbook. Paste a Google Sheet ID in this tab or upload a file.")
+        return
+    
+    # Show active workbook status
+    st.info(f"Active workbook detected. VM Builder will write overrides to the current sheet ({current_sheet}).")
+    
+    # Use the active workbook directly instead of legacy selection
+    target_wb = active_wb
+    tgt_sheet = current_sheet
+    
+    # Allow sheet selection if multiple sheets exist
+    if len(target_wb) > 1:
+        tgt_sheet = st.selectbox("Target sheet", list(target_wb.keys()), index=list(target_wb.keys()).index(current_sheet), key="vm_builder_sheet")
+    
+    add_vm_cols = st.columns([3, 1])
+    
+    with add_vm_cols[0]:
+        vm_new = st.text_input("Add VM (free type; press Enter to enqueue)", key="vm_builder_new")
+    with add_vm_cols[1]:
+        if st.button("➕ Enqueue VM"):
+            vm_list = st.session_state.get("vm_builder_queue", [])
+            if normalize_text(vm_new):
+                vm_list.append(normalize_text(vm_new))
+                st.session_state["vm_builder_queue"] = vm_list
+                st.session_state["vm_builder_new"] = ""
+    
+    vm_list = st.session_state.get("vm_builder_queue", [])
+    if vm_list:
+        st.write("Queued VMs:", ", ".join(vm_list))
+        if st.button("Create rows for these VMs"):
+            df = target_wb.get(tgt_sheet, pd.DataFrame(columns=CANON_HEADERS)).copy()
+            for vm in vm_list:
+                new_row = {c: "" for c in CANON_HEADERS}
+                new_row["Vital Measurement"] = vm
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            
+            # Update the active workbook directly
+            target_wb[tgt_sheet] = df
+            set_active_workbook(target_wb, source="vm_builder")
+            
+            # Clear stale caches to ensure immediate refresh
+            st.cache_data.clear()
+            
+            st.session_state["vm_builder_queue"] = []
+            st.success(f"Added {len(vm_list)} VM base row(s) to '{tgt_sheet}'. Use Symptoms/Conflicts or Wizard to build branches.")
     else:
-        tgt_sheet = st.selectbox("Target sheet", list(target_wb.keys()), key="vm_builder_sheet")
-        add_vm_cols = st.columns([3, 1])
-        
-        with add_vm_cols[0]:
-            vm_new = st.text_input("Add VM (free type; press Enter to enqueue)", key="vm_builder_new")
-        with add_vm_cols[1]:
-            if st.button("➕ Enqueue VM"):
-                vm_list = st.session_state.get("vm_builder_queue", [])
-                if normalize_text(vm_new):
-                    vm_list.append(normalize_text(vm_new))
-                    st.session_state["vm_builder_queue"] = vm_list
-                    st.session_state["vm_builder_new"] = ""
-        
-        vm_list = st.session_state.get("vm_builder_queue", [])
-        if vm_list:
-            st.write("Queued VMs:", ", ".join(vm_list))
-            if st.button("Create rows for these VMs"):
-                wb = (st.session_state.get("upload_workbook", {}) if vm_target_src == "Upload workbook" 
-                      else st.session_state.get("gs_workbook", {}))
-                df = wb.get(tgt_sheet, pd.DataFrame(columns=CANON_HEADERS)).copy()
-                for vm in vm_list:
-                    new_row = {c: "" for c in CANON_HEADERS}
-                    new_row["Vital Measurement"] = vm
-                    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                wb[tgt_sheet] = df
-                if vm_target_src == "Upload workbook":
-                    st.session_state["upload_workbook"] = wb
-                else:
-                    st.session_state["gs_workbook"] = wb
-                st.session_state["vm_builder_queue"] = []
-                st.success(f"Added {len(vm_list)} VM base row(s) to '{tgt_sheet}'. Use Symptoms/Conflicts or Wizard to build branches.")
-        else:
-            st.caption("No VMs queued yet.")
+        st.caption("No VMs queued yet.")
 
 
 def _render_new_sheet_wizard_section():
     """Render the New Sheet Wizard section."""
     st.subheader("🧙 New Sheet Wizard (create sheet + seed branches)")
     
-    wiz_src = st.radio("Create in workbook", ["Upload workbook", "Google Sheets workbook"], horizontal=True, key="wiz_target_src")
-    wiz_wb = (st.session_state.get("upload_workbook", {}) if wiz_src == "Upload workbook" 
-              else st.session_state.get("gs_workbook", {}))
+    # Use canonical workbook instead of legacy access
+    active_wb = get_active_workbook()
+    if not active_wb:
+        st.info("No active workbook. Please load a workbook first (upload or Google Sheets).")
+        return
+    
+    wiz_src = "Active workbook"  # Simplified since we're using canonical workbook
+    wiz_wb = active_wb  # Use the canonical workbook directly
     
     # Step 1: name sheet
     if "wiz_step" not in st.session_state:
@@ -274,13 +404,15 @@ def _render_new_sheet_wizard_section():
 
                 # Attach to workbook
                 wiz_wb[name] = df_new
-                if wiz_src == "Upload workbook":
-                    st.session_state["upload_workbook"] = wiz_wb
-                else:
-                    st.session_state["gs_workbook"] = wiz_wb
-
+                
+                # Set as active workbook using canonical API
+                set_active_workbook(wiz_wb, default_sheet=name, source="wizard")
+                
+                # Clear stale caches to ensure immediate refresh
+                st.cache_data.clear()
+                
                 # Set context to new sheet
-                st.session_state["work_context"] = {"source": "upload" if wiz_src == "Upload workbook" else "gs", "sheet": name}
+                st.session_state["work_context"] = {"source": "wizard", "sheet": name}
 
                 st.success(
                     f"Created '{name}' with {len(vms)} VM(s). "

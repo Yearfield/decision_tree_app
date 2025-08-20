@@ -6,26 +6,32 @@ Refactored from monolith to clean modular architecture
 import streamlit as st
 import pandas as pd
 import numpy as np
+import time
 from typing import Dict, Any, Tuple, List
 
 from utils import APP_VERSION, CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
+from utils.state import (
+    set_active_workbook, get_active_workbook, set_current_sheet, get_current_sheet,
+    get_active_df, has_active_workbook, get_workbook_status, migrate_legacy_state,
+    get_wb_nonce, verify_active_workbook
+)
 from logic.tree import get_cached_branch_options
 from logic.validate import (
     get_cached_orphan_nodes, get_cached_loops, get_cached_validation_report
 )
 from ui.tabs import (
     source, workspace, validation, conflicts, triage, actions, 
-    symptoms, dictionary, visualizer, push_log
+    symptoms, dictionary, calculator, visualizer, push_log
 )
 
 
 def main():
     """Main application entry point."""
     # Page configuration
-st.set_page_config(
-        page_title=f"Decision Tree Builder {APP_VERSION}",
-    page_icon="🌳",
-    layout="wide",
+    st.set_page_config(
+        page_title=f"Decision Tree App {APP_VERSION}",
+        page_icon="🌳",
+        layout="wide",
         initial_sidebar_state="expanded"
     )
     
@@ -41,7 +47,17 @@ st.set_page_config(
 
 def _initialize_session_state():
     """Initialize all session state variables."""
-    # Core workbook state
+    # Core workbook state (unified)
+    if "workbook" not in st.session_state:
+        st.session_state["workbook"] = {}
+    
+    if "current_sheet" not in st.session_state:
+        st.session_state["current_sheet"] = None
+    
+    if "wb_nonce" not in st.session_state:
+        st.session_state["wb_nonce"] = ""
+    
+    # Legacy state (kept for backward compatibility during migration)
     if "upload_workbook" not in st.session_state:
         st.session_state["upload_workbook"] = {}
     
@@ -50,9 +66,6 @@ def _initialize_session_state():
     
     if "work_context" not in st.session_state:
         st.session_state["work_context"] = {}
-    
-    if "current_sheet" not in st.session_state:
-        st.session_state["current_sheet"] = None
     
     # Branch overrides and symptom quality
     if "branch_overrides" not in st.session_state:
@@ -71,6 +84,9 @@ def _initialize_session_state():
     # UI state
     if "current_tab" not in st.session_state:
         st.session_state["current_tab"] = "source"
+    
+    # Migrate legacy state to unified format
+    migrate_legacy_state()
 
 
 def _render_header():
@@ -78,32 +94,60 @@ def _render_header():
     col1, col2, col3 = st.columns([2, 1, 1])
     
     with col1:
-        st.title(f"🌳 Decision Tree Builder {APP_VERSION}")
+        st.title(f"🌳 Decision Tree App {APP_VERSION}")
         st.markdown("Build, validate, and manage decision trees with ease")
     
     with col2:
-        # Show active workbook info
-        if _has_active_workbook():
-            ctx = st.session_state.get("work_context", {})
-            source_type = ctx.get("source", "None")
-            sheet_name = ctx.get("sheet", "None")
-            
-            if source_type and sheet_name:
-                st.info(f"📁 {source_type.upper()}: {sheet_name}")
-            else:
-                st.info("📁 No sheet selected")
+        # Global active-sheet selector
+        wb = get_active_workbook()
+        sheet = get_current_sheet()
+        if wb:
+            options = list(wb.keys())
+            if options:
+                idx = options.index(sheet) if sheet in options else 0
+                new_sheet = st.selectbox("Active sheet", options, index=idx, key="__active_sheet_box")
+                if new_sheet != sheet:
+                    set_current_sheet(new_sheet)
+            st.caption(f"Workbook: ✅ {len(wb)} sheet(s) • Active: **{get_current_sheet()}**")
         else:
-            st.warning("📁 No workbook loaded")
+            st.caption("Workbook: ❌ not loaded")
     
     with col3:
-        # Show header badge if we have data
-        if _has_active_workbook():
-            ctx = st.session_state.get("work_context", {})
-            if ctx.get("sheet"):
-                df = _get_current_dataframe()
-                if not df.empty:
-                    badge = compute_header_badge(df)
-                    st.metric("Data Quality", f"{badge['parent_score']}/{badge['row_score']}")
+        # Dev Panel instrumentation
+        with st.expander("🛠 Dev Panel", expanded=False):
+            try:
+                import pandas as pd
+                
+                # Show verification report
+                rep = verify_active_workbook()
+                st.write("**Workbook Verification:**")
+                st.json(rep)
+                
+                # Show DataFrame preview
+                df = get_active_df()
+                if isinstance(df, pd.DataFrame):
+                    st.caption(f"Headers: {list(df.columns)[:8]}{' …' if len(df.columns)>8 else ''}")
+                    st.dataframe(df.head(10), use_container_width=True)
+                else:
+                    st.info("Active df not available (not a DataFrame).")
+                
+                # Show basic state info
+                wb = get_active_workbook()
+                sheet = get_current_sheet()
+                st.write("**Basic State:**")
+                st.write({
+                    "workbook_source": st.session_state.get("workbook_source"),
+                    "sheet_id": st.session_state.get("sheet_id"),
+                    "sheet_name": st.session_state.get("sheet_name"),
+                    "current_sheet": sheet,
+                    "wb_nonce": get_wb_nonce(),
+                    "wb_keys": list(wb.keys()) if isinstance(wb, dict) else None,
+                    "df_shape": (df.shape if isinstance(df, pd.DataFrame) else None),
+                    "ts": time.strftime("%H:%M:%S")
+                })
+            except Exception as e:
+                st.error(f"Dev Panel error: {e}")
+                st.write("State inspection failed - app continues normally")
 
 
 def _render_main_content():
@@ -118,7 +162,7 @@ def _render_main_content():
         ("⚡ Actions", actions.render),
         ("🧬 Symptoms", symptoms.render),
         ("📖 Dictionary", dictionary.render),
-        ("🧮 Calculator", lambda: st.info("Moved into Validation/Visualizer for now")),
+        ("🧮 Calculator", calculator.render),
         ("🌐 Visualizer", visualizer.render),
         ("📜 Push Log", push_log.render),
     ]
@@ -137,45 +181,19 @@ def _render_main_content():
                 st.exception(e)
 
 
-def _has_active_workbook() -> bool:
-    """Check if there's an active workbook in session state."""
-    upload_wb = st.session_state.get("upload_workbook", {})
-    gs_wb = st.session_state.get("gs_workbook", {})
-    return bool(upload_wb or gs_wb)
-
-
-def _get_current_dataframe() -> pd.DataFrame:
-    """Get the current active DataFrame."""
-    try:
-        ctx = st.session_state.get("work_context", {})
-        src = ctx.get("source")
-        sheet = ctx.get("sheet")
-        
-        if not src or not sheet:
-            return pd.DataFrame()
-        
-        if src == "upload":
-            wb = st.session_state.get("upload_workbook", {})
-else:
-            wb = st.session_state.get("gs_workbook", {})
-        
-        if sheet in wb:
-            return wb[sheet]
-        
-        return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-
 def _get_cache_key(sheet_name: str, data_shape: Tuple[int, int], data_hash: str) -> Tuple:
     """Generate a cache key for heavy computations."""
     return (sheet_name, APP_VERSION, data_shape, data_hash)
 
 
 @st.cache_data(ttl=600)
-def compute_header_badge(df: pd.DataFrame) -> Dict[str, Any]:
+def compute_header_badge(df: pd.DataFrame, nonce: str) -> Dict[str, Any]:
     """Compute header badge metrics for the active sheet.
     
+    Args:
+        df: DataFrame with decision tree data
+        nonce: Workbook nonce for cache invalidation
+        
     Returns:
         Dict with 'parent_score' and 'row_score' metrics
     """
@@ -199,12 +217,13 @@ def compute_header_badge(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 @st.cache_data(ttl=600)
-def get_cached_branch_options_for_ui(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any]:
+def get_cached_branch_options_for_ui(df: pd.DataFrame, sheet_name: str, nonce: str) -> Dict[str, Any]:
     """Cached branch options computation for UI.
     
     Args:
         df: DataFrame with decision tree data
         sheet_name: Name of the current sheet
+        nonce: Workbook nonce for cache invalidation
         
     Returns:
         Dictionary mapping level keys to lists of possible values
@@ -225,12 +244,13 @@ def get_cached_branch_options_for_ui(df: pd.DataFrame, sheet_name: str) -> Dict[
 
 
 @st.cache_data(ttl=600)
-def get_cached_validation_summary_for_ui(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any]:
+def get_cached_validation_summary_for_ui(df: pd.DataFrame, sheet_name: str, nonce: str) -> Dict[str, Any]:
     """Cached validation summary computation for UI.
     
     Args:
         df: DataFrame with decision tree data
         sheet_name: Name of the current sheet
+        nonce: Workbook nonce for cache invalidation
         
     Returns:
         Dictionary containing validation summary and details
@@ -271,12 +291,13 @@ def get_cached_validation_summary_for_ui(df: pd.DataFrame, sheet_name: str) -> D
 
 
 @st.cache_data(ttl=600)
-def get_cached_conflict_summary_for_ui(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any]:
+def get_cached_conflict_summary_for_ui(df: pd.DataFrame, sheet_name: str, nonce: str) -> Dict[str, Any]:
     """Cached conflict summary computation for UI.
     
     Args:
         df: DataFrame with decision tree data
         sheet_name: Name of the current sheet
+        nonce: Workbook nonce for cache invalidation
         
     Returns:
         Dictionary containing conflict summary and details
@@ -311,7 +332,7 @@ def get_cached_conflict_summary_for_ui(df: pd.DataFrame, sheet_name: str) -> Dic
             "conflict_types": conflict_types
         }
         
-        except Exception:
+    except Exception:
         return {
             "total_conflicts": 0,
             "conflicts": [],
@@ -440,17 +461,7 @@ def _compute_row_completeness_score(df: pd.DataFrame) -> Dict[str, int]:
         return {"ok": 0, "total": 0}
 
 
-def get_active_df():
-    """Get the currently active DataFrame from session state."""
-    wb_u = st.session_state.get("upload_workbook", {})
-    wb_g = st.session_state.get("gs_workbook", {})
-    ctx = st.session_state.get("work_context", {})
-    sheet = ctx.get("sheet")
-    if sheet and sheet in wb_u: 
-        return wb_u[sheet]
-    if sheet and sheet in wb_g: 
-        return wb_g[sheet]
-    return None
+
 
 
 if __name__ == "__main__":

@@ -6,12 +6,31 @@ from typing import Dict, Any, List
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
+from utils.state import (
+    get_active_workbook, get_current_sheet, get_active_df, 
+    has_active_workbook, get_workbook_status, set_active_workbook
+)
+from ui.utils.rerun import safe_rerun
 
 
 def render():
     """Render the Diagnostic Triage tab for managing triage decisions."""
     try:
         st.header("🩺 Diagnostic Triage")
+        
+        # Status badge
+        has_wb, sheet_count, current_sheet = get_workbook_status()
+        if has_wb and current_sheet:
+            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
+        else:
+            st.caption("Workbook: ❌ not loaded")
+        
+        # Guard against no active workbook
+        wb = get_active_workbook()
+        sheet = get_current_sheet()
+        if not wb or not sheet:
+            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
+            return
 
         # Get active DataFrame
         df = get_active_df()
@@ -22,10 +41,6 @@ def render():
         if not validate_headers(df):
             st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
             return
-
-        # Get sheet name from context
-        ctx = st.session_state.get("work_context", {})
-        sheet = ctx.get("sheet", "Unknown")
 
         # Main sections
         _render_triage_overview(df, sheet)
@@ -40,19 +55,6 @@ def render():
 
     except Exception as e:
         st.exception(e)
-
-
-def get_active_df():
-    """Get the currently active DataFrame from session state."""
-    wb_u = st.session_state.get("upload_workbook", {})
-    wb_g = st.session_state.get("gs_workbook", {})
-    ctx = st.session_state.get("work_context", {})
-    sheet = ctx.get("sheet")
-    if sheet and sheet in wb_u: 
-        return wb_u[sheet]
-    if sheet and sheet in wb_g: 
-        return wb_g[sheet]
-    return None
 
 
 def _render_triage_overview(df: pd.DataFrame, sheet_name: str):
@@ -239,21 +241,19 @@ def _save_triage_changes(df: pd.DataFrame, edited_triage: Dict, sheet_name: str)
                 changes_made += 1
         
         if changes_made > 0:
-            # Update the workbook in session state
-            ctx = st.session_state.get("work_context", {})
-            src = ctx.get("source")
-            
-            if src == "upload":
-                wb = st.session_state.get("upload_workbook", {})
-                wb[sheet_name] = df
-                st.session_state["upload_workbook"] = wb
+            # Update the active workbook using canonical API
+            active_wb = get_active_workbook()
+            if active_wb and sheet_name in active_wb:
+                active_wb[sheet_name] = df
+                set_active_workbook(active_wb, source="triage_editor")
+                
+                # Clear stale caches to ensure immediate refresh
+                st.cache_data.clear()
+                
+                st.success(f"Saved {changes_made} triage changes!")
+                safe_rerun()
             else:
-                wb = st.session_state.get("gs_workbook", {})
-                wb[sheet_name] = df
-                st.session_state["gs_workbook"] = wb
-            
-            st.success(f"Saved {changes_made} triage changes!")
-            st.rerun()
+                st.error("Could not update active workbook.")
         else:
             st.info("No changes to save.")
             
@@ -283,7 +283,7 @@ def _apply_bulk_triage(df: pd.DataFrame, pattern_col: str, pattern_value: str, t
         _update_workbook(df, sheet_name)
         
         st.success(f"Applied triage decision to {matching_rows} rows!")
-        st.rerun()
+        safe_rerun()
         
     except Exception as e:
         st.error(f"Error applying bulk triage: {e}")
@@ -295,7 +295,7 @@ def _clear_all_triage(df: pd.DataFrame, sheet_name: str):
         df["Diagnostic Triage"] = ""
         _update_workbook(df, sheet_name)
         st.success("Cleared all triage decisions!")
-        st.rerun()
+        safe_rerun()
         
     except Exception as e:
         st.error(f"Error clearing triage: {e}")
@@ -313,26 +313,25 @@ def _copy_column_as_triage(df: pd.DataFrame, source_col: str, sheet_name: str):
         _update_workbook(df, sheet_name)
         
         st.success(f"Copied values from '{source_col}' as triage decisions!")
-        st.rerun()
+        safe_rerun()
         
     except Exception as e:
         st.error(f"Error copying column: {e}")
 
 
 def _update_workbook(df: pd.DataFrame, sheet_name: str):
-    """Update the workbook in session state."""
+    """Update the workbook in session state using canonical API."""
     try:
-        ctx = st.session_state.get("work_context", {})
-        src = ctx.get("source")
-        
-        if src == "upload":
-            wb = st.session_state.get("upload_workbook", {})
-            wb[sheet_name] = df
-            st.session_state["upload_workbook"] = wb
+        from utils.state import get_active_workbook, set_active_workbook
+        active_wb = get_active_workbook()
+        if active_wb and sheet_name in active_wb:
+            active_wb[sheet_name] = df
+            set_active_workbook(active_wb, source="triage_bulk")
+            
+            # Clear stale caches to ensure immediate refresh
+            st.cache_data.clear()
         else:
-            wb = st.session_state.get("gs_workbook", {})
-            wb[sheet_name] = df
-            st.session_state["gs_workbook"] = wb
+            st.error("Could not update active workbook.")
             
     except Exception as e:
         st.error(f"Error updating workbook: {e}")

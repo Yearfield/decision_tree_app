@@ -6,12 +6,30 @@ from typing import Dict, Any, List
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
+from utils.state import (
+    get_active_workbook, get_current_sheet, get_active_df, 
+    has_active_workbook, get_workbook_status
+)
 
 
 def render():
     """Render the Validation tab for checking decision tree integrity."""
     try:
         st.header("🧪 Validation rules")
+        
+        # Status badge
+        has_wb, sheet_count, current_sheet = get_workbook_status()
+        if has_wb and current_sheet:
+            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
+        else:
+            st.caption("Workbook: ❌ not loaded")
+        
+        # Guard against no active workbook
+        wb = get_active_workbook()
+        sheet = get_current_sheet()
+        if not wb or not sheet:
+            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
+            return
 
         # Get active DataFrame
         df = get_active_df()
@@ -22,10 +40,6 @@ def render():
         if not validate_headers(df):
             st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
             return
-
-        # Get sheet name from context
-        ctx = st.session_state.get("work_context", {})
-        sheet = ctx.get("sheet", "Unknown")
 
         # Get overrides and red flag data
         overrides_all = st.session_state.get("branch_overrides", {})
@@ -45,32 +59,13 @@ def render():
         st.exception(e)
 
 
-def get_active_df():
-    """Get the currently active DataFrame from session state."""
-    wb_u = st.session_state.get("upload_workbook", {})
-    wb_g = st.session_state.get("gs_workbook", {})
-    ctx = st.session_state.get("work_context", {})
-    sheet = ctx.get("sheet")
-    if sheet and sheet in wb_u: 
-        return wb_u[sheet]
-    if sheet and sheet in wb_g: 
-        return wb_g[sheet]
-    return None
-
-
-def _has_active_workbook() -> bool:
-    """Check if there's an active workbook in session state."""
-    upload_wb = st.session_state.get("upload_workbook", {})
-    gs_wb = st.session_state.get("gs_workbook", {})
-    return bool(upload_wb or gs_wb)
-
-
 def _run_validation_checks(df: pd.DataFrame, overrides_sheet: Dict, show_loose: bool, show_strict: bool, sheet_name: str):
     """Run all validation checks and display results."""
     try:
         # Get cached validation report
         from streamlit_app_upload import get_cached_validation_summary_for_ui
-        report = get_cached_validation_summary_for_ui(df, sheet_name)
+        from utils.state import get_wb_nonce
+        report = get_cached_validation_summary_for_ui(df, sheet_name, get_wb_nonce())
         
         # Display summary
         st.subheader("📊 Validation Summary")
@@ -120,7 +115,8 @@ def _display_orphan_analysis(df: pd.DataFrame, overrides_sheet: Dict, show_loose
     # Use the cached validation functions from the main app
     if show_loose:
         from streamlit_app_upload import get_cached_validation_summary_for_ui
-        report = get_cached_validation_summary_for_ui(df, sheet_name)
+        from utils.state import get_wb_nonce
+        report = get_cached_validation_summary_for_ui(df, sheet_name, get_wb_nonce())
         orphans_loose = report["orphans"]
         
         colA, colB = st.columns(2)

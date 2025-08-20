@@ -7,6 +7,11 @@ from datetime import datetime
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
+from utils.state import (
+    get_active_workbook, get_current_sheet, get_active_df, 
+    has_active_workbook, get_workbook_status
+)
+from ui.utils.rerun import safe_rerun
 from io_utils.sheets import make_push_log_entry
 
 
@@ -14,6 +19,20 @@ def render():
     """Render the Push Log tab for managing data push operations."""
     try:
         st.header("📜 Push Log")
+        
+        # Status badge
+        has_wb, sheet_count, current_sheet = get_workbook_status()
+        if has_wb and current_sheet:
+            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
+        else:
+            st.caption("Workbook: ❌ not loaded")
+        
+        # Guard against no active workbook
+        wb = get_active_workbook()
+        sheet = get_current_sheet()
+        if not wb or not sheet:
+            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
+            return
 
         # Get active DataFrame
         df = get_active_df()
@@ -25,10 +44,8 @@ def render():
             st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
             return
 
-        # Get sheet name and source from context
-        ctx = st.session_state.get("work_context", {})
-        sheet = ctx.get("sheet", "Unknown")
-        src = ctx.get("source", "upload")
+        # Get source (legacy - could be updated later)
+        src = "upload"  # Default for now
 
         # Main sections
         _render_push_log_overview(sheet)
@@ -43,26 +60,6 @@ def render():
 
     except Exception as e:
         st.exception(e)
-
-
-def get_active_df():
-    """Get the currently active DataFrame from session state."""
-    wb_u = st.session_state.get("upload_workbook", {})
-    wb_g = st.session_state.get("gs_workbook", {})
-    ctx = st.session_state.get("work_context", {})
-    sheet = ctx.get("sheet")
-    if sheet and sheet in wb_u: 
-        return wb_u[sheet]
-    if sheet and sheet in wb_g: 
-        return wb_g[sheet]
-    return None
-
-
-def _has_active_workbook() -> bool:
-    """Check if there's an active workbook in session state."""
-    upload_wb = st.session_state.get("upload_workbook", {})
-    gs_wb = st.session_state.get("gs_workbook", {})
-    return bool(upload_wb or gs_wb)
 
 
 def _render_push_log_overview(sheet_name: str):
@@ -451,7 +448,7 @@ def _execute_push(df: pd.DataFrame, sheet_name: str, source: str, push_type: str
             else:
                 st.success(f"✅ Successfully exported {rows_count} rows to file!")
             
-            st.rerun()
+            safe_rerun()
             
     except Exception as e:
         st.error(f"❌ Push operation failed: {e}")

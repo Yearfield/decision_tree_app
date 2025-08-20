@@ -1,0 +1,52 @@
+name: CI Checks
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  lint-and-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install ruff
+        
+    - name: Run Ruff linting
+      run: |
+        ruff check . --output-format=github
+        
+    - name: Run custom CI checks
+      run: |
+        chmod +x scripts/ci_checks.sh
+        ./scripts/ci_checks.sh
+        
+    - name: Verify no direct rerun calls
+      run: |
+        # Double-check: no st.rerun or st.experimental_rerun calls outside of ui/utils/rerun.py
+        if grep -r "st\.\(experimental_\)\?rerun(" --exclude-dir=.venv --exclude-dir=__pycache__ --exclude-dir=.git --exclude=ui/utils/rerun.py .; then
+          echo "❌ ERROR: Found direct rerun calls. Use safe_rerun() instead."
+          exit 1
+        fi
+        echo "✅ No direct rerun calls found"
+        
+    - name: Verify no state helper shadowing
+      run: |
+        # Check for function parameters that shadow state helpers
+        if find . -name "*.py" -not -path "./.venv/*" -not -path "./__pycache__/*" -not -path "./utils/state.py" -exec grep -l "def .*(" {} \; | xargs grep -h "def .*(" | grep -E "(get_current_sheet|get_active_df|get_active_workbook|set_current_sheet|get_wb_nonce|set_active_workbook)"; then
+          echo "❌ ERROR: Found state helper shadowing in function parameters"
+          exit 1
+        fi
+        echo "✅ No state helper shadowing found"

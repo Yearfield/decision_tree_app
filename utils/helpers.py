@@ -2,7 +2,7 @@
 from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
 import pandas as pd
-from .constants import CANON_HEADERS, LEVEL_COLS, MAX_LEVELS
+from .constants import CANON_HEADERS, LEVEL_COLS, MAX_LEVELS, MAX_CHILDREN_PER_PARENT
 
 def normalize_text(x) -> str:
     """Return a stripped string, converting NaN/None to ""."""
@@ -84,3 +84,17 @@ def enforce_k_five(opts: List[str]) -> List[str]:
     elif len(clean) < 5:
         clean = clean + [""]*(5-len(clean))
     return clean
+
+
+def normalize_child_set(values: list[str]) -> list[str]:
+    """Deduplicate in order, strip blanks, cap to MAX_CHILDREN_PER_PARENT."""
+    out = []
+    for v in values or []:
+        v = normalize_text(v)
+        if not v: 
+            continue
+        if v not in out:
+            out.append(v)
+        if len(out) >= MAX_CHILDREN_PER_PARENT:
+            break
+    return out
