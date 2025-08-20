@@ -22,10 +22,10 @@ from ui.tabs import (
 def main():
     """Main application entry point."""
     # Page configuration
-    st.set_page_config(
+st.set_page_config(
         page_title=f"Decision Tree Builder {APP_VERSION}",
-        page_icon="🌳",
-        layout="wide",
+    page_icon="🌳",
+    layout="wide",
         initial_sidebar_state="expanded"
     )
     
@@ -156,7 +156,7 @@ def _get_current_dataframe() -> pd.DataFrame:
         
         if src == "upload":
             wb = st.session_state.get("upload_workbook", {})
-        else:
+else:
             wb = st.session_state.get("gs_workbook", {})
         
         if sheet in wb:
@@ -311,7 +311,7 @@ def get_cached_conflict_summary_for_ui(df: pd.DataFrame, sheet_name: str) -> Dic
             "conflict_types": conflict_types
         }
         
-    except Exception:
+        except Exception:
         return {
             "total_conflicts": 0,
             "conflicts": [],
