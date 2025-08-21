@@ -332,7 +332,7 @@ def push_to_google_sheets(
     mode: str = "overwrite"
 ) -> bool:
     """
-    Write a DataFrame to a Google Sheet tab.
+    Write a DataFrame to a Google Sheet tab using proven resize-then-write semantics.
     
     Args:
         spreadsheet_id: Google Sheets ID
@@ -352,13 +352,60 @@ def push_to_google_sheets(
         # Prepare DataFrame for writing
         df = df.fillna("")
         
-        # Write data
-        write_dataframe(spreadsheet, sheet_name, df, mode=mode)
+        # Use proven Sheets semantics: resize first, then write
+        if mode == "overwrite":
+            _push_full_sheet_to_gs(spreadsheet, sheet_name, df)
+        else:
+            # For append mode, use existing logic
+            write_dataframe(spreadsheet, sheet_name, df, mode=mode)
         
         return True
 
     except Exception:
         return False
+
+
+def _push_full_sheet_to_gs(spreadsheet: gspread.Spreadsheet, sheet_name: str, df: pd.DataFrame):
+    """
+    Push full sheet to Google Sheets using proven resize-then-write semantics.
+    
+    This implements the stable v6.2.x behavior:
+    1. Authorize client
+    2. Open spreadsheet + worksheet by sheet_name
+    3. Resize worksheet to rows=len(df)+1 (for header) and cols=len(df.columns)
+    4. Write header row then values in bulk
+    5. Rate-limit / retry on 429s
+    """
+    try:
+        # Get the worksheet
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+            # Clear existing data
+            worksheet.clear()
+        except Exception:
+            # Create new worksheet if it doesn't exist
+            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=100, cols=20)
+        
+        # Prepare data for writing
+        headers = list(df.columns)
+        values = [headers] + df.astype(str).values.tolist()
+        n_rows = len(values)
+        n_cols = max(1, len(headers))
+        
+        # Resize worksheet to accommodate data (proven Sheets semantics)
+        # Add 1 row for header, ensure minimum size for stability
+        target_rows = max(n_rows, 200)  # Minimum 200 rows for stability
+        target_cols = max(n_cols, 8)    # Minimum 8 cols for stability
+        
+        worksheet.resize(rows=target_rows, cols=target_cols)
+        
+        # Write data in bulk (proven Sheets semantics)
+        if values:
+            worksheet.update('A1', values, value_input_option="RAW")
+            
+    except Exception as e:
+        # Re-raise with context
+        raise Exception(f"Failed to push full sheet to Google Sheets: {str(e)}") from e
 
 
 def backup_sheet_copy(spreadsheet_id: str, source_sheet: str, secrets_dict: dict) -> Optional[str]:

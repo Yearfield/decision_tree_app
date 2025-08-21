@@ -2,17 +2,23 @@
 """
 Pure logic functions for tree manipulation operations.
 No Streamlit dependencies - can be imported by both logic and UI modules.
+
+DUPLICATE ROWS POLICY:
+This app treats each row as a full path. Duplicate prefixes (first N nodes) are expected; 
+we compute unique children per parent by set semantics. Downstream multiplication does not 
+inflate child counts.
+
+The indexer maintains counters for display purposes but uses unique labels to judge 
+child-set size and conflicts. This ensures accurate conflict detection regardless of 
+row duplication patterns.
 """
 
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Any, Optional
+from collections import Counter, defaultdict
 
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Tuple, Any, Optional
-
-from utils.constants import LEVEL_COLS, MAX_LEVELS, ROOT_PARENT_LABEL
+from utils.constants import LEVEL_COLS, MAX_LEVELS, ROOT_PARENT_LABEL, MAX_CHILDREN_PER_PARENT
 from utils.helpers import normalize_text, normalize_child_set, validate_headers
 
 
@@ -475,3 +481,305 @@ def set_level1_children(df: pd.DataFrame, children: list[str]) -> pd.DataFrame:
     preferred = new_children[0]
     df2[n1] = df2[n1].apply(lambda x: preferred if normalize_text(x) not in new_children else normalize_text(x))
     return df2
+
+
+def build_parent_child_index(df: pd.DataFrame) -> Dict[Tuple[int, str], Counter]:
+    """
+    For each level L=1..MAX_LEVELS, build a mapping from (L, parent_path) to Counter(child -> row_count).
+    - L=1: parent_path is <ROOT>, child is Node 1
+    - L>=2: parent_path is 'Node 1>...>Node L-1' (non-empty segments only)
+    Each counter counts how many rows contribute that child, but the caller should treat presence as unique.
+    This is tolerant of row multiplication at deeper levels.
+    """
+    
+    idx: Dict[Tuple[int, str], Counter] = {}
+    if df is None or df.empty:
+        return idx
+
+    # Normalize & protect missing columns
+    nodes = [c for c in LEVEL_COLS if c in df.columns]
+    if not nodes:
+        return idx
+
+    # L=1 (ROOT → Node1)
+    c0 = nodes[0]
+    key_root = (1, ROOT_PARENT_LABEL)
+    ctr_root = Counter()
+    for val in df[c0].astype(str).tolist():
+        ch = normalize_text(val)
+        if ch:
+            ctr_root[ch] += 1
+    if ctr_root:
+        idx[key_root] = ctr_root
+
+    # L=2..MAX_LEVELS
+    for L in range(2, min(MAX_LEVELS, len(nodes)) + 1):
+        parent_cols = nodes[:L-1]
+        child_col = nodes[L-1]
+        # Build parent_path string per row
+        parent_paths = df[parent_cols].astype(str).map(normalize_text).agg(lambda s: ">".join([x for x in s.tolist() if x]), axis=1)
+        children = df[child_col].astype(str).map(normalize_text)
+        # Accumulate counts
+        for pth, ch in zip(parent_paths.tolist(), children.tolist()):
+            if not pth or not ch:
+                continue
+            key = (L, pth)
+            idx.setdefault(key, Counter())
+            idx[key][ch] += 1
+    return idx
+
+
+def summarize_children_sets(idx: Dict[Tuple[int, str], Counter]) -> Dict[Tuple[int, str], Dict]:
+    """
+    Convert counters to ordered unique child lists and simple metrics.
+    Returns mapping: (level, parent_path) -> {
+      'children': children,
+      'count': int,   # unique child count
+      'over5': bool,
+      'exact5': bool
+    }
+    """
+    
+    out: Dict[Tuple[int, str], Dict] = {}
+    for key, ctr in idx.items():
+        # preserve order by frequency desc then alpha
+        items = sorted(list(ctr.items()), key=lambda x: (-x[1], x[0]))
+        children = [c for c, _ in items]
+        children = [c for c in children if c]  # strip blanks (already normalized)
+        out[key] = {
+            "children": children,
+            "count": len(children),
+            "over5": len(children) > MAX_CHILDREN_PER_PARENT,
+            "exact5": len(children) == MAX_CHILDREN_PER_PARENT,
+        }
+    return out
+
+
+def group_by_parent_label_at_level(summary: Dict[Tuple[int, str], Dict]) -> Dict[Tuple[int, str], List[Tuple[str, List[str]]]]:
+    """
+    For a given level L>=2, group parents by their **last label** (parent label).
+    Example: all parents at L=3 whose last label == 'Confusion' are grouped together,
+    yielding a list of (parent_path, child_set). This lets us detect 'same label, different 5-sets'.
+    For L=1, the label is ROOT (only one group).
+    Returns mapping: (L, parent_label) -> [ (parent_path, children_list) ... ]
+    """
+    
+    buckets: Dict[Tuple[int, str], List[Tuple[str, List[str]]]] = defaultdict(list)
+    for (L, parent_path), info in summary.items():
+        if L == 1:
+            buckets[(1, ROOT_PARENT_LABEL)].append((parent_path, info["children"]))
+            continue
+        # parent_path like 'Node1>Node2>...>Node(L-1)'
+        label = parent_path.split(">")[-1] if parent_path else ""
+        if label:
+            buckets[(L, label)].append((parent_path, info["children"]))
+    return buckets
+
+
+def find_label_set_mismatches(summary: Dict[Tuple[int, str], Dict]) -> Dict[Tuple[int, str], Dict]:
+    """
+    For each (L, parent_label), check if all parent paths sharing that label have the **same 5 children**.
+    Report groups where:
+      - some have >5 children
+      - or they do not all share the exact same 5-set
+    Returns: (L, parent_label) -> {
+      'variants': List[ {'parent_path': str, 'children': List[str]} ],
+      'has_over5': bool,
+      'all_exact5_same': bool
+    }
+    """
+    
+    buckets = group_by_parent_label_at_level(summary)
+    out: Dict[Tuple[int, str], Dict] = {}
+    for key, items in buckets.items():
+        sets = [tuple(sorted(v[1])) for v in items]  # sorted for set-equality
+        unique_sets = set(sets)
+        has_over5 = any(len(v[1]) > MAX_CHILDREN_PER_PARENT for v in items)
+        all_exact5_same = (len(unique_sets) == 1) and all(len(v[1]) == MAX_CHILDREN_PER_PARENT for v in items)
+        out[key] = {
+            "variants": [{"parent_path": p, "children": c} for p, c in items],
+            "has_over5": has_over5,
+            "all_exact5_same": all_exact5_same,
+        }
+    return out
+
+
+def majority_vote_5set(variants: List[List[str]]) -> List[str]:
+    """
+    Suggest a canonical 5-set per (level, parent_label) by majority vote across parents sharing that label.
+    
+    Args:
+        variants: List of child lists from different parent paths sharing the same label
+        
+    Returns:
+        List of up to 5 children, ordered by frequency (descending) then alphabetically
+    """
+    if not variants:
+        return []
+    
+    # Flatten all children and count frequencies
+    flat = [c for vs in variants for c in vs]
+    freq = Counter(flat)
+    
+    # Rank by frequency (descending) then alphabetically
+    ranked = [c for c, _ in freq.most_common()]
+    
+    # Apply normalization (dedupe, cap to 5)
+    return normalize_child_set(ranked)
+
+
+def _row_nodes_with_root(row: pd.Series) -> List[str]:
+    """
+    Return a 6-length list: [root, n1, n2, n3, n4, n5]
+    with normalization and safe blanks for ragged rows.
+    """
+    from utils.constants import ROOT_COL
+    
+    vals = [normalize_text(row.get(ROOT_COL, ""))]
+    for c in LEVEL_COLS:
+        vals.append(normalize_text(row.get(c, "")))
+    # ensure length is 6
+    if len(vals) < (1 + MAX_LEVELS):
+        vals += [""] * ((1 + MAX_LEVELS) - len(vals))
+    return vals[: (1 + MAX_LEVELS)]  # [root, n1..n5]
+
+
+def build_parent_child_index_with_root(df: pd.DataFrame) -> Dict[Tuple[int, str], Counter]:
+    """
+    For each level L=1..MAX_LEVELS, build (L, parent_path) -> Counter(child -> rows_count).
+    - L=1 : parent is ROOT (<ROOT>), child is Node 1.
+    - L>=2: parent path is 'root>Node1>...>Node(L-1)', child is Node L.
+    Row multiplication at deeper levels is tolerated: we aggregate via Counter and
+    derive unique children from the counter keys (not total row counts).
+    """
+    from utils.constants import ROOT_COL
+    
+    idx: Dict[Tuple[int, str], Counter] = {}
+    if df is None or df.empty:
+        return idx
+
+    # ROOT -> Node1
+    ctr_root = Counter()
+    for _, row in df.iterrows():
+        root, n1, *_rest = _row_nodes_with_root(row)
+        if normalize_text(n1):
+            ctr_root[normalize_text(n1)] += 1
+    if ctr_root:
+        idx[(1, ROOT_PARENT_LABEL)] = ctr_root
+
+    # L=2..5
+    for L in range(2, MAX_LEVELS + 1):
+        ctr_level: Dict[str, Counter] = {}
+        for _, row in df.iterrows():
+            nodes = _row_nodes_with_root(row)  # [root, n1...n5]
+            parent_chain = [normalize_text(x) for x in nodes[:L]]  # includes root ... Node(L-1)
+            child = normalize_text(nodes[L])  # Node L
+            if not child:
+                continue
+            # parent_path is root>n1>...>n(L-1) with blanks removed
+            parent_path = ">".join([x for x in parent_chain if x])
+            if not parent_path:
+                continue
+            ctr_level.setdefault(parent_path, Counter())
+            ctr_level[parent_path][child] += 1
+        for pth, ctr in ctr_level.items():
+            idx[(L, pth)] = ctr
+
+    return idx
+
+
+def detect_full_path_duplicates(df: pd.DataFrame) -> List[Tuple[str, int]]:
+    """
+    Return [(full_path_string, count), ...] for any full path (root + 5 nodes) that occurs >1 times.
+    """
+    from utils.constants import ROOT_COL
+    
+    if df is None or df.empty:
+        return []
+    cols = [ROOT_COL] + LEVEL_COLS
+    cols = [c for c in cols if c in df.columns]
+    if len(cols) < 2:
+        return []
+    path_series = df[cols].astype(str).map(normalize_text).agg(lambda s: ">".join([x for x in s.tolist() if x]), axis=1)
+    counts = path_series.value_counts()
+    dups = [(p, int(n)) for p, n in counts.items() if n > 1]
+    return dups
+
+
+def group_across_tree_by_parent_label(summary: Dict[Tuple[int, str], Dict]) -> Dict[str, List[Tuple[int, str, List[str]]]]:
+    """
+    Whole-tree: bucket all parents by their *parent_label* regardless of level.
+    Key = parent_label (the last segment of parent_path; ROOT for level 1)
+    Value = list of tuples: (child_level, parent_path, children_list)
+    """
+    buckets: Dict[str, List[Tuple[int, str, List[str]]]] = defaultdict(list)
+    for (L, parent_path), info in summary.items():
+        if L == 1:
+            label = ROOT_PARENT_LABEL
+        else:
+            label = parent_path.split(">")[-1] if parent_path else ""
+        if not label:
+            continue
+        buckets[label].append((L, parent_path, info["children"]))
+    return buckets
+
+
+def find_treewide_label_mismatches(summary: Dict[Tuple[int, str], Dict]) -> Dict[str, Dict[str, Any]]:
+    """
+    For each parent_label across the *entire* tree, report if:
+      - any parent_path under this label has >5 children, or
+      - not all sets are the same exact 5.
+    Returns: label -> {
+        variants: [ { level, parent_path, children, unique_count } ],
+        has_over5: bool,
+        all_exact5_same: bool
+    }
+    """
+    buckets = group_across_tree_by_parent_label(summary)
+    out: Dict[str, Dict[str, Any]] = {}
+    for label, items in buckets.items():
+        sets = [tuple(sorted(children)) for (_L, _p, children) in items]
+        uniq = set(sets)
+        has_over5 = any(len(children) > MAX_CHILDREN_PER_PARENT for (_L, _p, children) in items)
+        all_exact5_same = (len(uniq) == 1) and all(len(children) == MAX_CHILDREN_PER_PARENT for (_L, _p, children) in items)
+        out[label] = {
+            "variants": [
+                {"level": L, "parent_path": p, "children": children, "unique_count": len(children)}
+                for (L, p, children) in items
+            ],
+            "has_over5": has_over5,
+            "all_exact5_same": all_exact5_same,
+        }
+    return out
+
+
+def analyze_decision_tree_with_root(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    UI-ready summary of the sheet:
+      - parent/child index (tolerant of multiplication)
+      - children-set summary per parent
+      - mismatches by parent label (same label, different 5-sets or >5)
+      - root set
+      - full-path duplicates
+      - top-level counts
+    """
+    idx = build_parent_child_index_with_root(df)
+    summary = summarize_children_sets(idx)
+    mismatches = find_label_set_mismatches(summary)
+    root_children = summary.get((1, ROOT_PARENT_LABEL), {}).get("children", [])
+    over5 = sum(1 for v in summary.values() if v["over5"])
+    not_exact5 = sum(1 for v in summary.values() if not v["exact5"])
+    dups = detect_full_path_duplicates(df)
+    return {
+        "index": idx,
+        "summary": summary,
+        "mismatches": mismatches,
+        "treewide_mismatches": find_treewide_label_mismatches(summary),
+        "root_children": root_children,
+        "duplicates_full_path": dups,
+        "counts": {
+            "parents_over5": over5,
+            "parents_not_exact5": not_exact5,
+            "total_parents": len(summary),
+        }
+    }
