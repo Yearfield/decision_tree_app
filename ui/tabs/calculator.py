@@ -8,10 +8,11 @@ from utils import (
 )
 from utils.state import (
     get_active_workbook, get_current_sheet, get_active_df, 
-    has_active_workbook, get_workbook_status
+    has_active_workbook, get_workbook_status, get_wb_nonce
 )
 from ui.utils.rerun import safe_rerun
-from logic.tree import infer_branch_options
+from logic.tree import infer_branch_options, analyze_decision_tree_with_root
+from utils.constants import ROOT_COL, LEVEL_COLS, LEVEL_LABELS
 
 
 def render():
@@ -66,116 +67,142 @@ def _get_cached_branch_options(df: pd.DataFrame, nonce: str) -> Dict[str, Any]:
     return infer_branch_options(df)
 
 
+def _calc_build_nested_options(df: pd.DataFrame) -> Dict[Tuple[int, str], List[str]]:
+    """Build nested dict: vm -> node1 children → node2 children → ... node5."""
+    res = analyze_decision_tree_with_root(df, get_wb_nonce())
+    summary = res["summary"]
+    # index: (L,parent_path) -> {children}
+    # Build per-level lookup
+    by_parent = {(L, p): info["children"] for (L, p), info in summary.items()}
+    return by_parent
+
+
+def children_for(by_parent: Dict[Tuple[int, str], List[str]], level: int, path: str) -> List[str]:
+    """Get children for a given level and parent path."""
+    return by_parent.get((level, path), [])
+
+
 def _render_path_navigator(df: pd.DataFrame, sheet_name: str):
-    """Render the path navigator interface."""
+    """Render the path navigator interface with VM+Nodes approach."""
     st.subheader("🗺️ Path Navigator")
     st.markdown("Walk through the decision tree by selecting options at each level.")
     
-    # Get branch options from logic.tree (cached)
-    from utils.state import get_wb_nonce
-    store = _get_cached_branch_options(df, get_wb_nonce())
+    # Build nested options from tree summary
+    by_parent = _calc_build_nested_options(df)
     
-    # Level 1: Root level options
-    level1_options = store.get("L1|", [])
-    if not level1_options:
-        st.info("No Level 1 options found in the decision tree.")
+    # VM (Root) options - Node 1 under ROOT
+    vm_opts = children_for(by_parent, 1, "<ROOT>")
+    if not vm_opts:
+        st.info("No VM (Root) options found in the decision tree.")
         return
     
-    # Level 1 selection
-    level1_choice = st.selectbox(
-        "Level 1: Select root option",
-        [""] + level1_options,
-        key="calc_level1",
+    # VM (Root) selection
+    vm = st.selectbox(
+        f"{LEVEL_LABELS[0]}: Select root option",
+        [""] + vm_opts,
+        key="calc_vm",
         help="Choose the starting point for your path"
     )
     
-    if level1_choice:
+    if vm:
         # Update path
         if len(st.session_state["calc_path"]) == 0:
-            st.session_state["calc_path"] = [level1_choice]
+            st.session_state["calc_path"] = [vm]
         else:
-            st.session_state["calc_path"][0] = level1_choice
+            st.session_state["calc_path"][0] = vm
             st.session_state["calc_path"] = st.session_state["calc_path"][:1]
         
-        # Level 2: Options based on Level 1 choice
-        level2_key = f"L2|{level1_choice}"
-        level2_options = store.get(level2_key, [])
+        # Node 1 options based on VM choice
+        n1_path = vm
+        n1_opts = children_for(by_parent, 2, n1_path)
+        n1 = st.selectbox(
+            f"{LEVEL_LABELS[1]}: Select option",
+            [""] + n1_opts,
+            key="calc_n1",
+            help="Choose Node 1 option"
+        )
         
-        if level2_options:
-            level2_choice = st.selectbox(
-                "Level 2: Select option",
-                [""] + level2_options,
-                key="calc_level2",
-                help="Choose the second level option"
+        if n1:
+            # Update path
+            if len(st.session_state["calc_path"]) < 2:
+                st.session_state["calc_path"].append(n1)
+            else:
+                st.session_state["calc_path"][1] = n1
+                st.session_state["calc_path"] = st.session_state["calc_path"][:2]
+            
+            # Node 2 options based on VM + Node 1
+            n2_path = ">".join([vm, n1])
+            n2_opts = children_for(by_parent, 3, n2_path)
+            n2 = st.selectbox(
+                f"{LEVEL_LABELS[2]}: Select option",
+                [""] + n2_opts,
+                key="calc_n2",
+                help="Choose Node 2 option"
             )
             
-            if level2_choice:
+            if n2:
                 # Update path
-                if len(st.session_state["calc_path"]) < 2:
-                    st.session_state["calc_path"].append(level2_choice)
+                if len(st.session_state["calc_path"]) < 3:
+                    st.session_state["calc_path"].append(n2)
                 else:
-                    st.session_state["calc_path"][1] = level2_choice
-                    st.session_state["calc_path"] = st.session_state["calc_path"][:2]
+                    st.session_state["calc_path"][2] = n2
+                    st.session_state["calc_path"] = st.session_state["calc_path"][:3]
                 
-                # Level 3: Options based on Level 1 + Level 2
-                level3_key = f"L3|{level1_choice}>{level2_choice}"
-                level3_options = store.get(level3_key, [])
+                # Node 3 options based on VM + Node 1 + Node 2
+                n3_path = ">".join([vm, n1, n2])
+                n3_opts = children_for(by_parent, 4, n3_path)
+                n3 = st.selectbox(
+                    f"{LEVEL_LABELS[3]}: Select option",
+                    [""] + n3_opts,
+                    key="calc_n3",
+                    help="Choose Node 3 option"
+                )
                 
-                if level3_options:
-                    level3_choice = st.selectbox(
-                        "Level 3: Select option",
-                        [""] + level3_options,
-                        key="calc_level3",
-                        help="Choose the third level option"
+                if n3:
+                    # Update path
+                    if len(st.session_state["calc_path"]) < 4:
+                        st.session_state["calc_path"].append(n3)
+                    else:
+                        st.session_state["calc_path"][3] = n3
+                        st.session_state["calc_path"] = st.session_state["calc_path"][:4]
+                    
+                    # Node 4 options based on VM + Node 1 + Node 2 + Node 3
+                    n4_path = ">".join([vm, n1, n2, n3])
+                    n4_opts = children_for(by_parent, 5, n4_path)
+                    n4 = st.selectbox(
+                        f"{LEVEL_LABELS[4]}: Select option",
+                        [""] + n4_opts,
+                        key="calc_n4",
+                        help="Choose Node 4 option"
                     )
                     
-                    if level3_choice:
+                    if n4:
                         # Update path
-                        if len(st.session_state["calc_path"]) < 3:
-                            st.session_state["calc_path"].append(level3_choice)
+                        if len(st.session_state["calc_path"]) < 5:
+                            st.session_state["calc_path"].append(n4)
                         else:
-                            st.session_state["calc_path"][2] = level3_choice
-                            st.session_state["calc_path"] = st.session_state["calc_path"][:3]
+                            st.session_state["calc_path"][4] = n4
+                            st.session_state["calc_path"] = st.session_state["calc_path"][:5]
                         
-                        # Level 4: Options based on Level 1 + Level 2 + Level 3
-                        level4_key = f"L4|{level1_choice}>{level2_choice}>{level3_choice}"
-                        level4_options = store.get(level4_key, [])
+                        # Node 5 options based on full path
+                        n5_path = ">".join([vm, n1, n2, n3, n4])
+                        n5_opts = children_for(by_parent, 6, n5_path)
+                        n5 = st.selectbox(
+                            f"{LEVEL_LABELS[5]}: Select option",
+                            [""] + n5_opts,
+                            key="calc_n5",
+                            help="Choose Node 5 option"
+                        )
                         
-                        if level4_options:
-                            level4_choice = st.selectbox(
-                                "Level 4: Select option",
-                                [""] + level4_options,
-                                key="calc_level4",
-                                help="Choose the fourth level option"
-                            )
-                            
-                            if level4_choice:
-                                # Update path
-                                if len(st.session_state["calc_path"]) < 4:
-                                    st.session_state["calc_path"].append(level4_choice)
-                                else:
-                                    st.session_state["calc_path"][3] = level4_choice
-                                    st.session_state["calc_path"] = st.session_state["calc_path"][:4]
-                                
-                                # Level 5: Options based on Level 1 + Level 2 + Level 3 + Level 4
-                                level5_key = f"L5|{level1_choice}>{level2_choice}>{level3_choice}>{level4_choice}"
-                                level5_options = store.get(level5_key, [])
-                                
-                                if level5_options:
-                                    level5_choice = st.selectbox(
-                                        "Level 5: Select option",
-                                        [""] + level5_options,
-                                        key="calc_level5",
-                                        help="Choose the fifth level option"
-                                    )
-                                    
-                                    if level5_choice:
-                                        # Update path
-                                        if len(st.session_state["calc_path"]) < 5:
-                                            st.session_state["calc_path"].append(level5_choice)
-                                        else:
-                                            st.session_state["calc_path"][4] = level5_choice
-                                            st.session_state["calc_path"] = st.session_state["calc_path"][:5]
+                        if n5:
+                            # Update path
+                            if len(st.session_state["calc_path"]) < 6:
+                                st.session_state["calc_path"].append(n5)
+                            else:
+                                st.session_state["calc_path"][5] = n5
+                                st.session_state["calc_path"] = st.session_state["calc_path"][:6]
+                                st.session_state["calc_path"][5] = n5
+                                st.session_state["calc_path"] = st.session_state["calc_path"][:6]
     
     # Live Path Preview
     if st.session_state["calc_path"]:
@@ -191,7 +218,7 @@ def _render_path_navigator(df: pd.DataFrame, sheet_name: str):
 
 
 def _render_path_results(df: pd.DataFrame, sheet_name: str):
-    """Render the results for the selected path."""
+    """Render the results for the selected path with row selection and CSV export."""
     st.subheader("📊 Path Results")
     
     if not st.session_state["calc_path"]:
@@ -214,18 +241,69 @@ def _render_path_results(df: pd.DataFrame, sheet_name: str):
     # Show summary
     st.success(f"Found {len(matching_rows)} matching row(s) for the path.")
     
-    # Display results
-    if len(matching_rows) <= 50:
-        st.write(f"**All {len(matching_rows)} matching rows:**")
-        _display_path_results_table(matching_rows)
+    # Row selection
+    st.subheader("📋 Row Selection")
+    idx_options = matching_rows.index.tolist()
+    sel_indices = st.multiselect(
+        "Select rows to include in export", 
+        options=idx_options, 
+        default=idx_options, 
+        key="calc_sel_rows"
+    )
+    chosen = matching_rows.loc[sel_indices] if sel_indices else matching_rows.head(0)
+    
+    if not chosen.empty:
+        st.write(f"**Selected {len(chosen)} rows:**")
+        st.dataframe(chosen, use_container_width=True)
+        
+        # CSV Export with Prevalence
+        st.subheader("📤 CSV Export")
+        _render_csv_export_with_prevalence(chosen)
     else:
-        st.write(f"**Showing top 50 of {len(matching_rows)} matching rows:**")
-        _display_path_results_table(matching_rows.head(50))
-        st.info(f"... and {len(matching_rows) - 50} more rows. Use filters to narrow down results.")
+        st.info("Please select at least one row for export.")
+
+
+def _render_csv_export_with_prevalence(chosen_rows: pd.DataFrame):
+    """Render CSV export with Prevalence instead of Quality."""
+    try:
+        # Build export table with 'Diagnosis' header and 'Prevalence' cells
+        diag_col = "Diagnostic Triage" if "Diagnostic Triage" in chosen_rows.columns else "Diagnosis"
+        prev_col = "Prevalence"  # rename from Quality
+        
+        # Ensure prevalence column exists (placeholder if missing)
+        if prev_col not in chosen_rows.columns:
+            chosen_rows[prev_col] = ""
+        
+        # Export layout:
+        # First "header row": Diagnosis as header, then one column per selected row (diagnosis values)
+        header = ["Diagnosis"] + chosen_rows[diag_col].astype(str).tolist()
+        
+        # Then 5 rows, one per Node 1..5, each row has [node label, prevalence per selected row]
+        rows = []
+        for i, node_col in enumerate(LEVEL_COLS, start=1):
+            label_row = [f"Node {i}"]
+            # Prevalence per selected row for this node row -> put the chosen[prev_col] value
+            label_row += chosen_rows[prev_col].astype(str).tolist()
+            rows.append(label_row)
+        
+        export_df = pd.DataFrame([header] + rows)
+        
+        st.download_button(
+            "Download CSV",
+            data=export_df.to_csv(index=False, header=False).encode("utf-8"),
+            file_name="calculator_export.csv",
+            mime="text/csv",
+            key="calc_dl_csv"
+        )
+        
+        st.info("CSV format: First row = Diagnosis values, subsequent rows = Node 1-5 with Prevalence entries")
+        
+    except Exception as e:
+        st.error(f"Error creating CSV export: {e}")
 
 
 def _build_path_filter_mask(df: pd.DataFrame, path: List[str]) -> Optional[pd.Series]:
-    """Build a filter mask for the selected path."""
+    """Build a filter mask for the selected path using VM+Nodes approach."""
     try:
         if not path:
             return None
@@ -234,8 +312,15 @@ def _build_path_filter_mask(df: pd.DataFrame, path: List[str]) -> Optional[pd.Se
         mask = pd.Series([True] * len(df), index=df.index)
         
         # Apply filter for each level in the path
-        for level, value in enumerate(path, 1):
-            col_name = f"Node {level}"
+        # path[0] = VM (Root), path[1] = Node 1, path[2] = Node 2, etc.
+        for level, value in enumerate(path):
+            if level == 0:
+                # VM (Root) level
+                col_name = ROOT_COL
+            else:
+                # Node levels (1-5)
+                col_name = LEVEL_COLS[level - 1]
+            
             if col_name in df.columns:
                 # Filter rows where this column matches the path value
                 level_mask = df[col_name].map(normalize_text) == value

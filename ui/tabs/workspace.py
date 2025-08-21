@@ -1,4 +1,16 @@
 # ui/tabs/workspace.py
+"""
+Workspace Selection tab for choosing and previewing sheets.
+
+DUPLICATE ROWS POLICY:
+This app treats each row as a full path. Duplicate prefixes (first N nodes) are expected; 
+we compute unique children per parent by set semantics. Downstream multiplication does not 
+inflate child counts.
+
+The indexer maintains counters for display purposes but uses unique labels to judge 
+child-set size and conflicts. This ensures accurate coverage metrics regardless of 
+row duplication patterns.
+"""
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -13,7 +25,7 @@ from utils.state import (
     get_wb_nonce, set_active_workbook
 )
 from logic.tree import infer_branch_options
-from utils.constants import ROOT_PARENT_LABEL
+from utils.constants import ROOT_PARENT_LABEL, MAX_CHILDREN_PER_PARENT, LEVEL_LABELS, ROOT_COL, LEVEL_COLS, MAX_LEVELS
 from ui.utils.rerun import safe_rerun
 
 # Guard assertions to prove imports are live (temporary; safe to remove later)
@@ -23,6 +35,13 @@ assert callable(get_active_workbook), "get_active_workbook not imported correctl
 assert callable(set_current_sheet), "set_current_sheet not imported correctly"
 assert callable(get_wb_nonce), "get_wb_nonce not imported correctly"
 assert callable(set_active_workbook), "set_active_workbook not imported correctly"
+
+
+def count_full_paths(df: pd.DataFrame) -> Tuple[int, int]:
+    """Count rows with full path (all 6 path cells: Root + Node1..Node5 are non-blank)."""
+    cols = [ROOT_COL] + LEVEL_COLS
+    present = df[cols].astype(str).map(lambda x: bool(str(x).strip()))
+    return int(present.all(axis=1).sum()), int(len(df))
 
 
 def render():
@@ -112,8 +131,8 @@ def render():
         # Render the new robust summary with repair functionality
         summary = _render_robust_summary_with_repair(df)
         
-        # Always show root overview (even if no parents found)
-        _render_root_overview(df)
+        # Show monolith counters
+        _render_monolith_counters(df)
         
         if summary and summary.get("total_parents", 0) > 0:
             # Show KPIs and per-level breakdown only after non-empty store
@@ -138,21 +157,27 @@ def render():
         st.exception(e)
 
 
-def _render_root_overview(df: pd.DataFrame):
-    """Render the Root (Level-1) overview card."""
-    store = infer_branch_options(df)
-    root = store.get(f"L1|{ROOT_PARENT_LABEL}", [])
+def _render_monolith_counters(df: pd.DataFrame):
+    """Render monolith-style counters: Rows with full path and Parents completed (exact-5)."""
+    # Count rows with full path
+    full_paths, total_rows = count_full_paths(df)
+    
+    # Count parents completed (exact-5)
+    res = get_conflict_summary_with_root(df, get_wb_nonce())
+    exact5 = sum(1 for ((_L, _p), info) in res["summary"].items() if info["exact5"])
+    total_parents = len(res["summary"])
     
     with st.container(border=True):
-        st.markdown("#### 🌱 Root (Level-1) Overview")
-        if not root:
-            st.warning("No Node-1 options found — check headers or edit Level-1.")
-        else:
-            st.write(f"**Node-1 set ({len(root)}):** {', '.join(root)}")
+        st.markdown("#### 📊 Monolith Counters")
         
-        if st.button("Edit Level-1 (ROOT) in ⚖️ Conflicts", type="secondary"):
-            st.session_state["_nav_hint"] = {"tab": "Conflicts", "level": 1}
-            safe_rerun()
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Rows with full path", f"{full_paths}/{total_rows}")
+        
+        with col2:
+            completion_rate = (exact5 / total_parents * 100) if total_parents > 0 else 0
+            st.metric("Parents completed (exact-5)", f"{exact5}/{total_parents}", f"{completion_rate:.1f}%")
 
 
 def _check_and_display_nav_hint():
@@ -181,94 +206,44 @@ def friendly_parent(level: int, path_str: str) -> str:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _compute_parent_coverage_summary(df: pd.DataFrame, nonce: str) -> Dict[str, Any]:
-    """Compute comprehensive parent coverage summary using the store."""
+    """Compute comprehensive parent coverage summary using the robust indexer."""
     try:
         # Validate headers first
         if not validate_headers(df):
             return {}
         
-        # Use logic.tree.infer_branch_options to build the store
-        from logic.tree import infer_branch_options
-        store = infer_branch_options(df)
+        # Use the monolith-style analysis from logic.tree
+        from ui.analysis import get_conflict_summary_with_root
+        res = get_conflict_summary_with_root(df, nonce)
         
         # Initialize level tracking
         level_stats = {level: {"total": 0, "with_5": 0, "with_less_5": 0, "with_0": 0} for level in range(1, 6)}
         
-        # Process each store key
-        for key, children in store.items():
-            if not key.startswith("L"):
+        # Level 1: exactly 1 parent (ROOT)
+        l1_total = 1 if res["summary"].get((1, ROOT_PARENT_LABEL)) else 0
+        l1_covered = 1 if len(res["root_children"]) == MAX_CHILDREN_PER_PARENT else 0
+        
+        level_stats[1]["total"] = l1_total
+        level_stats[1]["with_5"] = l1_covered
+        level_stats[1]["with_less_5"] = 1 - l1_covered if l1_total > 0 else 0
+        level_stats[1]["with_0"] = 0  # ROOT always has some children
+        
+        # Levels 2-5: count distinct parent paths
+        for (L, _pth), info in res["summary"].items():
+            if L == 1:  # Skip ROOT, already handled
+                continue
+            if L < 1 or L > MAX_LEVELS:
                 continue
                 
-            # Parse level from key (L{level}|{path})
-            parts = key.split("|", 1)
-            if len(parts) != 2:
-                continue
-                
-            try:
-                level = int(parts[0][1:])  # Remove "L" and convert to int
-                if level < 1 or level > 5:
-                    continue
-            except ValueError:
-                continue
-                
-            # Special handling for Level-1 (ROOT)
-            if level == 1 and key.endswith(f"|{ROOT_PARENT_LABEL}"):
-                # Level-1 has exactly 1 parent (the ROOT)
-                level_stats[level]["total"] = 1
-                
-                # Count non-empty, deduped, normalized children
-                if children:
-                    normalized_children = []
-                    seen = set()
-                    for child in children:
-                        clean_child = normalize_text(child)
-                        if clean_child and clean_child not in seen:
-                            normalized_children.append(clean_child)
-                            seen.add(clean_child)
-                    
-                    child_count = len(normalized_children)
-                else:
-                    child_count = 0
-                
-                # Coverage for Level-1: 1 if exactly 5 children, else 0
-                if child_count == 5:
-                    level_stats[level]["with_5"] = 1
-                    level_stats[level]["with_less_5"] = 0
-                    level_stats[level]["with_0"] = 0
-                else:
-                    level_stats[level]["with_5"] = 0
-                    level_stats[level]["with_less_5"] = 1 if child_count > 0 else 0
-                    level_stats[level]["with_0"] = 1 if child_count == 0 else 0
-                
-                # Skip further processing for Level-1
-                continue
+            level_stats[L]["total"] += 1
             
-            # Normal processing for levels 2-5
-            # Count non-empty, deduped, normalized children
-            if children:
-                # Normalize and dedupe while preserving order
-                normalized_children = []
-                seen = set()
-                for child in children:
-                    clean_child = normalize_text(child)
-                    # Filter out empty children ("" trimmed)
-                    if clean_child and clean_child not in seen:
-                        normalized_children.append(clean_child)
-                        seen.add(clean_child)
-                
-                child_count = len(normalized_children)
-            else:
-                child_count = 0
-            
-            # Update level statistics
-            level_stats[level]["total"] += 1
-            
-            if child_count == 5:
-                level_stats[level]["with_5"] += 1
-            elif child_count == 0:
-                level_stats[level]["with_0"] += 1
-            elif 0 < child_count < 5:
-                level_stats[level]["with_less_5"] += 1
+            # Check coverage based on exact5 flag
+            if info["exact5"]:
+                level_stats[L]["with_5"] += 1
+            elif info["count"] == 0:
+                level_stats[L]["with_0"] += 1
+            elif 0 < info["count"] < MAX_CHILDREN_PER_PARENT:
+                level_stats[L]["with_less_5"] += 1
         
         # Compute totals across all levels
         total_parents = sum(stats["total"] for stats in level_stats.values())
@@ -314,9 +289,9 @@ def _render_robust_summary(df: pd.DataFrame):
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Parents with 5 children", f"{parents_with_5}/{total_parents}")
+        st.metric(f"Parents with {MAX_CHILDREN_PER_PARENT} children", f"{parents_with_5}/{total_parents}")
     with col2:
-        st.metric("Parents with <5 children", parents_with_less_5)
+        st.metric(f"Parents with <{MAX_CHILDREN_PER_PARENT} children", parents_with_less_5)
     with col3:
         st.metric("Parents with 0 children", parents_with_0)
     
@@ -389,9 +364,9 @@ def _render_kpis_and_breakdown(df: pd.DataFrame, summary: Dict[str, Any]):
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Parents with 5 children", f"{parents_with_5}/{total_parents}")
+        st.metric(f"Parents with {MAX_CHILDREN_PER_PARENT} children", f"{parents_with_5}/{total_parents}")
     with col2:
-        st.metric("Parents with <5 children", parents_with_less_5)
+        st.metric(f"Parents with <{MAX_CHILDREN_PER_PARENT} children", parents_with_less_5)
     with col3:
         st.metric("Parents with 0 children", parents_with_0)
     

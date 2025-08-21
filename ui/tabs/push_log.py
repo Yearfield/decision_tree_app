@@ -416,10 +416,35 @@ def _render_push_history(sheet_name: str):
         _export_push_history(sheet_logs, sheet_name)
 
 
-def _execute_push(df: pd.DataFrame, sheet_name: str, source: str, push_type: str, rows_count: int, **kwargs):
-    """Execute the push operation."""
+def _execute_push(
+    df: pd.DataFrame, 
+    sheet_name: str, 
+    source: str, 
+    target_type: str,   # e.g. "google_sheets"
+    push_type: str,     # "full" | "delta" | etc.
+    rows_count: int | None = None,
+    **kwargs
+):
+    """
+    Execute a push to the given target. If rows_count is provided, use it
+    for logging/UI; otherwise compute from df.
+    """
     try:
+        # Compute rows_count if not provided
+        if rows_count is None:
+            try:
+                rows_count = len(df)
+            except Exception:
+                rows_count = 0
+        
         with st.spinner("Executing push operation..."):
+            # Handle Google Sheets push
+            if target_type == "google_sheets":
+                _execute_google_sheets_push(df, sheet_name, source, push_type, rows_count, **kwargs)
+            else:
+                # Handle other export types (local files, etc.)
+                _execute_local_export(df, sheet_name, source, push_type, rows_count, **kwargs)
+            
             # Create push log entry
             log_entry = make_push_log_entry(
                 sheet=sheet_name,
@@ -443,7 +468,7 @@ def _execute_push(df: pd.DataFrame, sheet_name: str, source: str, push_type: str
             st.session_state["push_log"] = push_log
             
             # Show success message
-            if push_type == "google_sheets":
+            if target_type == "google_sheets":
                 st.success(f"✅ Successfully pushed {rows_count} rows to Google Sheets!")
             else:
                 st.success(f"✅ Successfully exported {rows_count} rows to file!")
@@ -453,6 +478,92 @@ def _execute_push(df: pd.DataFrame, sheet_name: str, source: str, push_type: str
     except Exception as e:
         st.error(f"❌ Push operation failed: {e}")
         st.exception(e)
+
+
+def _execute_google_sheets_push(df: pd.DataFrame, sheet_name: str, source: str, push_type: str, rows_count: int, **kwargs):
+    """Execute Google Sheets push using proven resize-then-write semantics."""
+    try:
+        from io_utils.sheets import push_to_google_sheets
+        
+        spreadsheet_id = kwargs.get('spreadsheet_id')
+        target_sheet = kwargs.get('target_sheet', sheet_name)
+        push_mode = kwargs.get('push_mode', 'overwrite')
+        create_backup = kwargs.get('create_backup', True)
+        
+        if not spreadsheet_id:
+            raise ValueError("Spreadsheet ID is required for Google Sheets push")
+        
+        # Get service account credentials
+        if "gcp_service_account" not in st.secrets:
+            raise ValueError("Google Sheets not configured. Add your service account JSON under [gcp_service_account].")
+        
+        secrets_dict = st.secrets["gcp_service_account"]
+        
+        # Create backup if requested
+        if create_backup:
+            try:
+                from io_utils.sheets import backup_sheet_copy
+                backup_name = backup_sheet_copy(spreadsheet_id, target_sheet, secrets_dict)
+                if backup_name:
+                    st.info(f"📋 Created backup: {backup_name}")
+            except Exception as e:
+                st.warning(f"⚠️ Backup creation failed: {e}")
+        
+        # Execute the push using proven Sheets semantics
+        success = push_to_google_sheets(
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=target_sheet,
+            df=df,
+            secrets_dict=secrets_dict,
+            mode=push_mode
+        )
+        
+        if not success:
+            raise Exception("Google Sheets push operation failed")
+            
+    except Exception as e:
+        st.error(f"❌ Google Sheets push failed: {e}")
+        raise
+
+
+def _execute_local_export(df: pd.DataFrame, sheet_name: str, source: str, push_type: str, rows_count: int, **kwargs):
+    """Execute local file export."""
+    try:
+        export_format = kwargs.get('export_format', 'Excel (.xlsx)')
+        filename = kwargs.get('filename', f"{sheet_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        
+        if export_format == "Excel (.xlsx)":
+            from io_utils.sheets import export_dataframe_to_excel_bytes
+            file_data = export_dataframe_to_excel_bytes(df, sheet_name)
+            file_extension = ".xlsx"
+            mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            
+        elif export_format == "CSV":
+            from io_utils.sheets import export_dataframe_to_csv_bytes
+            file_data = export_dataframe_to_csv_bytes(df)
+            file_extension = ".csv"
+            mime_type = "text/csv"
+            
+        elif export_format == "JSON":
+            import json
+            file_data = json.dumps(df.to_dict('records'), indent=2).encode('utf-8')
+            file_extension = ".json"
+            mime_type = "application/json"
+            
+        else:
+            raise ValueError(f"Unsupported export format: {export_format}")
+        
+        # Create download button
+        st.download_button(
+            label=f"📥 Download {export_format}",
+            data=file_data,
+            file_name=f"{filename}{file_extension}",
+            mime=mime_type
+        )
+        
+    except Exception as e:
+        st.error(f"❌ Local export failed: {e}")
+        raise
 
 
 def _export_push_history(push_logs: List[Dict], sheet_name: str):
