@@ -118,6 +118,11 @@ def _render_upload_section():
         assert sheet_check is None or sheet_check in wb_check, "current_sheet must be a key of active workbook"
         
         st.success(f"Loaded {len(clean_wb)} sheet(s) into session.")
+        
+        # Guide users forward to Workspace Selection
+        st.toast("Workbook ready. Opening 🗂 Workspace Selection…")
+        st.session_state["current_tab"] = "🗂 Workspace Selection"
+        st.rerun()
 
 
 def _render_google_sheets_section():
@@ -264,6 +269,11 @@ def _render_google_sheets_section():
                         st.dataframe(clean_wb["BP"].head(5), use_container_width=True)
                     
                     st.success(f"Loaded '{default_sheet}' from Google Sheets and stored in session state.")
+                    
+                    # Guide users forward to Workspace Selection
+                    st.toast("Workbook ready. Opening 🗂 Workspace Selection…")
+                    st.session_state["current_tab"] = "🗂 Workspace Selection"
+                    st.rerun()
         except Exception as e:
             st.error(f"Google Sheets error: {e}")
 
@@ -322,6 +332,11 @@ def _render_vm_builder_section():
             
             st.session_state["vm_builder_queue"] = []
             st.success(f"Added {len(vm_list)} VM base row(s) to '{tgt_sheet}'. Use Symptoms/Conflicts or Wizard to build branches.")
+            
+            # Guide users forward to Workspace Selection
+            st.toast("VMs created. Opening 🗂 Workspace Selection…")
+            st.session_state["current_tab"] = "🗂 Workspace Selection"
+            st.rerun()
     else:
         st.caption("No VMs queued yet.")
 
@@ -495,6 +510,12 @@ def _render_new_sheet_wizard_section():
                     f"Created '{name}' with {len(vms)} VM(s). "
                     f"Use Symptoms/Conflicts or Wizard to build branches."
                 )
+                
+                # Guide users forward to Workspace Selection
+                st.toast("Sheet created. Opening 🗂 Workspace Selection…")
+                st.session_state["current_tab"] = "🗂 Workspace Selection"
+                st.rerun()
+                
                 # Reset wizard
                 for k in list(st.session_state.keys()):
                     if k.startswith("wiz_"):

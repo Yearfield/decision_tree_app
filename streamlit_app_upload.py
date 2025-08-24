@@ -27,6 +27,35 @@ from ui.tabs import (
 from ui.utils.debug import dump_state, render_guard, banner
 
 
+def _render_tabs_with_routing(tab_registry, requested_label=None):
+    """
+    Render st.tabs using TAB_REGISTRY but, if requested_label is provided,
+    reorder so that requested tab is first, which makes it selected.
+    """
+    # registry items like: [("📂 Source", ui.tabs.source), ("🗂 Workspace Selection", ui.tabs.workspace), ...]
+    labels = [lbl for (lbl, _mod) in tab_registry]
+    regs   = list(tab_registry)
+
+    if requested_label and requested_label in labels:
+        i = labels.index(requested_label)
+        # rotate requested to front
+        labels = [labels[i]] + labels[:i] + labels[i+1:]
+        regs   = [regs[i]]   + regs[:i]   + regs[i+1:]
+
+    tabs = st.tabs(labels)
+    for (label, mod), tab in zip(regs, tabs):
+        with tab:
+            try:
+                mod.render()
+            except Exception as e:
+                st.error(f"Exception in {label}.render(): {e}")
+                st.exception(e)
+
+    # once used, clear the request so it doesn't keep reshuffling
+    if "current_tab" in st.session_state:
+        st.session_state.pop("current_tab", None)
+
+
 def main():
     """Main application entry point."""
     # Early debug sidebar - ALWAYS drawn first
@@ -37,6 +66,14 @@ def main():
             for k, v in st.session_state.items()
         }
         st.json(snapshot)
+        
+        # Router debug expander
+        with st.expander("🛠 Router Debug", expanded=False):
+            try:
+                st.write("Requested tab:", st.session_state.get("current_tab"))
+                st.write("Registered tabs:", ["📂 Source", "🗂 Workspace Selection", "🔎 Validation", "⚖️ Conflicts", "🧬 Symptoms", "📝 Outcomes", "📖 Dictionary", "🧮 Calculator", "🌐 Visualizer", "📜 Push Log"])
+            except Exception as e:
+                st.write("Router debug error:", e)
         
         # Reset session button
         if st.button("🧹 Reset session state"):
@@ -580,18 +617,9 @@ def _render_all_tabs():
         ("📜 Push Log", push_log.render),
     ]
     
-    # Create tabs
-    tab_names = [t[0] for t in TAB_REGISTRY]
-    tabs = st.tabs(tab_names)
-    
-    # Render each tab with render_guard for crash protection
-    for i, (tab_name, fn) in enumerate(TAB_REGISTRY):
-        with tabs[i]:
-            # Extract the actual tab name without emoji
-            clean_tab_name = tab_name.split(" ", 1)[1] if " " in tab_name else tab_name
-            
-            # Use render_guard for all tabs to prevent blank panes
-            render_guard(clean_tab_name, fn)
+    # Get requested tab from session state and render with routing
+    requested = st.session_state.get("current_tab")
+    _render_tabs_with_routing(TAB_REGISTRY, requested_label=requested)
 
 
 def _get_cache_key(sheet_name: str, data_shape: Tuple[int, int], data_hash: str) -> Tuple:
