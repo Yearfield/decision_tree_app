@@ -2,8 +2,11 @@
 import streamlit as st
 import pandas as pd
 from typing import Dict, Any, List, Tuple, Optional
+import utils.state as USTATE
+from ui.utils.debug import dump_state, banner
+from utils.constants import ROOT_COL, LEVEL_COLS
+from utils.helpers import normalize_text
 
-from utils.state import get_active_workbook, get_current_sheet, get_active_df, has_active_workbook
 from logic.tree import infer_branch_options_with_overrides
 
 
@@ -14,28 +17,27 @@ def _nz(s) -> str:
 
 def render():
     """Render the Calculator tab for navigating decision tree paths."""
+    
+    # Add guard and debug expander
+    from ui.utils.guards import ensure_active_workbook_and_sheet
+    ok, df = ensure_active_workbook_and_sheet("Calculator")
+    if not ok:
+        return
+    
+    # Debug state expander
+    import json
+    with st.expander("🛠 Debug: Session State (tab)", expanded=False):
+        ss = {k: type(v).__name__ for k,v in st.session_state.items()}
+        st.code(json.dumps(ss, indent=2))
+    
+    banner("Calculator RENDER ENTRY")
+    dump_state("Session (pre-calculator)")
+    
     try:
         st.header("🧮 Calculator")
         
-        # Check if we have a workbook before proceeding
-        from utils.state import get_active_df_safe
-        df, status, detail = get_active_df_safe()
-        
-        if status != "ok":
-            if status == "no_wb":
-                st.info("📂 **No workbook loaded yet**")
-                st.markdown("""
-                **To get started:**
-                1. Go to the **Source tab** (first tab)
-                2. **Upload a workbook** or **connect to Google Sheets**
-                3. **Select a sheet** to work with
-                
-                Once a workbook is loaded, this tab will show your decision tree data.
-                """)
-                return
-            else:
-                st.warning(f"Calculator not ready: {status} — {detail}")
-                return
+        # Get current sheet name for display
+        sheet = USTATE.get_current_sheet()
         
         # Ensure Node columns exist (add empty strings if any of Node 1..Node 5 missing)
         node_cols = ["Node 1", "Node 2", "Node 3", "Node 4", "Node 5"]

@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
+import datetime
 from typing import Dict, Any, Tuple, List
 
 from utils import APP_VERSION, CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
@@ -23,6 +24,7 @@ from ui.tabs import (
     source, workspace, validation, conflicts, 
     symptoms, outcomes, dictionary, calculator, visualizer, push_log
 )
+from ui.utils.debug import dump_state, render_guard, banner
 
 
 def main():
@@ -35,6 +37,11 @@ def main():
             for k, v in st.session_state.items()
         }
         st.json(snapshot)
+        
+        # Reset session button
+        if st.button("🧹 Reset session state"):
+            st.session_state.clear()
+            st.experimental_rerun()
     
     # Page configuration
     st.set_page_config(
@@ -43,6 +50,9 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
+    
+    banner("App ENTRY")
+    dump_state("Session (early)", expanded=True)
     
     # Initialize session state
     _initialize_session_state()
@@ -75,6 +85,8 @@ def main():
         if merged:
             set_active_workbook(merged, default_sheet=st.session_state.get("sheet_name"))
             st.info(f"🔧 Auto-migrated: Merged {len(merged)} sheets from legacy workbooks")
+            banner("POST-UPLOAD / POST-SELECTION")
+            dump_state("Session (after upload/select)", expanded=True)
     
     # AGGRESSIVE RECOVERY: Check all possible workbook sources and try to restore data
     if not st.session_state.get("workbook") or not st.session_state.get("current_sheet"):
@@ -572,43 +584,14 @@ def _render_all_tabs():
     tab_names = [t[0] for t in TAB_REGISTRY]
     tabs = st.tabs(tab_names)
     
-    # Render each tab with DISPATCH tracer and error handling
+    # Render each tab with render_guard for crash protection
     for i, (tab_name, fn) in enumerate(TAB_REGISTRY):
         with tabs[i]:
             # Extract the actual tab name without emoji
             clean_tab_name = tab_name.split(" ", 1)[1] if " " in tab_name else tab_name
             
-            if clean_tab_name == "Symptoms":
-                st.info(f"🚦 DISPATCH Symptoms at {datetime.datetime.now().isoformat()}")
-                try:
-                    fn()
-                except Exception as e:
-                    st.error(f"❌ Symptoms tab crashed: {e}")
-                    st.exception(e)
-            
-            elif clean_tab_name == "Outcomes":
-                st.info(f"🚦 DISPATCH Outcomes at {datetime.datetime.now().isoformat()}")
-                try:
-                    fn()
-                except Exception as e:
-                    st.error(f"❌ Outcomes tab crashed: {e}")
-                    st.exception(e)
-            
-            elif clean_tab_name == "Calculator":
-                st.info(f"🚦 DISPATCH Calculator at {datetime.datetime.now().isoformat()}")
-                try:
-                    fn()
-                except Exception as e:
-                    st.error(f"❌ Calculator tab crashed: {e}")
-                    st.exception(e)
-            
-            else:
-                # Other tabs get basic error handling
-                try:
-                    fn()
-                except Exception as e:
-                    st.error(f"❌ {clean_tab_name} tab crashed: {e}")
-                    st.exception(e)
+            # Use render_guard for all tabs to prevent blank panes
+            render_guard(clean_tab_name, fn)
 
 
 def _get_cache_key(sheet_name: str, data_shape: Tuple[int, int], data_hash: str) -> Tuple:

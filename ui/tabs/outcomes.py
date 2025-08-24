@@ -2,20 +2,18 @@
 from typing import Dict, List, Tuple, Optional
 import pandas as pd
 import streamlit as st
+import utils.state as USTATE
+from ui.utils.debug import dump_state, banner
 
-from utils.state import (
-    get_active_workbook, get_current_sheet, get_active_df, 
-    has_active_workbook, get_workbook_status, set_active_workbook
-)
-from logic.tree import normalize_text
+from utils.helpers import normalize_text
 from ui.utils.rerun import safe_rerun
 
 
 def _get_current_df_and_sheet():
     """Get current DataFrame and sheet from active context."""
     # Try to get from active workbook first
-    wb = get_active_workbook()
-    sheet = get_current_sheet()
+    wb = USTATE.get_active_workbook()
+    sheet = USTATE.get_current_sheet()
     if wb and sheet and sheet in wb:
         df = wb[sheet]
         if df is not None and not df.empty:
@@ -51,12 +49,30 @@ def _get_current_df_and_sheet():
 
 def render():
     """Render the Outcomes tab for managing diagnostic triage and actions."""
+    
+    # Add guard and debug expander
+    from ui.utils.guards import ensure_active_workbook_and_sheet
+    ok, df = ensure_active_workbook_and_sheet("Outcomes")
+    if not ok:
+        return
+    
+    # Debug state expander
+    import json
+    with st.expander("🛠 Debug: Session State (tab)", expanded=False):
+        ss = {k: type(v).__name__ for k,v in st.session_state.items()}
+        st.code(json.dumps(ss, indent=2))
+    
+    banner("Outcomes RENDER ENTRY")
+    dump_state("Session (pre-outcomes)")
+    
     try:
         st.header("📝 Outcomes")
         
+        # Get current sheet name for display
+        sheet = USTATE.get_current_sheet()
+        
         # Check if we have a workbook before proceeding
-        from utils.state import get_active_df_safe
-        df, status, detail = get_active_df_safe()
+        df, status, detail = USTATE.get_active_df_safe()
         
         if status != "ok":
             if status == "no_wb":
@@ -74,6 +90,14 @@ def render():
                 st.warning(f"Outcomes not ready: {status} — {detail}")
                 return
 
+        # Guard against None DataFrame
+        if df is None:
+            st.warning("Outcomes: Active DataFrame is None. (Did the upload complete and was a sheet selected?)")
+            dump_state("Session (df is None)")
+            return
+        else:
+            st.caption(f"Outcomes: df shape = {getattr(df, 'shape', None)}")
+
     except Exception as dbg_e:
         st.error(f"🔥 Debug tracer failed: {dbg_e}")
         st.exception(dbg_e)
@@ -81,8 +105,9 @@ def render():
     try:
         st.header("📝 Outcomes — Diagnostic Triage & Actions")
 
-        df, sheet, src_code = _get_current_df_and_sheet()
-        if df is None or sheet is None:
+        # Use the df we already validated above, but also check the legacy function
+        df_legacy, sheet_legacy, src_code = _get_current_df_and_sheet()
+        if df_legacy is None or sheet_legacy is None:
             st.info("Select a sheet in **Workspace** (or load one in **Source**).")
             st.warning("🚧 Outcomes: Exiting early guard check")
             return
@@ -96,7 +121,7 @@ def render():
             where = "upload"
         else:
             # active context
-            wb = get_active_workbook() or {}
+            wb = USTATE.get_active_workbook() or {}
             where = "active"
         
         if not wb or sheet not in wb:

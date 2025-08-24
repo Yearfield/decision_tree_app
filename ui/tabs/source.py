@@ -6,10 +6,7 @@ from typing import Dict, Any
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
-from utils.state import (
-    set_active_workbook, get_active_workbook, set_current_sheet, 
-    get_current_sheet, get_workbook_status
-)
+import utils.state as USTATE
 from logic.tree import build_raw_plus_v630 # Not fully used yet, but imported
 from io_utils.sheets import read_google_sheet
 
@@ -18,14 +15,20 @@ def render():
     """Render the Source tab for loading and creating decision tree data."""
     st.info("🚦 DISPATCH Source/Workbook loader reached")
     
+    # Debug state expander
+    import json
+    with st.expander("🛠 Debug: Session State (tab)", expanded=False):
+        ss = {k: type(v).__name__ for k,v in st.session_state.items()}
+        st.code(json.dumps(ss, indent=2))
+    
     try:
         st.header("📂 Source")
         st.markdown("Load/create your decision tree data.")
         
         # Status badge
-        has_wb, sheet_count, current_sheet = get_workbook_status()
+        has_wb, sheet_count, current_sheet = USTATE.get_workbook_status()
         if has_wb and current_sheet:
-            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{get_current_sheet()}**")
+            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{USTATE.get_current_sheet()}**")
         else:
             st.caption("Workbook: ❌ not loaded")
 
@@ -76,8 +79,7 @@ def _render_upload_section():
             wb = sheets
         
         # Validate that we got proper DataFrames
-        from utils.state import coerce_workbook_to_dataframes
-        clean_wb = coerce_workbook_to_dataframes(wb)
+        clean_wb = USTATE.coerce_workbook_to_dataframes(wb)
         if not clean_wb:
             st.error("Uploaded workbook did not contain any valid sheets (as DataFrames).")
             return
@@ -86,14 +88,13 @@ def _render_upload_section():
         st.session_state["upload_filename"] = file.name
         
         # Set as active workbook using canonical API
-        set_active_workbook(clean_wb, source="upload")
+        USTATE.set_active_workbook(clean_wb, source="upload")
         
         # Prefer previously selected sheet_name if present; otherwise first sheet.
-        from utils.state import ensure_active_sheet
         from ui.utils.rerun import safe_rerun
         
         # after you set wb dict in session (workbook OR gs_workbook)...
-        picked = ensure_active_sheet(default=st.session_state.get("sheet_name"))
+        picked = USTATE.ensure_active_sheet(default=st.session_state.get("sheet_name"))
         if picked:
             st.toast(f"Active sheet set to {picked}")
         
@@ -104,15 +105,14 @@ def _render_upload_section():
         st.info(f"✅ Current sheet set to {picked}")
         
         # Verify that get_workbook_status() now reflects the current sheet
-        from utils.state import get_workbook_status
-        has_wb, sheet_count, current_sheet = get_workbook_status()
+        has_wb, sheet_count, current_sheet = USTATE.get_workbook_status()
         st.info(f"🔍 Workbook status after set_current_sheet: has_wb={has_wb}, sheet_count={sheet_count}, current_sheet={picked}")
         
         # Additional verification - check session state directly
         st.info(f"🔍 Session state check: workbook keys={list(st.session_state.get('workbook', {}).keys())}, current_sheet={st.session_state.get('current_sheet')}")
         
         # Sanity assertions (temporary; safe to remove later)
-        wb_check, sheet_check = get_active_workbook(), get_current_sheet()
+        wb_check, sheet_check = USTATE.get_active_workbook(), USTATE.get_current_sheet()
         assert wb_check is not None, "active workbook missing after upload"
         assert isinstance(wb_check, dict), "active workbook should be Dict[str, DataFrame]"
         assert sheet_check is None or sheet_check in wb_check, "current_sheet must be a key of active workbook"
@@ -125,8 +125,8 @@ def _render_google_sheets_section():
     st.subheader("🔄 Google Sheets")
     
     # Re-sync button for current sheet
-    current_wb = get_active_workbook()
-    current_sheet = get_current_sheet()
+            current_wb = USTATE.get_active_workbook()
+        current_sheet = USTATE.get_current_sheet()
     if bool(current_wb) and current_sheet:
         if st.button("🔄 Re-sync current sheet"):
             sheet_id = st.session_state.get("sheet_id")
@@ -140,16 +140,15 @@ def _render_google_sheets_section():
                         with st.spinner("Re-syncing..."):
                             new_df = read_google_sheet(sheet_id, sheet_name, st.secrets["gcp_service_account"])
                             if not new_df.empty:
-                                updated_wb = get_active_workbook() or {}
+                                updated_wb = USTATE.get_active_workbook() or {}
                                 updated_wb[sheet_name] = new_df
-                                set_active_workbook(updated_wb, source="sheets")
+                                USTATE.set_active_workbook(updated_wb, source="sheets")
                                 
                                 # Prefer previously selected sheet_name if present; otherwise first sheet.
-                                from utils.state import ensure_active_sheet
                                 from ui.utils.rerun import safe_rerun
                                 
                                 # after you set wb dict in session (workbook OR gs_workbook)...
-                                picked = ensure_active_sheet(default=st.session_state.get("sheet_name"))
+                                picked = USTATE.ensure_active_sheet(default=st.session_state.get("sheet_name"))
                                 if picked:
                                     st.toast(f"Active sheet set to {picked}")
                                 
@@ -163,15 +162,14 @@ def _render_google_sheets_section():
                                 st.info(f"✅ Current sheet set to {sheet_name}")
                                 
                                 # Verify that get_workbook_status() now reflects the current sheet
-                                from utils.state import get_workbook_status
-                                has_wb, sheet_count, current_sheet = get_workbook_status()
+                                has_wb, sheet_count, current_sheet = USTATE.get_workbook_status()
                                 st.info(f"🔍 Workbook status after set_current_sheet: has_wb={has_wb}, sheet_count={sheet_count}, current_sheet={sheet_name}")
                                 
                                 # Additional verification - check session state directly
                                 st.info(f"🔍 Session state check: workbook keys={list(st.session_state.get('workbook', {}).keys())}, current_sheet={st.session_state.get('current_sheet')}")
                                 
                                 # Sanity assertions (temporary; safe to remove later)
-                                wb_check, sheet_check = get_active_workbook(), get_current_sheet()
+                                wb_check, sheet_check = USTATE.get_active_workbook(), USTATE.get_current_sheet()
                                 assert wb_check is not None, "active workbook missing after re-sync"
                                 assert isinstance(wb_check, dict), "active workbook should be Dict[str, DataFrame]"
                                 assert sheet_check is None or sheet_check in wb_check, "current_sheet must be a key of active workbook"
@@ -210,9 +208,7 @@ def _render_google_sheets_section():
                     wb_g = {gs_sheet: df_g}
                     
                     # Use the new verification utilities to ensure proper DataFrame storage
-                    from utils.state import set_active_workbook, verify_active_workbook, coerce_workbook_to_dataframes
-                    
-                    clean_wb = coerce_workbook_to_dataframes(wb_g)
+                    clean_wb = USTATE.coerce_workbook_to_dataframes(wb_g)
                     if not clean_wb:
                         st.error("Loaded workbook contained no valid (non-empty) sheets. Check the sheet content.")
                         return
@@ -225,14 +221,13 @@ def _render_google_sheets_section():
                     st.session_state["sheet_name"] = default_sheet
                     
                     # Set as active workbook using canonical API
-                    set_active_workbook(clean_wb, default_sheet=default_sheet, source="sheets")
+                    USTATE.set_active_workbook(clean_wb, default_sheet=default_sheet, source="sheets")
                     
                     # Prefer previously selected sheet_name if present; otherwise first sheet.
-                    from utils.state import ensure_active_sheet
                     from ui.utils.rerun import safe_rerun
                     
                     # after you set wb dict in session (workbook OR gs_workbook)...
-                    picked = ensure_active_sheet(default=st.session_state.get("sheet_name"))
+                    picked = USTATE.ensure_active_sheet(default=st.session_state.get("sheet_name"))
                     if picked:
                         st.toast(f"Active sheet set to {picked}")
                     
@@ -246,20 +241,19 @@ def _render_google_sheets_section():
                     st.info(f"✅ Current sheet set to {default_sheet}")
                     
                     # Verify that get_workbook_status() now reflects the current sheet
-                    from utils.state import get_workbook_status
-                    has_wb, sheet_count, current_sheet = get_workbook_status()
+                    has_wb, sheet_count, current_sheet = USTATE.get_workbook_status()
                     st.info(f"🔍 Workbook status after set_current_sheet: has_wb={has_wb}, sheet_count={sheet_count}, current_sheet={current_sheet}")
                     
                     # Additional verification - check session state directly
                     st.info(f"🔍 Session state check: workbook keys={list(st.session_state.get('workbook', {}).keys())}, current_sheet={st.session_state.get('current_sheet')}")
                     
                     # Show verification report for debugging
-                    rep = verify_active_workbook()
+                    rep = USTATE.verify_active_workbook()
                     with st.expander("Workbook verification (loader)", expanded=False):
                         st.json(rep)
                     
                     # Sanity assertions (temporary; safe to remove later)
-                    wb, sheet = get_active_workbook(), get_current_sheet()
+                    wb, sheet = USTATE.get_active_workbook(), USTATE.get_current_sheet()
                     assert wb is not None, "active workbook missing after load"
                     assert isinstance(wb, dict), "active workbook should be Dict[str, DataFrame]"
                     assert sheet is None or sheet in wb, "current_sheet must be a key of active workbook"
@@ -279,8 +273,8 @@ def _render_vm_builder_section():
     st.subheader("🧩 VM Builder (add VMs to an existing sheet)")
     
     # Check active workbook status
-    active_wb = get_active_workbook()
-    current_sheet = get_current_sheet()
+    active_wb = USTATE.get_active_workbook()
+    current_sheet = USTATE.get_current_sheet()
     
     if not active_wb:
         st.info("No active workbook. Paste a Google Sheet ID in this tab or upload a file.")
@@ -321,7 +315,7 @@ def _render_vm_builder_section():
             
             # Update the active workbook directly
             target_wb[tgt_sheet] = df
-            set_active_workbook(target_wb, source="vm_builder")
+            USTATE.set_active_workbook(target_wb, source="vm_builder")
             
             # Clear stale caches to ensure immediate refresh
             st.cache_data.clear()
@@ -337,7 +331,7 @@ def _render_new_sheet_wizard_section():
     st.subheader("🧙 New Sheet Wizard (create sheet + seed branches)")
     
     # Use canonical workbook instead of legacy access
-    active_wb = get_active_workbook()
+                    active_wb = USTATE.get_active_workbook()
     if not active_wb:
         st.info("No active workbook. Please load a workbook first (upload or Google Sheets).")
         return
@@ -468,14 +462,13 @@ def _render_new_sheet_wizard_section():
                 wiz_wb[name] = df_new
                 
                 # Set as active workbook using canonical API
-                set_active_workbook(wiz_wb, default_sheet=name, source="wizard")
+                USTATE.set_active_workbook(wiz_wb, default_sheet=name, source="wizard")
                 
                 # Prefer previously selected sheet_name if present; otherwise first sheet.
-                from utils.state import ensure_active_sheet
                 from ui.utils.rerun import safe_rerun
                 
                 # after you set wb dict in session (workbook OR gs_workbook)...
-                picked = ensure_active_sheet(default=name)
+                picked = USTATE.ensure_active_sheet(default=name)
                 if picked:
                     st.toast(f"Active sheet set to {picked}")
                 
@@ -489,8 +482,7 @@ def _render_new_sheet_wizard_section():
                 st.info(f"✅ Current sheet set to {name}")
                 
                 # Verify that get_workbook_status() now reflects the current sheet
-                from utils.state import get_workbook_status
-                has_wb, sheet_count, current_sheet = get_workbook_status()
+                has_wb, sheet_count, current_sheet = USTATE.get_workbook_status()
                 st.info(f"🔍 Workbook status after set_current_sheet: has_wb={has_wb}, sheet_count={sheet_count}, current_sheet={name}")
                 
                 # Additional verification - check session state directly

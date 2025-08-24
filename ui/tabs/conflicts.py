@@ -19,10 +19,7 @@ from typing import Dict, Any, List, Tuple, Optional
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
-from utils.state import (
-    get_active_workbook, get_current_sheet, get_active_df, 
-    has_active_workbook, get_workbook_status, set_active_workbook, set_current_sheet, get_wb_nonce
-)
+import utils.state as USTATE
 from utils.helpers import normalize_text, normalize_child_set
 from utils.constants import ROOT_PARENT_LABEL, MAX_CHILDREN_PER_PARENT, LEVEL_LABELS
 from logic.tree import (
@@ -44,8 +41,24 @@ def get_conflict_summary(df: pd.DataFrame, nonce: str) -> Dict[str, Any]:
 
 def render():
     """Render the Conflicts tab for detecting and resolving decision tree conflicts."""
+    
+    # Add guard and debug expander
+    from ui.utils.guards import ensure_active_workbook_and_sheet
+    ok, df = ensure_active_workbook_and_sheet("Conflicts")
+    if not ok:
+        return
+    
+    # Debug state expander
+    import json
+    with st.expander("🛠 Debug: Session State (tab)", expanded=False):
+        ss = {k: type(v).__name__ for k,v in st.session_state.items()}
+        st.code(json.dumps(ss, indent=2))
+    
     try:
         st.header("⚖️ Conflicts")
+        
+        # Get current sheet name for display
+        sheet = USTATE.get_current_sheet()
         
         # Show duplicate rows policy
         with st.expander("ℹ️ Duplicate Rows Policy", expanded=False):
@@ -59,31 +72,14 @@ def render():
             """)
         
         # Status badge
-        has_wb, sheet_count, current_sheet = get_workbook_status()
+        has_wb, sheet_count, current_sheet = USTATE.get_workbook_status()
         if has_wb and current_sheet:
             st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
         else:
             st.caption("Workbook: ❌ not loaded")
-        
-        # Guard against no active workbook
-        wb = get_active_workbook()
-        sheet = get_current_sheet()
-        if not wb or not sheet:
-            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
-            return
-
-        # Get active DataFrame
-        df = get_active_df()
-        if df is None:
-            st.warning("No active sheet selected. Please load a workbook in the Source tab and select a sheet.")
-            return
-        
-        if not validate_headers(df):
-            st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
-            return
 
         # Get conflict summary using cached function
-        conflict_summary = get_conflict_summary(df, get_wb_nonce())
+        conflict_summary = get_conflict_summary(df, USTATE.get_wb_nonce())
         
         # Mode toggle: Simple vs Advanced
         mode = st.segmented_control(
@@ -191,8 +187,11 @@ def _render_simple_conflicts_navigator(conflict_summary: Dict[str, Any], df: pd.
         
     else:
         st.success("🎉 All conflicts resolved.")
-        st.session_state["current_tab"] = "symptoms"  # or whatever your router key expects
-        st.rerun()
+        
+        # Add conflicts→symptoms handoff button
+        if st.button("✅ No conflicts left — Continue to 🧬 Symptoms", type="primary"):
+            st.session_state["current_tab"] = "🧬 Symptoms"
+            st.rerun()
 
 
 def _render_parent_first_editor(cur: Dict[str, Any], treewide_mismatches: Dict, df: pd.DataFrame, sheet_name: str):
@@ -224,7 +223,7 @@ def _render_parent_first_editor(cur: Dict[str, Any], treewide_mismatches: Dict, 
     default_set = cur["children"][:MAX_CHILDREN_PER_PARENT]
 
     # Build stable key seed
-    seed = f"conflicts_simple_{cur['level']}_{cur['parent_label']}_{cur['parent_path']}_{get_wb_nonce()}"
+    seed = f"conflicts_simple_{cur['level']}_{cur['parent_label']}_{cur['parent_path']}_{USTATE.get_wb_nonce()}"
     
     chosen = st.multiselect(
         f"Choose up to {MAX_CHILDREN_PER_PARENT} children", 
@@ -259,7 +258,7 @@ def _apply_to_single_parent(level: int, parent_path: str, children: List[str], d
     """Apply children to a single parent path."""
     try:
         with st.spinner(f"Applying to single parent at level {level}..."):
-            wb = get_active_workbook() or {}
+            wb = USTATE.get_active_workbook() or {}
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -271,8 +270,8 @@ def _apply_to_single_parent(level: int, parent_path: str, children: List[str], d
             
             # Update workbook
             wb[sheet_name] = new_df
-            set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_single_parent")
-            set_current_sheet(sheet_name)
+            USTATE.set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_single_parent")
+            USTATE.set_current_sheet(sheet_name)
             
             st.success(f"Applied to parent: {parent_path}")
             # Move to next conflict
@@ -289,7 +288,7 @@ def _apply_to_label_group(level: int, parent_label: str, children: List[str], df
     """Apply children to all parents with the same label at the given level."""
     try:
         with st.spinner(f"Applying to all '{parent_label}' parents at level {level}..."):
-            wb = get_active_workbook() or {}
+            wb = USTATE.get_active_workbook() or {}
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -301,8 +300,8 @@ def _apply_to_label_group(level: int, parent_label: str, children: List[str], df
             
             # Update workbook
             wb[sheet_name] = new_df
-            set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_label_group")
-            set_current_sheet(sheet_name)
+            USTATE.set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_label_group")
+            USTATE.set_current_sheet(sheet_name)
             
             st.success(f"Applied to label-wide group: {parent_label}")
             # Move to next conflict
@@ -319,7 +318,7 @@ def _apply_to_label_across_tree(label: str, children: List[str], df: pd.DataFram
     """Apply children to all parents with the same label across the entire tree."""
     try:
         with st.spinner(f"Applying to all '{label}' parents across the tree..."):
-            wb = get_active_workbook() or {}
+            wb = USTATE.get_active_workbook() or {}
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -327,7 +326,7 @@ def _apply_to_label_across_tree(label: str, children: List[str], df: pd.DataFram
             df0 = wb[sheet_name]
             
             # Get the summary for the materializer
-            res = get_conflict_summary_with_root(df0, get_wb_nonce())
+            res = get_conflict_summary_with_root(df0, USTATE.get_wb_nonce())
             summary = res["summary"]
             
             # Use the across-tree materializer
@@ -335,8 +334,8 @@ def _apply_to_label_across_tree(label: str, children: List[str], df: pd.DataFram
             
             # Update workbook
             wb[sheet_name] = new_df
-            set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_across_tree")
-            set_current_sheet(sheet_name)
+            USTATE.set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_across_tree")
+            USTATE.set_current_sheet(sheet_name)
             
             st.success(f"Applied to all '{label}' parents across the tree")
             # Move to next conflict
@@ -424,7 +423,7 @@ def _apply_root_children(children: list[str], sheet_name: str):
     try:
         with st.spinner("Applying Level 1 changes..."):
             # Get current workbook and DataFrame
-            wb = get_active_workbook()
+            wb = USTATE.get_active_workbook()
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -438,10 +437,10 @@ def _apply_root_children(children: list[str], sheet_name: str):
             wb[sheet_name] = new_df
             
             # Refresh the active workbook state
-            set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_level1_editor")
+            USTATE.set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_level1_editor")
             
             # Bump nonce via re-setting current sheet
-            set_current_sheet(sheet_name)
+            USTATE.set_current_sheet(sheet_name)
             
             st.success(f"✅ Updated Level-1 (ROOT) children to: {', '.join(children)}")
             st.info("The sheet has been updated. Other tabs will reflect these changes.")
@@ -734,7 +733,7 @@ def _apply_level1_resolution(children: List[str], sheet_name: str):
     try:
         with st.spinner("Applying Level 1 resolution..."):
             # Get current workbook and DataFrame
-            wb = get_active_workbook()
+            wb = USTATE.get_active_workbook()
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -748,10 +747,10 @@ def _apply_level1_resolution(children: List[str], sheet_name: str):
             wb[sheet_name] = new_df
             
             # Refresh the active workbook state
-            set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_level1_resolution")
+            USTATE.set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_level1_resolution")
             
             # Bump nonce via re-setting current sheet
-            set_current_sheet(sheet_name)
+            USTATE.set_current_sheet(sheet_name)
             
             st.success(f"✅ Updated Level-1 (ROOT) children to: {', '.join(children)}")
             st.info("The sheet has been updated. Other tabs will reflect these changes.")
@@ -775,7 +774,7 @@ def _apply_level_resolution(level: int, parent_label: str, children: List[str],
                 overrides_all[sheet_name] = {}
             
             # Find all parent paths that match this parent label at this level
-            wb = get_active_workbook()
+            wb = USTATE.get_active_workbook()
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -811,7 +810,7 @@ def _apply_level_resolution(level: int, parent_label: str, children: List[str],
             
             # Update the active workbook
             wb[sheet_name] = updated_df
-            set_active_workbook(wb, source="conflicts_level_resolution")
+            USTATE.set_active_workbook(wb, source="conflicts_level_resolution")
             
             # Clear stale caches to ensure immediate refresh
             st.cache_data.clear()
@@ -1148,8 +1147,7 @@ def _apply_children_resolution(df: pd.DataFrame, level: int, parent_path: Tuple[
             # from logic.tree import build_raw_plus_v630 # This import is now at the top
             
             # Get the active workbook
-            # from utils.state import get_active_workbook, set_active_workbook # This import is now at the top
-            active_wb = get_active_workbook()
+            active_wb = USTATE.get_active_workbook()
             
             if active_wb and sheet_name in active_wb:
                 # Apply overrides and rebuild the sheet
@@ -1157,7 +1155,7 @@ def _apply_children_resolution(df: pd.DataFrame, level: int, parent_path: Tuple[
                 
                 # Update the active workbook
                 active_wb[sheet_name] = updated_df
-                set_active_workbook(active_wb, source="conflicts_resolution")
+                USTATE.set_active_workbook(active_wb, source="conflicts_resolution")
                 
                 # Clear stale caches to ensure immediate refresh
                 st.cache_data.clear()
@@ -1184,7 +1182,7 @@ def _apply_canonical_set_for_label_group(level: int, parent_label: str, children
     """
     try:
         with st.spinner(f"Applying canonical set to level {level} / label '{parent_label}'..."):
-            wb = get_active_workbook()
+            wb = USTATE.get_active_workbook()
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -1198,10 +1196,10 @@ def _apply_canonical_set_for_label_group(level: int, parent_label: str, children
             wb[sheet_name] = new_df
             
             # Refresh the active workbook state
-            set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_materialization")
+            USTATE.set_active_workbook(wb, default_sheet=sheet_name, source="conflicts_materialization")
             
             # Bump nonce via re-setting current sheet
-            set_current_sheet(sheet_name)
+            USTATE.set_current_sheet(sheet_name)
             
             # Clear stale caches to ensure immediate refresh
             st.cache_data.clear()

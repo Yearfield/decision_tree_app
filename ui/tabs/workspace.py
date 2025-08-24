@@ -19,21 +19,12 @@ from typing import Dict, Any, Tuple, List, Optional
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
-from utils.state import (
-    get_active_workbook, get_current_sheet, get_active_df, 
-    set_current_sheet, has_active_workbook, get_workbook_status,
-    set_active_workbook
-)
+import utils.state as USTATE
 from logic.tree import infer_branch_options, infer_branch_options_with_overrides
-from utils.constants import ROOT_PARENT_LABEL, MAX_CHILDREN_PER_PARENT, LEVEL_LABELS, ROOT_COL, LEVEL_COLS, MAX_LEVELS
+from utils.constants import ROOT_PARENT_LABEL, MAX_CHILDREN_PER_PARENT, LEVEL_LABELS, ROOT_COL, MAX_LEVELS
 from ui.utils.rerun import safe_rerun
 
-# Guard assertions to prove imports are live (temporary; safe to remove later)
-assert callable(get_current_sheet), "get_current_sheet not imported correctly"
-assert callable(get_active_df), "get_active_df not imported correctly"
-assert callable(get_active_workbook), "get_active_workbook not imported correctly"
-assert callable(set_current_sheet), "set_current_sheet not imported correctly"
-assert callable(set_active_workbook), "set_active_workbook not imported correctly"
+
 
 
 def _compute_parents_vectorized(df: pd.DataFrame) -> tuple[int, int, int]:
@@ -90,6 +81,19 @@ def count_full_paths(df: pd.DataFrame) -> Tuple[int, int]:
 
 def render():
     """Render the Workspace Selection tab for choosing and previewing sheets."""
+    
+    # Add guard and debug expander
+    from ui.utils.guards import ensure_active_workbook_and_sheet
+    ok, df = ensure_active_workbook_and_sheet("Workspace Selection")
+    if not ok:
+        return
+    
+    # Debug state expander
+    import json
+    with st.expander("🛠 Debug: Session State (tab)", expanded=False):
+        ss = {k: type(v).__name__ for k,v in st.session_state.items()}
+        st.code(json.dumps(ss, indent=2))
+    
     try:
         # Check for navigation hints and display instructions
         _check_and_display_nav_hint()
@@ -98,15 +102,15 @@ def render():
         st.markdown("Choose a sheet to work with and preview its contents.")
         
         # Status badge
-        has_wb, sheet_count, current_sheet = get_workbook_status()
+        has_wb, sheet_count, current_sheet = USTATE.get_workbook_status()
         if has_wb and current_sheet:
             st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
         else:
             st.caption("Workbook: ❌ not loaded")
         
         # Guard against no active workbook
-        wb = get_active_workbook()
-        sheet = get_current_sheet()
+        wb = USTATE.get_active_workbook()
+        sheet = USTATE.get_current_sheet()
         if not wb or not sheet:
             st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet below.")
             return
@@ -123,7 +127,7 @@ def render():
             )
             
             if selected_sheet != sheet:
-                set_current_sheet(selected_sheet)
+                USTATE.set_current_sheet(selected_sheet)
                 safe_rerun()
         
         # Re-sync button for current sheet
@@ -140,9 +144,9 @@ def render():
                             from io_utils.sheets import read_google_sheet
                             new_df = read_google_sheet(sheet_id, sheet_name, st.secrets["gcp_service_account"])
                             if not new_df.empty:
-                                wb = get_active_workbook() or {}
+                                wb = USTATE.get_active_workbook() or {}
                                 wb[sheet_name] = new_df
-                                set_active_workbook(wb, source="workspace_resync")
+                                USTATE.set_active_workbook(wb, source="workspace_resync")
                                 
                                 # Clear stale caches to ensure immediate refresh
                                 st.cache_data.clear()
@@ -154,13 +158,13 @@ def render():
                     st.error(f"Google Sheets error: {e}")
         
         # Get active DataFrame
-        df = get_active_df()
+        df = USTATE.get_active_df()
         if df is None:
             st.warning("No active workbook/sheet. Load or select one in 📂 Source / 🗂 Workspace.")
             return
 
         # Show headers and preview
-        st.caption(f"Active sheet: {get_current_sheet()} ({len(df)} rows)")
+        st.caption(f"Active sheet: {USTATE.get_current_sheet()} ({len(df)} rows)")
         st.caption(f"Headers: {list(df.columns)[:8]}{' …' if len(df.columns)>8 else ''}")
         
         if not validate_headers(df):
@@ -196,7 +200,7 @@ def render():
         else:
             if st.button("Recompute / Repair"):
                 # bump nonce by re-setting current sheet to itself
-                set_current_sheet(get_current_sheet())
+                USTATE.set_current_sheet(USTATE.get_current_sheet())
                 safe_rerun()
 
         # Preview section
@@ -603,10 +607,10 @@ def _force_summary_recompute(df: pd.DataFrame):
     """Force recompute of the summary by clearing cache and refreshing."""
     try:
         # Use canonical cache invalidation
-        current_sheet = get_current_sheet()
+        current_sheet = USTATE.get_current_sheet()
         if current_sheet:
             # Bump the nonce by setting the same sheet (this triggers cache invalidation)
-            set_current_sheet(current_sheet)
+            USTATE.set_current_sheet(current_sheet)
         
         # Show feedback
         st.success("✅ Summary cache cleared! Recomputing...")
@@ -1100,26 +1104,26 @@ def _apply_quick_append_override(df: pd.DataFrame, level: int, parent_path: str,
             
             # Get current overrides
             overrides_all = st.session_state.get("branch_overrides", {})
-            if get_current_sheet() not in overrides_all:
-                overrides_all[get_current_sheet()] = {}
+            if USTATE.get_current_sheet() not in overrides_all:
+                overrides_all[USTATE.get_current_sheet()] = {}
             
             # Set the override
-            overrides_all[get_current_sheet()][override_key] = children
+            overrides_all[USTATE.get_current_sheet()][override_key] = children
             st.session_state["branch_overrides"] = overrides_all
             
             # Apply the override using logic.tree
             from logic.tree import build_raw_plus_v630
             
             # Get the active workbook
-            active_wb = get_active_workbook()
+            active_wb = USTATE.get_active_workbook()
             
-            if active_wb and get_current_sheet() in active_wb:
+            if active_wb and USTATE.get_current_sheet() in active_wb:
                 # Apply overrides and rebuild the sheet
-                updated_df = build_raw_plus_v630(df, overrides_all[get_current_sheet()])
+                updated_df = build_raw_plus_v630(df, overrides_all[USTATE.get_current_sheet()])
                 
                 # Update the active workbook
-                active_wb[get_current_sheet()] = updated_df
-                set_active_workbook(active_wb, source="quick_append")
+                active_wb[USTATE.get_current_sheet()] = updated_df
+                USTATE.set_active_workbook(active_wb, source="quick_append")
                 
                 # Clear stale caches to ensure immediate refresh
                 st.cache_data.clear()
@@ -1314,26 +1318,26 @@ def _save_parent_changes(df: pd.DataFrame, level: int, parent_path: str, new_chi
         
         # Get current overrides
         overrides_all = st.session_state.get("branch_overrides", {})
-        if get_current_sheet() not in overrides_all:
-            overrides_all[get_current_sheet()] = {}
+        if USTATE.get_current_sheet() not in overrides_all:
+            overrides_all[USTATE.get_current_sheet()] = {}
         
         # Set the override
-        overrides_all[get_current_sheet()][override_key] = clean_children
+        overrides_all[USTATE.get_current_sheet()][override_key] = clean_children
         st.session_state["branch_overrides"] = overrides_all
         
         # Apply the override using logic.tree
         from logic.tree import build_raw_plus_v630
         
         # Get the active workbook
-        active_wb = get_active_workbook()
+        active_wb = USTATE.get_active_workbook()
         
-        if active_wb and get_current_sheet() in active_wb:
+        if active_wb and USTATE.get_current_sheet() in active_wb:
             # Apply overrides and rebuild the sheet
-            updated_df = build_raw_plus_v630(df, overrides_all[get_current_sheet()])
+            updated_df = build_raw_plus_v630(df, overrides_all[USTATE.get_current_sheet()])
             
             # Update the active workbook
-            active_wb[get_current_sheet()] = updated_df
-            set_active_workbook(active_wb, source="parent_editor")
+            active_wb[USTATE.get_current_sheet()] = updated_df
+            USTATE.set_active_workbook(active_wb, source="parent_editor")
             
             # Clear stale caches to ensure immediate refresh
             st.cache_data.clear()
@@ -1432,7 +1436,7 @@ def _apply_workspace_changes(df: pd.DataFrame, sheet_name: str, changes: Dict[st
             from logic.tree import build_raw_plus_v630
             
             # Get the active workbook
-            active_wb = get_active_workbook()
+            active_wb = USTATE.get_active_workbook()
             
             if active_wb and sheet_name in active_wb:
                 # Apply overrides and rebuild the sheet
@@ -1440,7 +1444,7 @@ def _apply_workspace_changes(df: pd.DataFrame, sheet_name: str, changes: Dict[st
                 
                 # Update the active workbook
                 active_wb[sheet_name] = updated_df
-                set_active_workbook(active_wb, source="workspace_changes")
+                USTATE.set_active_workbook(active_wb, source="workspace_changes")
                 
                 # Clear stale caches to ensure immediate refresh
                 st.cache_data.clear()

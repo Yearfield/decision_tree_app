@@ -6,41 +6,37 @@ from typing import Dict, Any, List
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
-from utils.state import (
-    get_active_workbook, get_current_sheet, get_active_df, 
-    has_active_workbook, get_workbook_status, set_active_workbook
-)
+import utils.state as USTATE
 from ui.utils.rerun import safe_rerun
 
 
 def render():
     """Render the Diagnostic Triage tab for managing triage decisions."""
+    
+    # Add guard and debug expander
+    from ui.utils.guards import ensure_active_workbook_and_sheet
+    ok, df = ensure_active_workbook_and_sheet("Diagnostic Triage")
+    if not ok:
+        return
+    
+    # Debug state expander
+    import json
+    with st.expander("🛠 Debug: Session State (tab)", expanded=False):
+        ss = {k: type(v).__name__ for k,v in st.session_state.items()}
+        st.code(json.dumps(ss, indent=2))
+    
     try:
         st.header("🩺 Diagnostic Triage")
         
+        # Get current sheet name for display
+        sheet = USTATE.get_current_sheet()
+        
         # Status badge
-        has_wb, sheet_count, current_sheet = get_workbook_status()
+        has_wb, sheet_count, current_sheet = USTATE.get_workbook_status()
         if has_wb and current_sheet:
             st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
         else:
             st.caption("Workbook: ❌ not loaded")
-        
-        # Guard against no active workbook
-        wb = get_active_workbook()
-        sheet = get_current_sheet()
-        if not wb or not sheet:
-            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
-            return
-
-        # Get active DataFrame
-        df = get_active_df()
-        if df is None:
-            st.warning("No active sheet selected. Please load a workbook in the Source tab and select a sheet.")
-            return
-        
-        if not validate_headers(df):
-            st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
-            return
 
         # Main sections
         _render_triage_overview(df, sheet)
@@ -242,10 +238,10 @@ def _save_triage_changes(df: pd.DataFrame, edited_triage: Dict, sheet_name: str)
         
         if changes_made > 0:
             # Update the active workbook using canonical API
-            active_wb = get_active_workbook()
+            active_wb = USTATE.get_active_workbook()
             if active_wb and sheet_name in active_wb:
                 active_wb[sheet_name] = df
-                set_active_workbook(active_wb, source="triage_editor")
+                USTATE.set_active_workbook(active_wb, source="triage_editor")
                 
                 # Clear stale caches to ensure immediate refresh
                 st.cache_data.clear()
@@ -322,11 +318,10 @@ def _copy_column_as_triage(df: pd.DataFrame, source_col: str, sheet_name: str):
 def _update_workbook(df: pd.DataFrame, sheet_name: str):
     """Update the workbook in session state using canonical API."""
     try:
-        from utils.state import get_active_workbook, set_active_workbook
-        active_wb = get_active_workbook()
+        active_wb = USTATE.get_active_workbook()
         if active_wb and sheet_name in active_wb:
             active_wb[sheet_name] = df
-            set_active_workbook(active_wb, source="triage_bulk")
+            USTATE.set_active_workbook(active_wb, source="triage_bulk")
             
             # Clear stale caches to ensure immediate refresh
             st.cache_data.clear()

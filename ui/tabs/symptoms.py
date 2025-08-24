@@ -3,19 +3,19 @@ import streamlit as st
 import pandas as pd
 import utils.state as USTATE
 from typing import Dict, Any, List, Tuple, Set
+from ui.utils.debug import dump_state, banner
 
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
 )
-from utils.constants import MAX_CHILDREN_PER_PARENT, ROOT_PARENT_LABEL, LEVEL_COLS, MAX_LEVELS, LEVEL_LABELS
+from utils.constants import MAX_CHILDREN_PER_PARENT, ROOT_PARENT_LABEL, MAX_LEVELS, LEVEL_LABELS
 from utils.helpers import normalize_child_set, normalize_text
 from ui.utils.rerun import safe_rerun
 from logic.tree import infer_branch_options, build_label_children_index, infer_branch_options_with_overrides
 from logic.materialize import materialize_children_for_label_group, materialize_children_for_single_parent, materialize_children_for_label_across_tree
 
-# Constants for canonical mapping
-NODE_COLS = ["Node 1", "Node 2", "Node 3", "Node 4", "Node 5"]
-CANON_HEADERS = ["Vital Measurement", *NODE_COLS, "Diagnostic Triage", "Actions"]
+# Use imported constants from utils.constants
+from utils.constants import NODE_COLS, CANON_HEADERS
 
 # Helper functions for level mapping and column access
 def clamp_level(L: int) -> int:
@@ -142,8 +142,27 @@ APP_VERSION = "v6.5"
 
 def render():
     """Render the Symptoms tab for managing symptom quality and branch building."""
+    
+    # Add guard and debug expander
+    from ui.utils.guards import ensure_active_workbook_and_sheet
+    ok, df = ensure_active_workbook_and_sheet("Symptoms")
+    if not ok:
+        return
+    
+    # Debug state expander
+    import json
+    with st.expander("🛠 Debug: Session State (tab)", expanded=False):
+        ss = {k: type(v).__name__ for k,v in st.session_state.items()}
+        st.code(json.dumps(ss, indent=2))
+    
+    banner("Symptoms RENDER ENTRY")
+    dump_state("Session (pre-symptoms)")
+    
     try:
         st.header("🧬 Symptoms v6.5")
+        
+        # Get current sheet name for display
+        sheet = USTATE.get_current_sheet()
         
         # Always-on mini debug banner (never returns early)
         try:
@@ -158,6 +177,18 @@ def render():
         
         # === Use SAFE getters so we know *why* it might be empty ===
         df, status, detail = USTATE.get_active_df_safe()
+        
+        # Get workbook and sheet info for guards
+        wb = USTATE.get_active_workbook()
+        st.caption(f"🔎 [Symptoms] start — current_sheet={sheet!r}  sheet_name={st.session_state.get('sheet_name')!r}")
+
+        if not wb:
+            st.warning("Symptoms: No active workbook in memory (wb is falsy). Load one in 📂 Source.")
+            return
+        if not sheet:
+            st.warning("Symptoms: No active sheet selected (current_sheet is falsy). Choose a sheet in 🗂 Workspace or Source.")
+            return
+        
         if status != "ok":
             # Show a more helpful message when no workbook
             if status == "no_wb":
@@ -194,8 +225,15 @@ def render():
                 return
 
         # We have a DataFrame and a sheet name
-        sheet = st.session_state.get("current_sheet") or st.session_state.get("sheet_name")
         st.caption(f"✅ Using sheet: {sheet} | rows={len(df)} | cols={list(df.columns)[:8]}")
+
+        # Guard against None DataFrame
+        if df is None:
+            st.warning("Symptoms: Active DataFrame is None. (Did the upload complete and was a sheet selected?)")
+            dump_state("Session (df is None)")
+            return
+        else:
+            st.caption(f"Symptoms: df shape = {getattr(df, 'shape', None)}")
 
         # Validate headers early, but tell users *which* are missing
         required = ["Vital Measurement", "Node 1", "Node 2", "Node 3", "Node 4", "Node 5", "Diagnostic Triage", "Actions"]
@@ -334,7 +372,15 @@ def render():
             summary[(L, parent_tuple)] = {"children": kids, "count": len(kids)}
 
         # Render the streamlined symptoms editor with DataFrame-based queues
-        _render_streamlined_symptoms_editor(df, df_norm, sheet, summary, queue_a, queue_b)
+        banner("Symptoms about to render streamlined editor")
+        
+        try:
+            _render_streamlined_symptoms_editor(df, df_norm, sheet, summary, queue_a, queue_b)
+            banner("Symptoms streamlined editor completed OK")
+        except Exception as e:
+            st.error(f"Symptoms: streamlined editor crashed: {type(e).__name__}: {e}")
+            import traceback as _tb
+            st.code(_tb.format_exc())
 
     except Exception as e:
         st.error(f"Exception in Symptoms.render(): {e}")
@@ -549,7 +595,7 @@ def _apply_symptoms_to_single_parent(level: int, parent_path: str, children: Lis
     """Apply children to a single parent path in symptoms."""
     try:
         with st.spinner(f"Applying to single parent at level {level}..."):
-            wb = get_active_workbook()
+            wb = USTATE.get_active_workbook()
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -567,8 +613,8 @@ def _apply_symptoms_to_single_parent(level: int, parent_path: str, children: Lis
             
             # Update workbook
             wb[sheet_name] = new_df
-            set_active_workbook(wb, default_sheet=sheet_name, source="symptoms_single_parent")
-            set_current_sheet(sheet_name)
+            USTATE.set_active_workbook(wb, default_sheet=sheet_name, source="symptoms_single_parent")
+            USTATE.set_current_sheet(sheet_name)
             
             st.success(f"Applied to parent: {parent_path}")
             st.warning("⚠️ Rerun skipped for debugging")
@@ -583,7 +629,7 @@ def _apply_symptoms_to_label_group(level: int, parent_label: str, children: List
     """Apply children to all parents with the same label at the given level in symptoms."""
     try:
         with st.spinner(f"Applying to all '{parent_label}' parents at level {level}..."):
-            wb = get_active_workbook()
+            wb = USTATE.get_active_workbook()
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -595,8 +641,8 @@ def _apply_symptoms_to_label_group(level: int, parent_label: str, children: List
             
             # Update workbook
             wb[sheet_name] = new_df
-            set_active_workbook(wb, default_sheet=sheet_name, source="symptoms_label_group")
-            set_current_sheet(sheet_name)
+            USTATE.set_active_workbook(wb, default_sheet=sheet_name, source="symptoms_label_group")
+            USTATE.set_current_sheet(sheet_name)
             
             st.success(f"Applied to label-wide group: {parent_label}")
             st.warning("⚠️ Rerun skipped for debugging")
@@ -611,7 +657,7 @@ def _apply_symptoms_to_label_across_tree(parent_label: str, children: List[str],
     """Apply children to all parents with the same label across the entire tree in symptoms."""
     try:
         with st.spinner(f"Applying to all '{parent_label}' parents across the tree..."):
-            wb = get_active_workbook()
+            wb = USTATE.get_active_workbook()
             if not wb or sheet_name not in wb:
                 st.error("No active sheet.")
                 return
@@ -619,7 +665,7 @@ def _apply_symptoms_to_label_across_tree(parent_label: str, children: List[str],
             df0 = wb[sheet_name]
             
             # Get the summary for the materializer
-            res = get_conflict_summary_with_root(df0, get_wb_nonce())
+            res = get_conflict_summary_with_root(df0, USTATE.get_wb_nonce())
             summary = res["summary"]
             
             # Use the across-tree materializer
@@ -627,8 +673,8 @@ def _apply_symptoms_to_label_across_tree(parent_label: str, children: List[str],
             
             # Update workbook
             wb[sheet_name] = new_df
-            set_active_workbook(wb, default_sheet=sheet_name, source="symptoms_across_tree")
-            set_current_sheet(sheet_name)
+            USTATE.set_active_workbook(wb, default_sheet=sheet_name, source="symptoms_across_tree")
+            USTATE.set_current_sheet(sheet_name)
             
             st.success(f"Applied to label-wide group: {parent_label}")
             st.warning("⚠️ Rerun skipped for debugging")
@@ -1038,7 +1084,7 @@ def _render_branch_editor_section(df: pd.DataFrame, sheet_name: str):
         st.info("💡 **Note:** Level-1 (ROOT) children are managed in the ⚖️ Conflicts tab. Use the Level-1 editor there to set the Node-1 options.")
     
     # Get distinct parent paths at level-1
-    parent_paths = _get_parent_paths_at_level(df, level, get_wb_nonce())
+    parent_paths = _get_parent_paths_at_level(df, level, USTATE.get_wb_nonce())
     
     if not parent_paths:
         st.info(f"No parent paths found at level {level}.")
@@ -1057,7 +1103,7 @@ def _render_branch_editor_section(df: pd.DataFrame, sheet_name: str):
         return
     
     # Show current children for the selected parent
-    current_children = _get_current_children_for_parent(df, level, selected_parent_path, get_wb_nonce())
+    current_children = _get_current_children_for_parent(df, level, selected_parent_path, USTATE.get_wb_nonce())
     
     # Build clear parent title
     if len(selected_parent_path) == 0 and level == 1:
@@ -1179,10 +1225,10 @@ def _render_branch_editor_section(df: pd.DataFrame, sheet_name: str):
                     df_new.loc[idxs, "Actions"] = bulk_actions
 
                 # Save back
-                wb = get_active_workbook()
+                wb = USTATE.get_active_workbook()
                 if wb and sheet_name in wb:
                     wb[sheet_name] = df_new
-                    set_active_workbook(wb, source="symptoms_outcomes_bulk")
+                    USTATE.set_active_workbook(wb, source="symptoms_outcomes_bulk")
                     st.success(f"Applied Outcomes to {len(idxs)} row(s).")
                 else:
                     st.error("Could not update workbook.")
@@ -1232,10 +1278,10 @@ def _render_branch_editor_section(df: pd.DataFrame, sheet_name: str):
                         df_new.at[orig_idx, "Actions"] = edited.iloc[pos]["Actions"]
 
                     # Save back
-                    wb = get_active_workbook()
+                    wb = USTATE.get_active_workbook()
                     if wb and sheet_name in wb:
                         wb[sheet_name] = df_new
-                        set_active_workbook(wb, source="symptoms_outcomes_rows")
+                        USTATE.set_active_workbook(wb, source="symptoms_outcomes_rows")
                         st.success("Per-row Outcomes saved.")
                     else:
                         st.error("Could not update workbook.")
@@ -1332,8 +1378,7 @@ def _apply_branch_editor_changes(df: pd.DataFrame, level: int, parent_path: Tupl
             from logic.tree import build_raw_plus_v630
             
             # Get the active workbook
-            from utils.state import get_active_workbook, set_active_workbook
-            active_wb = get_active_workbook()
+            active_wb = USTATE.get_active_workbook()
             
             if active_wb and sheet_name in active_wb:
                 # Apply overrides and rebuild the sheet
@@ -1341,7 +1386,7 @@ def _apply_branch_editor_changes(df: pd.DataFrame, level: int, parent_path: Tupl
                 
                 # Update the active workbook
                 active_wb[sheet_name] = updated_df
-                set_active_workbook(active_wb, source="symptoms_editor")
+                USTATE.set_active_workbook(active_wb, source="symptoms_editor")
                 
                 # Clear stale caches to ensure immediate refresh
                 st.cache_data.clear()
@@ -1375,60 +1420,61 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
     """Render the streamlined symptoms editor with queue-driven navigation."""
     
     # put at the very start of the Symptoms render() (or _render_streamlined_symptoms_editor)
-    st.markdown("""
-    <style>
-    /* Scope to symptoms only */
-    .symp hr,
-    .symp .stDivider,
-    .symp [data-testid="stMarkdownContainer"] hr {
-      display: none !important;
-      margin: 0 !important;
-      padding: 0 !important;
-      height: 0 !important;
-      border: 0 !important;
-    }
+    # TEMPORARILY COMMENTED OUT CSS WRAPPER TO DEBUG BLANK TABS
+    # st.markdown("""
+    # <style>
+    # /* Scope to symptoms only */
+    # .symp hr,
+    # .symp .stDivider,
+    # .symp [data-testid="stMarkdownContainer"] hr {
+    #   display: none !important;
+    #   margin: 0 !important;
+    #   padding: 0 !important;
+    #   height: 0 !important;
+    #   border: 0 !important;
+    # }
 
-    /* Remove extra spacing right under button rows */
-    .symp .stHorizontalBlock, .symp .stButton > button {
-      margin-bottom: 0 !important;
-    }
+    # /* Remove extra spacing right under button rows */
+    # .symp .stHorizontalBlock, .symp .stButton > button {
+    #   margin-bottom: 0 !important;
+    # }
 
-    /* Only hide empty <p>, don't hide the whole container */
-    .symp [data-testid="stMarkdownContainer"] > p:empty {
-      display: none !important;
-      margin: 0 !important;
-      padding: 0 !important;
-    }
+    # /* Only hide empty <p>, don't hide the whole container */
+    # .symp [data-testid="stMarkdownContainer"] > p:empty {
+    #   display: none !important;
+    #   margin: 0 !important;
+    #   padding: 0 !important;
+    # }
 
-    .symp .chip {
-      display:inline-block;
-      padding:3px 8px;
-      margin:0 6px 6px 0;
-      border-radius:12px;
-      border:1px solid #dbe0e6;
-      background:#fff;
-      font-size:12px;
-    }
+    # .symp .chip {
+    #   display:inline-block;
+    #   padding:3px 8px;
+    #   margin:0 6px 6px 0;
+    #   border-radius:12px;
+    #   border:1px solid #dbe0e6;
+    #   background:#fff;
+    #   font-size:12px;
+    # }
 
-    /* Compact, marginless card */
-    .symp .symp-card{
-      background:#f0f2f6;
-      border:1px solid #dbe0e6;
-      border-radius:8px;
-      padding:16px;
-      margin:0 !important;          /* kill any outer gap */
-      display:flex;
-      gap:24px;
-      align-items:flex-start;
-    }
-    /* two-column layout */
-    .symp .symp-card__left{ flex:2; min-width:0; }
-    .symp .symp-card__right{ flex:1; min-width:0; }
+    # /* Compact, marginless card */
+    # .symp .symp-card{
+    #   background:#f0f2f6;
+    #   border:1px solid #dbe0e6;
+    #   border-radius:8px;
+    #   padding:16px;
+    #   margin:0 !important;          /* kill any outer gap */
+    #   display:flex;
+    #   gap:24px;
+    #   align-items:flex-start;
+    # }
+    # /* two-column layout */
+    # .symp .symp-card__left{ flex:2; min-width:0; }
+    # .symp .symp-card__right{ flex:1; min-width:0; }
 
 
-    </style>
-    <div class="symp">
-    """, unsafe_allow_html=True)
+    # </style>
+    # <div class="symp">
+    # """, unsafe_allow_html=True)
 
 
     
@@ -1692,10 +1738,9 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
             # Call your existing materialize/save routine (the one already used elsewhere) to write to Node L
             try:
                 from logic.tree import infer_branch_options_with_overrides
-                from utils.state import get_active_workbook, set_active_workbook
                 
                 # Get active workbook
-                wb = get_active_workbook()
+                wb = USTATE.get_active_workbook()
                 if not wb or sheet_name not in wb:
                     st.error("No active workbook found.")
                     return
@@ -1705,7 +1750,7 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
                 
                 # Update workbook
                 wb[sheet_name] = updated_df
-                set_active_workbook(wb, source="symptoms_editor")
+                USTATE.set_active_workbook(wb, source="symptoms_editor")
                 
                 # Clear caches
                 st.cache_data.clear()
@@ -1722,7 +1767,7 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
                 if active == "A" and queue_a:
                     st.session_state[posA_key] = (st.session_state.get(posA_key, 0) + 1) % len(queue_a)
                 elif active == "B" and queue_b:
-                    st.session_state[posB_key] = (st.session_state.get(posB_key, 0) + 1) % len(queue_b)
+                    st.session_state[posB_key] = (st.session_state.get(posB_key, 0) + 1) % len(queue_a)
                 
                 # Rerun to update queues
                 st.rerun()
@@ -1765,10 +1810,9 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
             # Call your existing materialize/save routine (the one already used elsewhere) to write to Node L
             try:
                 from logic.tree import infer_branch_options_with_overrides
-                from utils.state import get_active_workbook, set_active_workbook
                 
                 # Get active workbook
-                wb = get_active_workbook()
+                wb = USTATE.get_active_workbook()
                 if not wb or sheet_name not in wb:
                     st.error("No active workbook found.")
                     return
@@ -1778,7 +1822,7 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
                 
                 # Update workbook
                 wb[sheet_name] = updated_df
-                set_active_workbook(wb, source="symptoms_editor")
+                USTATE.set_active_workbook(wb, source="symptoms_editor")
                 
                 # Clear caches
                 st.cache_data.clear()
@@ -1888,4 +1932,5 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
                 st.write(f"**Sample Node 1 values (repr):** {[repr(v) for v in sample_values]}")
     
     # Close the CSS wrapper div
-    st.markdown("</div>", unsafe_allow_html=True)
+    # TEMPORARILY COMMENTED OUT CSS WRAPPER TO DEBUG BLANK TABS
+    # st.markdown("</div>", unsafe_allow_html=True)
