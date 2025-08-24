@@ -20,8 +20,8 @@ from logic.validate import (
     get_cached_orphan_nodes, get_cached_loops, get_cached_validation_report
 )
 from ui.tabs import (
-    source, workspace, validation, conflicts, triage, actions, 
-    symptoms, dictionary, calculator, visualizer, push_log
+    source, workspace, validation, conflicts, 
+    symptoms, outcomes, dictionary, calculator, visualizer, push_log
 )
 
 
@@ -91,6 +91,8 @@ def _initialize_session_state():
 
 def _render_header():
     """Render the application header."""
+    import pandas as pd
+    
     col1, col2, col3 = st.columns([2, 1, 1])
     
     with col1:
@@ -111,6 +113,76 @@ def _render_header():
             st.caption(f"Workbook: ✅ {len(wb)} sheet(s) • Active: **{get_current_sheet()}**")
         else:
             st.caption("Workbook: ❌ not loaded")
+        
+        # Header badges showing current context stats
+        df0 = get_active_df()
+        badges_html = ""
+        if isinstance(df0, pd.DataFrame) and not df0.empty and validate_headers(df0):
+            # Inline helper functions for metrics
+            def _rows_full_path_counts(df0: pd.DataFrame) -> tuple[int, int]:
+                if df0 is None or df0.empty:
+                    return 0, 0
+                node_cols = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
+                for c in node_cols:
+                    if c not in df0.columns:
+                        df0[c] = ""
+                ok = int((df0[node_cols] != "").all(axis=1).sum())
+                total = int(len(df0))
+                return ok, total
+
+            def _parents_vectorized_counts(df0: pd.DataFrame) -> tuple[int, int]:
+                if df0 is None or df0.empty:
+                    return 0, 0
+                dfv = df0.copy()
+                node_cols = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
+                for c in ["Vital Measurement"] + node_cols:
+                    if c not in dfv.columns:
+                        dfv[c] = ""
+                    dfv[c] = dfv[c].astype(str).str.strip()
+                ok_total = 0
+                total_parents = 0
+                for lvl in range(1, 6):
+                    parent_cols = node_cols[:lvl-1]
+                    child_col  = node_cols[lvl-1]
+                    scope = dfv[dfv[child_col] != ""].copy()
+                    if parent_cols:
+                        scope = scope[(scope[parent_cols] != "").all(axis=1)]
+                    if scope.empty:
+                        continue
+                    grp = (scope.groupby(parent_cols, dropna=False)[child_col].nunique()
+                           if parent_cols else
+                           scope.assign(__root="__root").groupby("__root")[child_col].nunique())
+                    total_parents += int(len(grp))
+                    ok_total      += int((grp == 5).sum())
+                return ok_total, total_parents
+            
+            ok_p, total_p = _parents_vectorized_counts(df0)
+            ok_r, total_r = _rows_full_path_counts(df0)
+            pct_p = 0 if total_p==0 else int(round(100*ok_p/total_p))
+            pct_r = 0 if total_r==0 else int(round(100*ok_r/total_r))
+            badges_html = f"""
+            <style>
+            .badge-wrap {{ display:flex; gap:16px; flex-wrap: wrap; }}
+            .b {{ padding:8px 10px; border-radius:12px; border:1px solid #dbe0e6; background:#f8fafc; 
+                 font: 12px/1.2 -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color:#0f172a; }}
+            .bar {{ position:relative; height:8px; background:#eef2f6; border:1px solid #dbe0e6; border-radius:8px; overflow:hidden; width:160px; }}
+            .fill1 {{ position:absolute; left:0; top:0; bottom:0; width:{pct_p}%; background:linear-gradient(90deg,#60a5fa,#2563eb); }}
+            .fill2 {{ position:absolute; left:0; top:0; bottom:0; width:{pct_r}%; background:linear-gradient(90deg,#34d399,#059669); }}
+            .strong {{ font-weight:600; }}
+            </style>
+            <div class='badge-wrap'>
+              <div class='b'>
+                <div>Parents 5/5 — <span class='strong'>{ok_p}/{total_p}</span></div>
+                <div class='bar'><div class='fill1'></div></div>
+              </div>
+              <div class='b'>
+                <div>Rows full path — <span class='strong'>{ok_r}/{total_r}</span></div>
+                <div class='bar'><div class='fill2'></div></div>
+              </div>
+            </div>
+            """
+        if badges_html:
+            st.markdown(badges_html, unsafe_allow_html=True)
     
     with col3:
         # Dev Panel instrumentation
@@ -158,9 +230,8 @@ def _render_main_content():
         ("🗂 Workspace Selection", workspace.render),
         ("🔎 Validation", validation.render),
         ("⚖️ Conflicts", conflicts.render),
-        ("🩺 Diagnostic Triage", triage.render),
-        ("⚡ Actions", actions.render),
         ("🧬 Symptoms", symptoms.render),
+        ("📝 Outcomes", outcomes.render),
         ("📖 Dictionary", dictionary.render),
         ("🧮 Calculator", calculator.render),
         ("🌐 Visualizer", visualizer.render),

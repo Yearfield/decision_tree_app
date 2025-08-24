@@ -8,7 +8,7 @@ from utils import (
 )
 from utils.state import (
     set_active_workbook, get_active_workbook, set_current_sheet, 
-    get_current_sheet, has_active_workbook, get_workbook_status
+    get_current_sheet, get_workbook_status
 )
 from logic.tree import build_raw_plus_v630 # Not fully used yet, but imported
 from io_utils.sheets import read_google_sheet
@@ -40,11 +40,7 @@ def render():
         st.exception(e)
 
 
-def _has_active_workbook() -> bool:
-    """Check if there's an active workbook in session state."""
-    upload_wb = st.session_state.get("upload_workbook", {})
-    gs_wb = st.session_state.get("gs_workbook", {})
-    return bool(upload_wb or gs_wb)
+
 
 
 def _render_upload_section():
@@ -94,7 +90,6 @@ def _render_upload_section():
         st.cache_data.clear()
         
         # Sanity assertions (temporary; safe to remove later)
-        from utils.state import get_active_workbook, get_current_sheet
         wb_check, sheet_check = get_active_workbook(), get_current_sheet()
         assert wb_check is not None, "active workbook missing after upload"
         assert isinstance(wb_check, dict), "active workbook should be Dict[str, DataFrame]"
@@ -108,7 +103,9 @@ def _render_google_sheets_section():
     st.subheader("🔄 Google Sheets")
     
     # Re-sync button for current sheet
-    if has_active_workbook() and get_current_sheet():
+    current_wb = get_active_workbook()
+    current_sheet = get_current_sheet()
+    if bool(current_wb) and current_sheet:
         if st.button("🔄 Re-sync current sheet"):
             sheet_id = st.session_state.get("sheet_id")
             sheet_name = st.session_state.get("sheet_name")
@@ -121,15 +118,14 @@ def _render_google_sheets_section():
                         with st.spinner("Re-syncing..."):
                             new_df = read_google_sheet(sheet_id, sheet_name, st.secrets["gcp_service_account"])
                             if not new_df.empty:
-                                wb = get_active_workbook() or {}
-                                wb[sheet_name] = new_df
-                                set_active_workbook(wb, source="sheets")
+                                updated_wb = get_active_workbook() or {}
+                                updated_wb[sheet_name] = new_df
+                                set_active_workbook(updated_wb, source="sheets")
                                 
                                 # Clear stale caches to ensure immediate refresh
                                 st.cache_data.clear()
                                 
                                 # Sanity assertions (temporary; safe to remove later)
-                                from utils.state import get_active_workbook, get_current_sheet
                                 wb_check, sheet_check = get_active_workbook(), get_current_sheet()
                                 assert wb_check is not None, "active workbook missing after re-sync"
                                 assert isinstance(wb_check, dict), "active workbook should be Dict[str, DataFrame]"
@@ -186,6 +182,9 @@ def _render_google_sheets_section():
                     # Set as active workbook using canonical API
                     set_active_workbook(clean_wb, default_sheet=default_sheet, source="sheets")
                     
+                    # Set work_context so other tabs (Outcomes) pick it up immediately
+                    st.session_state["work_context"] = {"source": "gs", "sheet": default_sheet}
+                    
                     # Clear stale caches - the nonce-based system should handle this automatically,
                     # but we'll clear explicitly to ensure immediate refresh
                     st.cache_data.clear()
@@ -196,7 +195,6 @@ def _render_google_sheets_section():
                         st.json(rep)
                     
                     # Sanity assertions (temporary; safe to remove later)
-                    from utils.state import get_active_workbook, get_current_sheet
                     wb, sheet = get_active_workbook(), get_current_sheet()
                     assert wb is not None, "active workbook missing after load"
                     assert isinstance(wb, dict), "active workbook should be Dict[str, DataFrame]"

@@ -3,16 +3,13 @@ import streamlit as st
 import pandas as pd
 from typing import Dict, Any, List, Tuple, Optional
 
-from utils import (
-    CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
-)
-from utils.state import (
-    get_active_workbook, get_current_sheet, get_active_df, 
-    has_active_workbook, get_workbook_status, get_wb_nonce
-)
-from ui.utils.rerun import safe_rerun
-from logic.tree import infer_branch_options, analyze_decision_tree_with_root
-from utils.constants import ROOT_COL, LEVEL_COLS, LEVEL_LABELS
+from utils.state import get_active_workbook, get_current_sheet
+from logic.tree import infer_branch_options_with_overrides
+
+
+def _nz(s) -> str:
+    """Local text normalizer - strips whitespace and handles None/NaN."""
+    return "" if s is None else str(s).strip()
 
 
 def render():
@@ -21,41 +18,49 @@ def render():
         st.header("🧮 Calculator")
         st.markdown("Navigate decision tree paths and explore outcomes.")
         
-        # Status badge
-        has_wb, sheet_count, current_sheet = get_workbook_status()
-        if has_wb and current_sheet:
-            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
-        else:
-            st.caption("Workbook: ❌ not loaded")
-        
-        # Guard against no active workbook
+        # Get active DF + sheet using utils.state
         wb = get_active_workbook()
         sheet = get_current_sheet()
+        
         if not wb or not sheet:
-            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
-            return
-
-        # Get active DataFrame
-        df = get_active_df()
-        if df is None:
-            st.warning("No active sheet selected. Please load a workbook in the Source tab and select a sheet.")
+            st.info("Load a workbook in Source.")
             return
         
-        if not validate_headers(df):
-            st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
+        df = wb.get(sheet)
+        if df is None or df.empty:
+            st.info("Load a workbook in Source.")
             return
-
-        # Initialize calculator path in session state
-        if "calc_path" not in st.session_state:
-            st.session_state["calc_path"] = []
         
+        # Ensure Node columns exist (add empty strings if any of Node 1..Node 5 missing)
+        node_cols = ["Node 1", "Node 2", "Node 3", "Node 4", "Node 5"]
+        for col in node_cols:
+            if col not in df.columns:
+                df[col] = ""
+        
+        # Show Root (VM) as a read-only label only
+        vm_values = df["Vital Measurement"].dropna().astype(str).str.strip()
+        vm_values = vm_values[vm_values != ""]
+        if not vm_values.empty:
+            vm_label = vm_values.iloc[0]  # First non-empty value
+        else:
+            vm_label = "—"
+        
+        st.caption(f"VM (Root): {vm_label}")
+
         # Main Path Navigator
         _render_path_navigator(df, sheet)
         
-        # Path Results
-        if st.session_state["calc_path"]:
+        # Path Results - check if any path is selected
+        nav_key = f"calc_nav_{sheet}"
+        current_context = st.session_state.get(nav_key, {})
+        current_path = []
+        for i in range(1, 6):  # Only check N1-N5 (not N6)
+            if current_context.get(f"N{i}"):
+                current_path.append(current_context[f"N{i}"])
+        
+        if current_path:
             st.markdown("---")
-            _render_path_results(df, sheet)
+            _render_path_results(df, sheet, current_path)
         
     except Exception as e:
         st.exception(e)
@@ -67,165 +72,303 @@ def _get_cached_branch_options(df: pd.DataFrame, nonce: str) -> Dict[str, Any]:
     return infer_branch_options(df)
 
 
-def _calc_build_nested_options(df: pd.DataFrame) -> Dict[Tuple[int, str], List[str]]:
-    """Build nested dict: vm -> node1 children → node2 children → ... node5."""
-    res = analyze_decision_tree_with_root(df, get_wb_nonce())
-    summary = res["summary"]
-    # index: (L,parent_path) -> {children}
-    # Build per-level lookup
-    by_parent = {(L, p): info["children"] for (L, p), info in summary.items()}
-    return by_parent
+def _calc_build_nested_options(df: pd.DataFrame, overrides_sheet: Dict[str, List[str]]) -> Dict[int, Dict[Tuple[str, ...], List[str]]]:
+    """
+    Build {level -> {parent_tuple -> [children...]}} from df + overrides.
+    Level 1 parents = ROOT (empty tuple), children live in Node 1.
+    """
+    store = infer_branch_options_with_overrides(df, overrides_sheet)
+    out: Dict[int, Dict[Tuple[str, ...], List[str]]] = {i: {} for i in range(1, 6)}
+    for key, children in (store or {}).items():
+        # Expected keys like "L1|<ROOT>", "L2|Headache", "L3|Headache>Thunderclap Headache", ...
+        if "|" not in key:
+            continue
+        lvl_s, path = key.split("|", 1)
+        try:
+            L = int(lvl_s[1:])
+        except Exception:
+            continue
+        if L < 1 or L > 5:
+            continue
+        parent_tuple: Tuple[str, ...] = tuple([] if path == "<ROOT>" else path.split(">"))
+        out[L][parent_tuple] = [c for c in (children or []) if _nz(c)]
+    return out
 
 
-def children_for(by_parent: Dict[Tuple[int, str], List[str]], level: int, path: str) -> List[str]:
+def children_for(by_parent: Dict[int, Dict[Tuple[str, ...], List[str]]], level: int, path: str) -> List[str]:
     """Get children for a given level and parent path."""
-    return by_parent.get((level, path), [])
+    if level not in by_parent:
+        return []
+    
+    # Convert path string to tuple for lookup
+    if path == "<ROOT>":
+        parent_tuple = tuple()
+    else:
+        parent_tuple = tuple(path.split(">"))
+    
+    return by_parent[level].get(parent_tuple, [])
 
 
 def _render_path_navigator(df: pd.DataFrame, sheet_name: str):
-    """Render the path navigator interface with VM+Nodes approach."""
+    """Render the path navigator interface with correct Root/Level mapping and Node 2-5 population."""
     st.subheader("🗺️ Path Navigator")
     st.markdown("Walk through the decision tree by selecting options at each level.")
     
-    # Build nested options from tree summary
-    by_parent = _calc_build_nested_options(df)
-    
-    # VM (Root) options - Node 1 under ROOT
-    vm_opts = children_for(by_parent, 1, "<ROOT>")
-    if not vm_opts:
-        st.info("No VM (Root) options found in the decision tree.")
+    if df is None or df.empty:
+        st.info("Load a workbook in Source.")
         return
+
+    # Build the store and nested lookup "by_parent"
+    overrides_sheet = st.session_state.get("branch_overrides", {}).get(sheet_name, {})
+    store = infer_branch_options_with_overrides(df, overrides_sheet)
     
-    # VM (Root) selection
-    vm = st.selectbox(
-        f"{LEVEL_LABELS[0]}: Select root option",
-        [""] + vm_opts,
-        key="calc_vm",
-        help="Choose the starting point for your path"
+    # Parse keys like "L1|<ROOT>", "L2|Headache", "L3|Headache>Thunderclap Headache"
+    by_parent: Dict[int, Dict[Tuple[str, ...], List[str]]] = {i: {} for i in range(1, 6)}
+    
+    for key, children in (store or {}).items():
+        if "|" not in key:
+            continue
+        lstr, path = key.split("|", 1)
+        try:
+            L = int(lstr[1:])
+        except Exception:
+            continue
+        if L < 1 or L > 5:
+            continue
+        
+        # Parse parent tuple - ensure proper tuple construction
+        if path == "<ROOT>":
+            parent_tuple = ()
+        else:
+            # Split by '>' and normalize each part
+            parent_tuple = tuple(_nz(part) for part in path.split(">"))
+        
+        children = [c for c in (children or []) if _nz(c)]
+        by_parent[L][parent_tuple] = children
+    
+    # Root children (Node 1 options)
+    root_children = by_parent.get(1, {}).get((), [])
+    
+    # Fallback: if empty, use sorted unique, non-empty df["Node 1"]
+    if not root_children:
+        fallback_node1 = sorted(df["Node 1"].astype(str).str.strip().replace("nan", "").unique())
+        fallback_node1 = [x for x in fallback_node1 if x and x != ""]
+        
+        if fallback_node1:
+            by_parent[1][()] = fallback_node1
+            root_children = fallback_node1
+        else:
+            st.warning("No Node 1 options found. Check 'Vital Measurement' and 'Node 1' data.")
+            return
+    
+    # State & cascade reset
+    nav_key = f"calc_nav_{sheet_name}"
+    state = st.session_state.setdefault(nav_key, {"N1": None, "N2": None, "N3": None, "N4": None, "N5": None})
+    
+    # State hygiene - reset when sheet changes
+    if st.session_state.get("calc_nav_sheet") != sheet_name:
+        state = {"N1": None, "N2": None, "N3": None, "N4": None, "N5": None}
+        st.session_state[nav_key] = state
+        st.session_state["calc_nav_sheet"] = sheet_name
+    
+    # Debug expander (collapsed by default)
+    with st.expander("🔍 Debug (Path Navigator)", expanded=False):
+        st.write(f"**Root children count:** {len(root_children)}")
+        st.write(f"**by_parent[1] has () key:** {() in by_parent.get(1, {})}")
+        st.write(f"**by_parent[1][()] children count:** {len(by_parent.get(1, {}).get((), []))}")
+        st.write(f"**Sheet:** {sheet_name}")
+        st.write(f"**DataFrame shape:** {df.shape}")
+    
+    # Reset path button
+    if st.button("🔄 Reset Path", key="calc_reset_path"):
+        state = {"N1": None, "N2": None, "N3": None, "N4": None, "N5": None}
+        st.session_state[nav_key] = state
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Helper function for fallback options
+    def get_fallback_options(level: int, parent_selections: List[str]) -> List[str]:
+        """Get fallback options from DataFrame when store is empty."""
+        if level < 2 or level > 5:
+            return []
+        
+        # Build filter mask for parent columns
+        mask = pd.Series(True, index=df.index)
+        for i, selection in enumerate(parent_selections):
+            col_name = f"Node {i+1}"
+            if col_name in df.columns:
+                # Normalize both DataFrame column and selection for comparison
+                mask &= (df[col_name].astype(str).str.strip().replace("nan", "") == _nz(selection))
+        
+        # Get unique non-empty values from current level column
+        level_col = f"Node {level}"
+        if level_col in df.columns:
+            filtered_values = df[mask][level_col].astype(str).str.strip().replace("nan", "").unique()
+            return sorted([x for x in filtered_values if x and x != ""])
+        return []
+    
+    # Node 1 selection
+    node1 = st.selectbox(
+        "Select Node 1 option",
+        [""] + root_children,
+        key=f"{nav_key}_node1",
+        help="Choose the first node in your path"
     )
     
-    if vm:
-        # Update path
-        if len(st.session_state["calc_path"]) == 0:
-            st.session_state["calc_path"] = [vm]
-        else:
-            st.session_state["calc_path"][0] = vm
-            st.session_state["calc_path"] = st.session_state["calc_path"][:1]
+    # Reset cascade when higher levels change
+    if node1 != state.get("N1"):
+        state["N1"] = node1
+        state["N2"] = None
+        state["N3"] = None
+        state["N4"] = None
+        state["N5"] = None
+        st.session_state[nav_key] = state
+    
+    if node1:
+        # Node 2 options
+        p1 = _nz(node1)
+        key2 = (p1,)
+        opts2 = by_parent.get(2, {}).get(key2, [])
         
-        # Node 1 options based on VM choice
-        n1_path = vm
-        n1_opts = children_for(by_parent, 2, n1_path)
-        n1 = st.selectbox(
-            f"{LEVEL_LABELS[1]}: Select option",
-            [""] + n1_opts,
-            key="calc_n1",
-            help="Choose Node 1 option"
+        # Fallback if opts2 is empty
+        if not opts2:
+            opts2 = get_fallback_options(2, [p1])
+        
+        node2 = st.selectbox(
+            "Select Node 2 option",
+            [""] + opts2,
+            key=f"{nav_key}_node2",
+            help="Choose the second node in your path"
         )
         
-        if n1:
-            # Update path
-            if len(st.session_state["calc_path"]) < 2:
-                st.session_state["calc_path"].append(n1)
-            else:
-                st.session_state["calc_path"][1] = n1
-                st.session_state["calc_path"] = st.session_state["calc_path"][:2]
+        # Reset cascade when N2 changes
+        if node2 != state.get("N2"):
+            state["N2"] = node2
+            state["N3"] = None
+            state["N4"] = None
+            state["N5"] = None
+            st.session_state[nav_key] = state
+        
+        if node2:
+            # Node 3 options
+            p2 = _nz(node2)
+            key3 = (p1, p2)
+            opts3 = by_parent.get(3, {}).get(key3, [])
             
-            # Node 2 options based on VM + Node 1
-            n2_path = ">".join([vm, n1])
-            n2_opts = children_for(by_parent, 3, n2_path)
-            n2 = st.selectbox(
-                f"{LEVEL_LABELS[2]}: Select option",
-                [""] + n2_opts,
-                key="calc_n2",
-                help="Choose Node 2 option"
+            # Fallback if opts3 is empty
+            if not opts3:
+                opts3 = get_fallback_options(3, [p1, p2])
+            
+            node3 = st.selectbox(
+                "Select Node 3 option",
+                [""] + opts3,
+                key=f"{nav_key}_node3",
+                help="Choose the third node in your path"
             )
             
-            if n2:
-                # Update path
-                if len(st.session_state["calc_path"]) < 3:
-                    st.session_state["calc_path"].append(n2)
-                else:
-                    st.session_state["calc_path"][2] = n2
-                    st.session_state["calc_path"] = st.session_state["calc_path"][:3]
+            # Reset cascade when N3 changes
+            if node3 != state.get("N3"):
+                state["N3"] = node3
+                state["N4"] = None
+                state["N5"] = None
+                st.session_state[nav_key] = state
+            
+            if node3:
+                # Node 4 options
+                p3 = _nz(node3)
+                key4 = (p1, p2, p3)
+                opts4 = by_parent.get(4, {}).get(key4, [])
                 
-                # Node 3 options based on VM + Node 1 + Node 2
-                n3_path = ">".join([vm, n1, n2])
-                n3_opts = children_for(by_parent, 4, n3_path)
-                n3 = st.selectbox(
-                    f"{LEVEL_LABELS[3]}: Select option",
-                    [""] + n3_opts,
-                    key="calc_n3",
-                    help="Choose Node 3 option"
+                # Fallback if opts4 is empty
+                if not opts4:
+                    opts4 = get_fallback_options(4, [p1, p2, p3])
+                
+                node4 = st.selectbox(
+                    "Select Node 4 option",
+                    [""] + opts4,
+                    key=f"{nav_key}_node4",
+                    help="Choose the fourth node in your path"
                 )
                 
-                if n3:
-                    # Update path
-                    if len(st.session_state["calc_path"]) < 4:
-                        st.session_state["calc_path"].append(n3)
-                    else:
-                        st.session_state["calc_path"][3] = n3
-                        st.session_state["calc_path"] = st.session_state["calc_path"][:4]
+                # Reset cascade when N4 changes
+                if node4 != state.get("N4"):
+                    state["N4"] = node4
+                    state["N5"] = None
+                    st.session_state[nav_key] = state
+                
+                if node4:
+                    # Node 5 options
+                    p4 = _nz(node4)
+                    key5 = (p1, p2, p3, p4)
+                    opts5 = by_parent.get(5, {}).get(key5, [])
                     
-                    # Node 4 options based on VM + Node 1 + Node 2 + Node 3
-                    n4_path = ">".join([vm, n1, n2, n3])
-                    n4_opts = children_for(by_parent, 5, n4_path)
-                    n4 = st.selectbox(
-                        f"{LEVEL_LABELS[4]}: Select option",
-                        [""] + n4_opts,
-                        key="calc_n4",
-                        help="Choose Node 4 option"
+                    # Fallback if opts5 is empty
+                    if not opts5:
+                        opts5 = get_fallback_options(5, [p1, p2, p3, p4])
+                    
+                    node5 = st.selectbox(
+                        "Select Node 5 option",
+                        [""] + opts5,
+                        key=f"{nav_key}_node5",
+                        help="Choose the fifth node in your path"
                     )
                     
-                    if n4:
-                        # Update path
-                        if len(st.session_state["calc_path"]) < 5:
-                            st.session_state["calc_path"].append(n4)
-                        else:
-                            st.session_state["calc_path"][4] = n4
-                            st.session_state["calc_path"] = st.session_state["calc_path"][:5]
-                        
-                        # Node 5 options based on full path
-                        n5_path = ">".join([vm, n1, n2, n3, n4])
-                        n5_opts = children_for(by_parent, 6, n5_path)
-                        n5 = st.selectbox(
-                            f"{LEVEL_LABELS[5]}: Select option",
-                            [""] + n5_opts,
-                            key="calc_n5",
-                            help="Choose Node 5 option"
-                        )
-                        
-                        if n5:
-                            # Update path
-                            if len(st.session_state["calc_path"]) < 6:
-                                st.session_state["calc_path"].append(n5)
-                            else:
-                                st.session_state["calc_path"][5] = n5
-                                st.session_state["calc_path"] = st.session_state["calc_path"][:6]
-                                st.session_state["calc_path"][5] = n5
-                                st.session_state["calc_path"] = st.session_state["calc_path"][:6]
+                    if node5:
+                        state["N5"] = node5
+                        st.session_state[nav_key] = state
     
-    # Live Path Preview
-    if st.session_state["calc_path"]:
+    # Debug expander for navigator keys (optional)
+    with st.expander("🔍 Debug (Navigator keys)", expanded=False):
+        if node1:
+            p1_norm = _nz(node1)
+            key2_debug = (p1_norm,)
+            st.write(f"**Node 2 parent tuple:** {key2_debug}")
+            st.write(f"**by_parent[2] contains key:** {key2_debug in by_parent.get(2, {})}")
+            st.write(f"**Node 2 options from store:** {len(by_parent.get(2, {}).get(key2_debug, []))}")
+            
+            # Show fallback values when store is empty
+            if not by_parent.get(2, {}).get(key2_debug, []):
+                fallback_debug = get_fallback_options(2, [p1_norm])
+                st.write(f"**Node 2 fallback DF values:** {fallback_debug[:5]}... (total: {len(fallback_debug)})")
+        
+        if node1 and node2:
+            p2_norm = _nz(node2)
+            key3_debug = (_nz(node1), p2_norm)
+            st.write(f"**Node 3 parent tuple:** {key3_debug}")
+            st.write(f"**by_parent[3] contains key:** {key3_debug in by_parent.get(3, {})}")
+            st.write(f"**Node 3 options from store:** {len(by_parent.get(3, {}).get(key3_debug, []))}")
+    
+    # Current Path should display only the Node selections (do not include VM string in the tuple)
+    current_path = []
+    for i in range(1, 6):  # Only check N1-N5 (not N6)
+        if state.get(f"N{i}"):
+            current_path.append(state.get(f"N{i}"))
+    
+    if current_path:
         st.markdown("---")
         st.subheader("📍 Path Preview")
-        path_display = " > ".join(st.session_state["calc_path"])
+        path_display = " > ".join(current_path)
         st.info(f"**Current Path:** {path_display}")
         
-        # Reset button
-        if st.button("🔄 Reset Path", key="calc_reset"):
-            st.session_state["calc_path"] = []
-            safe_rerun()
+        # Show current selections
+        cols = st.columns(5)  # Only 5 columns for N1-N5
+        for i, col in enumerate(cols):
+            with col:
+                level_name = f"Node {i+1}"
+                value = state.get(f"N{i+1}", "")
+                st.metric(level_name, value if value else "Not selected")
 
 
-def _render_path_results(df: pd.DataFrame, sheet_name: str):
+def _render_path_results(df: pd.DataFrame, sheet_name: str, current_path: List[str]):
     """Render the results for the selected path with row selection and CSV export."""
     st.subheader("📊 Path Results")
     
-    if not st.session_state["calc_path"]:
+    if not current_path:
         return
     
     # Build filter mask for the selected path
-    filter_mask = _build_path_filter_mask(df, st.session_state["calc_path"])
+    filter_mask = _build_path_filter_mask(df, current_path)
     
     if filter_mask is None:
         st.warning("Could not build filter for the selected path.")

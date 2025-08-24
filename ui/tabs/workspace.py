@@ -14,7 +14,7 @@ row duplication patterns.
 import streamlit as st
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
@@ -22,9 +22,9 @@ from utils import (
 from utils.state import (
     get_active_workbook, get_current_sheet, get_active_df, 
     set_current_sheet, has_active_workbook, get_workbook_status,
-    get_wb_nonce, set_active_workbook
+    set_active_workbook
 )
-from logic.tree import infer_branch_options
+from logic.tree import infer_branch_options, infer_branch_options_with_overrides
 from utils.constants import ROOT_PARENT_LABEL, MAX_CHILDREN_PER_PARENT, LEVEL_LABELS, ROOT_COL, LEVEL_COLS, MAX_LEVELS
 from ui.utils.rerun import safe_rerun
 
@@ -33,8 +33,52 @@ assert callable(get_current_sheet), "get_current_sheet not imported correctly"
 assert callable(get_active_df), "get_active_df not imported correctly"
 assert callable(get_active_workbook), "get_active_workbook not imported correctly"
 assert callable(set_current_sheet), "set_current_sheet not imported correctly"
-assert callable(get_wb_nonce), "get_wb_nonce not imported correctly"
 assert callable(set_active_workbook), "set_active_workbook not imported correctly"
+
+
+def _compute_parents_vectorized(df: pd.DataFrame) -> tuple[int, int, int]:
+    """
+    Returns (ok_parents, total_parents, conflict_parents).
+    ok_parents = parents that have exactly 5 distinct non-empty children.
+    conflict_parents = parents with !=5 children.
+    """
+    if df is None or df.empty:
+        return 0, 0, 0
+
+    dfv = df.copy()
+    node_cols = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
+    for c in ["Vital Measurement"] + node_cols:
+        if c not in dfv.columns:
+            dfv[c] = ""
+        dfv[c] = dfv[c].astype(str).map(lambda x: x.strip())
+
+    ok_total = 0
+    total_parents = 0
+    conflict_parents = 0
+
+    for lvl in range(1, 6):
+        parent_cols = node_cols[:lvl-1]        # [] for lvl==1 (ROOT)
+        child_col  = node_cols[lvl-1]
+
+        scope = dfv[dfv[child_col] != ""].copy()
+        if parent_cols:
+            scope = scope[(scope[parent_cols] != "").all(axis=1)]
+        if scope.empty:
+            continue
+
+        if parent_cols:
+            grp = scope.groupby(parent_cols, dropna=False)[child_col].nunique()
+        else:
+            grp = scope.assign(__root="__root").groupby("__root")[child_col].nunique()
+
+        total_parents     += int(len(grp))
+        ok_total          += int((grp == 5).sum())
+        conflict_parents  += int((grp != 5).sum())
+
+    return ok_total, total_parents, conflict_parents
+
+
+
 
 
 def count_full_paths(df: pd.DataFrame) -> Tuple[int, int]:
@@ -132,7 +176,17 @@ def render():
         summary = _render_robust_summary_with_repair(df)
         
         # Show monolith counters
-        _render_monolith_counters(df)
+        has_any_label, total_p = _render_monolith_counters(df, sheet)
+        
+        # Check if we truly have no labels vs just no parents discovered
+        node_cols = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
+        for c in node_cols:
+            if c not in df.columns:
+                df[c] = ""
+        has_any_label = (df[node_cols].astype(str).apply(lambda s: s.str.strip()) != "").any(axis=1).any()
+        
+        if total_p == 0 and not has_any_label:
+            st.info("No parent nodes found yet. Start by adding Node 1 children in the Symptoms tab.")
         
         if summary and summary.get("total_parents", 0) > 0:
             # Show KPIs and per-level breakdown only after non-empty store
@@ -140,7 +194,6 @@ def render():
             # Also show the worklist since we have data
             _render_parent_worklist(df, summary)
         else:
-            st.warning("No parents were discovered. This can happen if children are all blanks or normalization trims everything.")
             if st.button("Recompute / Repair"):
                 # bump nonce by re-setting current sheet to itself
                 set_current_sheet(get_current_sheet())
@@ -157,27 +210,50 @@ def render():
         st.exception(e)
 
 
-def _render_monolith_counters(df: pd.DataFrame):
-    """Render monolith-style counters: Rows with full path and Parents completed (exact-5)."""
-    # Count rows with full path
-    full_paths, total_rows = count_full_paths(df)
+def _render_monolith_counters(df: pd.DataFrame, sheet_name: Optional[str] = None):
+    if df is None or df.empty:
+        st.info("Selected sheet is empty.")
+        return
+
+    # Use vectorized calculation for accurate parent metrics
+    ok_p, total_p, conflict_parents = _compute_parents_vectorized(df)
     
-    # Count parents completed (exact-5)
-    res = get_conflict_summary_with_root(df, get_wb_nonce())
-    exact5 = sum(1 for ((_L, _p), info) in res["summary"].items() if info["exact5"])
-    total_parents = len(res["summary"])
+    # Calculate rows with full path
+    total = len(df)
+    ok_r = 0
     
-    with st.container(border=True):
-        st.markdown("#### 📊 Monolith Counters")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.metric("Rows with full path", f"{full_paths}/{total_rows}")
-        
-        with col2:
-            completion_rate = (exact5 / total_parents * 100) if total_parents > 0 else 0
-            st.metric("Parents completed (exact-5)", f"{exact5}/{total_parents}", f"{completion_rate:.1f}%")
+    for _, row in df.iterrows():
+        path_complete = True
+        for col in LEVEL_COLS:
+            if col in df.columns:
+                if normalize_text(row.get(col, "")) == "":
+                    path_complete = False
+                    break
+        if path_complete:
+            ok_r += 1
+    
+    total_r = total
+
+    # Robust parent presence check (don't rely solely on store)
+    # Show a notice ONLY if there are truly no non-empty labels in Node 1..5.
+    node_cols = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
+    for c in node_cols:
+        if c not in df.columns:
+            df[c] = ""
+    has_any_label = (df[node_cols].astype(str).apply(lambda s: s.str.strip()) != "").any(axis=1).any()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Parents with 5 children", f"{ok_p}/{total_p}")
+        st.progress(0 if total_p == 0 else ok_p / total_p)
+    with c2:
+        st.metric("Rows with full path", f"{ok_r}/{total_r}")
+        st.progress(0 if total_r == 0 else ok_r / total_r)
+    with c3:
+        st.metric("Parents violating 5‑child rule", f"{conflict_parents}")
+    
+    # Return the has_any_label value and total_p for use in the render function
+    return has_any_label, total_p
 
 
 def _check_and_display_nav_hint():
@@ -212,38 +288,51 @@ def _compute_parent_coverage_summary(df: pd.DataFrame, nonce: str) -> Dict[str, 
         if not validate_headers(df):
             return {}
         
-        # Use the monolith-style analysis from logic.tree
-        from ui.analysis import get_conflict_summary_with_root
-        res = get_conflict_summary_with_root(df, nonce)
+        # Use local logic instead of external analysis
+        store = infer_branch_options(df)
         
         # Initialize level tracking
         level_stats = {level: {"total": 0, "with_5": 0, "with_less_5": 0, "with_0": 0} for level in range(1, 6)}
         
-        # Level 1: exactly 1 parent (ROOT)
-        l1_total = 1 if res["summary"].get((1, ROOT_PARENT_LABEL)) else 0
-        l1_covered = 1 if len(res["root_children"]) == MAX_CHILDREN_PER_PARENT else 0
-        
-        level_stats[1]["total"] = l1_total
-        level_stats[1]["with_5"] = l1_covered
-        level_stats[1]["with_less_5"] = 1 - l1_covered if l1_total > 0 else 0
-        level_stats[1]["with_0"] = 0  # ROOT always has some children
-        
-        # Levels 2-5: count distinct parent paths
-        for (L, _pth), info in res["summary"].items():
-            if L == 1:  # Skip ROOT, already handled
-                continue
-            if L < 1 or L > MAX_LEVELS:
+        # Process each store entry
+        for key, children in store.items():
+            if not key.startswith("L"):
                 continue
                 
-            level_stats[L]["total"] += 1
+            # Parse level from key (L{level}|{path})
+            parts = key.split("|", 1)
+            if len(parts) != 2:
+                continue
+                
+            try:
+                level = int(parts[0][1:])  # Remove "L" and convert to int
+                if level < 1 or level > 5:
+                    continue
+            except ValueError:
+                continue
             
-            # Check coverage based on exact5 flag
-            if info["exact5"]:
-                level_stats[L]["with_5"] += 1
-            elif info["count"] == 0:
-                level_stats[L]["with_0"] += 1
-            elif 0 < info["count"] < MAX_CHILDREN_PER_PARENT:
-                level_stats[L]["with_less_5"] += 1
+            # Count non-empty, deduped children
+            if children:
+                normalized_children = []
+                seen = set()
+                for child in children:
+                    clean_child = normalize_text(child)
+                    if clean_child and clean_child not in seen:
+                        normalized_children.append(clean_child)
+                        seen.add(clean_child)
+                child_count = len(normalized_children)
+            else:
+                child_count = 0
+            
+            # Update level stats
+            level_stats[level]["total"] += 1
+            
+            if child_count == 5:
+                level_stats[level]["with_5"] += 1
+            elif child_count == 0:
+                level_stats[level]["with_0"] += 1
+            elif 0 < child_count < 5:
+                level_stats[level]["with_less_5"] += 1
         
         # Compute totals across all levels
         total_parents = sum(stats["total"] for stats in level_stats.values())
@@ -268,7 +357,7 @@ def _compute_parent_coverage_summary(df: pd.DataFrame, nonce: str) -> Dict[str, 
 def _render_robust_summary(df: pd.DataFrame):
     """Render the robust parent coverage summary."""
     # Compute summary with caching using nonce
-    summary = _compute_parent_coverage_summary(df, get_wb_nonce())
+    summary = _compute_parent_coverage_summary(df, "local")
     
     if not summary:
         st.warning("No active sheet or invalid headers")
@@ -337,7 +426,7 @@ def _render_robust_summary(df: pd.DataFrame):
 def _render_robust_summary_with_repair(df: pd.DataFrame):
     """Render the robust parent coverage summary with repair functionality."""
     # Compute summary with caching using nonce
-    summary = _compute_parent_coverage_summary(df, get_wb_nonce())
+    summary = _compute_parent_coverage_summary(df, "local")
     
     if not summary:
         st.warning("No active sheet or invalid headers")
@@ -1367,28 +1456,6 @@ def _apply_workspace_changes(df: pd.DataFrame, sheet_name: str, changes: Dict[st
     except Exception as e:
         st.error(f"Error applying workspace changes: {e}")
         st.exception(e)
-
-
-@st.cache_data(ttl=600)
-def _compute_row_path_score_counts(df: pd.DataFrame, nonce: str) -> tuple[int, int]:
-    """Compute row path score counts."""
-    try:
-        total = len(df)
-        ok = 0
-        
-        for _, row in df.iterrows():
-            path_complete = True
-            for col in LEVEL_COLS:
-                if col in df.columns:
-                    if normalize_text(row.get(col, "")) == "":
-                        path_complete = False
-                        break
-            if path_complete:
-                ok += 1
-                
-        return ok, total
-    except Exception:
-        return 0, 0
 
 
 def _render_preview_section(df: pd.DataFrame, sheet_name: str):
