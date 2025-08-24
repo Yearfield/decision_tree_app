@@ -190,8 +190,9 @@ def _render_simple_conflicts_navigator(conflict_summary: Dict[str, Any], df: pd.
         _render_parent_first_editor(cur, treewide_mismatches, df, sheet_name)
         
     else:
-        st.success("No conflicts 🎉")
-        st.stop()
+        st.success("🎉 All conflicts resolved.")
+        st.session_state["current_tab"] = "symptoms"  # or whatever your router key expects
+        st.rerun()
 
 
 def _render_parent_first_editor(cur: Dict[str, Any], treewide_mismatches: Dict, df: pd.DataFrame, sheet_name: str):

@@ -1,21 +1,17 @@
 # ui/tabs/symptoms.py
 import streamlit as st
 import pandas as pd
+import utils.state as USTATE
 from typing import Dict, Any, List, Tuple, Set
 
 from utils import (
     CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
-)
-from utils.state import (
-    get_active_workbook, get_current_sheet, get_active_df, 
-    has_active_workbook, get_workbook_status, set_active_workbook, set_current_sheet
 )
 from utils.constants import MAX_CHILDREN_PER_PARENT, ROOT_PARENT_LABEL, LEVEL_COLS, MAX_LEVELS, LEVEL_LABELS
 from utils.helpers import normalize_child_set, normalize_text
 from ui.utils.rerun import safe_rerun
 from logic.tree import infer_branch_options, build_label_children_index, infer_branch_options_with_overrides
 from logic.materialize import materialize_children_for_label_group, materialize_children_for_single_parent, materialize_children_for_label_across_tree
-from utils.state import get_active_workbook, get_current_sheet, set_active_workbook
 
 # Constants for canonical mapping
 NODE_COLS = ["Node 1", "Node 2", "Node 3", "Node 4", "Node 5"]
@@ -147,30 +143,65 @@ APP_VERSION = "v6.5"
 def render():
     """Render the Symptoms tab for managing symptom quality and branch building."""
     try:
-        st.header(f"🧬 Symptoms — {APP_VERSION}")
+        st.header("🧬 Symptoms v6.5")
         
-        # Status badge
-        has_wb, sheet_count, current_sheet = get_workbook_status()
-        if has_wb and current_sheet:
-            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
-        else:
-            st.caption("Workbook: ❌ not loaded")
+        # Always-on mini debug banner (never returns early)
+        try:
+            wb, wb_status, wb_detail = USTATE.get_active_workbook_safe()
+            wb_keys = list((wb or {}).keys())
+        except Exception:
+            wb_keys = []
+        st.caption(
+            f"🚦 Symptoms ENTRY | current_sheet={st.session_state.get('current_sheet')} "
+            f"| sheet_name={st.session_state.get('sheet_name')} | wb_keys={wb_keys[:5]}"
+        )
         
-        # Guard against no active workbook
-        wb = get_active_workbook()
-        sheet = get_current_sheet()
-        if not wb or not sheet:
-            st.warning("No active workbook/sheet. Load a workbook in 📂 Source or select a sheet in 🗂 Workspace.")
-            return
+        # === Use SAFE getters so we know *why* it might be empty ===
+        df, status, detail = USTATE.get_active_df_safe()
+        if status != "ok":
+            # Show a more helpful message when no workbook
+            if status == "no_wb":
+                st.info("📂 **No workbook loaded yet**")
+                st.markdown("""
+                **To get started:**
+                1. Go to the **Source tab** (first tab)
+                2. **Upload a workbook** or **connect to Google Sheets**
+                3. **Select a sheet** to work with
+                
+                Once a workbook is loaded, this tab will show your decision tree data.
+                """)
+                
+                # Show current status
+                with st.expander("🔍 Current Status", expanded=True):
+                    st.write({
+                        "workbook_status": status,
+                        "detail": detail,
+                        "session_keys": [k for k in st.session_state.keys() if "workbook" in k.lower() or "sheet" in k.lower()]
+                    })
+                
+                # Don't show the "Try ensure_active_sheet" button when no workbook
+                return
+            else:
+                st.warning(f"Symptoms not ready: {status} — {detail}")
+                colA, colB = st.columns(2)
+                with colA:
+                    if st.button("🔁 Try ensure_active_sheet()"):
+                        picked = USTATE.ensure_active_sheet(default=st.session_state.get("sheet_name"))
+                        st.toast(f"Active sheet → {picked}")
+                        st.rerun()
+                with colB:
+                    st.caption("If this persists, check upload step sets `workbook` or `gs_workbook` as a dict of DataFrames.")
+                return
 
-        # Get active DataFrame
-        df = get_active_df()
-        if df is None:
-            st.warning("No active sheet selected. Please load a workbook in the Source tab and select a sheet.")
-            return
-        
-        if not validate_headers(df):
-            st.warning("Active sheet has invalid headers. Please ensure it has the required columns.")
+        # We have a DataFrame and a sheet name
+        sheet = st.session_state.get("current_sheet") or st.session_state.get("sheet_name")
+        st.caption(f"✅ Using sheet: {sheet} | rows={len(df)} | cols={list(df.columns)[:8]}")
+
+        # Validate headers early, but tell users *which* are missing
+        required = ["Vital Measurement", "Node 1", "Node 2", "Node 3", "Node 4", "Node 5", "Diagnostic Triage", "Actions"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            st.error(f"Missing required columns: {missing}")
             return
 
         # Build the parent→children store for editing (but not for counting)
@@ -193,11 +224,15 @@ def render():
         
         # Build queues from the DataFrame (not the store)
         queue_a = []  # No children
-        queue_b = []  # <5 children
+        queue_b = []  # ≤5 children (changed from <5 children)
+        
+
         
         for L in range(1, 6):  # 1..5 inclusive
             pcols = parent_cols(L)
             ccol = child_col(L)
+            
+
             
             # Parent set
             if L == 1:
@@ -223,6 +258,8 @@ def render():
             if not parent_set:
                 continue
             
+
+            
             # Child count per parent
             scope_nonempty = df_norm[df_norm[ccol] != ""]
             
@@ -230,16 +267,20 @@ def render():
                 # Treat ROOT specially by counting distinct non-empty Node 1 overall (this yields 0..N)
                 n = scope_nonempty[ccol].nunique()
                 
+
+                
                 # Queue A (no children): n == 0 → include ()
                 if n == 0:
                     queue_a.append((L, ()))
                 
-                # Queue B (<5 children): if 0 < n < 5 → include ()
-                if 0 < n < 5:
+                # Queue B (≤5 children): if 0 < n ≤ 5 → include ()  # Updated condition
+                if 0 < n <= 5:
                     queue_b.append((L, ()))
             else:
                 # Group by parent columns and count children
                 grp = scope_nonempty.groupby(pcols, dropna=False)[ccol].nunique()
+                
+
                 
                 # Convert groupby index to normalized tuples for proper comparison
                 keys = grp.index
@@ -248,24 +289,32 @@ def render():
                 else:
                     grp_keys = {(_nz_strict(v),) for v in keys.tolist()}                  # single index
                 
+
+                
                 # Queue A (no children): parents in parent set not in grp.index
                 zero_children = sorted(parent_set - grp_keys)  # both sets are tuples
                 for parent_tuple in zero_children:
                     queue_a.append((L, parent_tuple))
                 
-                # Queue B (<5 children): iterate grp.items() carefully mapped to the tuple keys
-                for k, v in grp.items():
-                    if 0 < v < 5:
+
+                
+                # Queue B (≤5 children): iterate grp.items() carefully mapped to the tuple keys
+                for k, child_count in grp.items():
+                    if 0 < child_count <= 5:  # Changed from < 5 to <= 5
                         # Convert the key to a proper tuple using strict normalizer
                         if len(pcols) == 1:
                             parent_tuple = (_nz_strict(k),)
                         else:
-                            parent_tuple = tuple(_nz_strict(v) for v in k)
+                            parent_tuple = tuple(_nz_strict(val) for val in k)
                         queue_b.append((L, parent_tuple))
+                
+
         
         # Sort queues by (L, parent_tuple) for stability
         queue_a.sort(key=lambda x: (x[0], x[1]))
         queue_b.sort(key=lambda x: (x[0], x[1]))
+        
+
         
         # Build summary for editing (using store for pre-filling, not for counting)
         summary: Dict[Tuple[int, Tuple[str, ...]], Dict[str, object]] = {}
@@ -288,6 +337,7 @@ def render():
         _render_streamlined_symptoms_editor(df, df_norm, sheet, summary, queue_a, queue_b)
 
     except Exception as e:
+        st.error(f"Exception in Symptoms.render(): {e}")
         st.exception(e)
 
 
@@ -398,7 +448,8 @@ def _render_simple_symptoms_editor(df: pd.DataFrame, sheet_name: str, summary: D
             if st.button("Skip ➝ Next incomplete parent", key="__symptoms_skip_next"):
                 next_idx = (st.session_state["sym_simple_parent_index"] + 1) % len(parent_options)
                 st.session_state["sym_simple_parent_index"] = next_idx
-                safe_rerun()
+                st.warning("⚠️ Rerun skipped for debugging")
+                # safe_rerun()
         
         with col2:
             st.info(f"Parent {st.session_state['sym_simple_parent_index'] + 1} of {len(parent_options)}")
@@ -520,7 +571,8 @@ def _apply_symptoms_to_single_parent(level: int, parent_path: str, children: Lis
             set_current_sheet(sheet_name)
             
             st.success(f"Applied to parent: {parent_path}")
-            safe_rerun()
+            st.warning("⚠️ Rerun skipped for debugging")
+            # safe_rerun()
             
     except Exception as e:
         st.error(f"Error applying to single parent: {e}")
@@ -547,7 +599,8 @@ def _apply_symptoms_to_label_group(level: int, parent_label: str, children: List
             set_current_sheet(sheet_name)
             
             st.success(f"Applied to label-wide group: {parent_label}")
-            safe_rerun()
+            st.warning("⚠️ Rerun skipped for debugging")
+            # safe_rerun()
             
     except Exception as e:
         st.error(f"Error applying to label group: {e}")
@@ -577,8 +630,9 @@ def _apply_symptoms_to_label_across_tree(parent_label: str, children: List[str],
             set_active_workbook(wb, default_sheet=sheet_name, source="symptoms_across_tree")
             set_current_sheet(sheet_name)
             
-            st.success(f"Applied to all '{parent_label}' parents across the tree")
-            safe_rerun()
+            st.success(f"Applied to label-wide group: {parent_label}")
+            st.warning("⚠️ Rerun skipped for debugging")
+            # safe_rerun()
             
     except Exception as e:
         st.error(f"Error applying across tree: {e}")
@@ -654,7 +708,8 @@ def _render_symptom_prevalence_section(df: pd.DataFrame, symptom_prevalence: Dic
                     symptom_prevalence[selected_term] = new_prevalence
                     st.session_state["__symptom_prevalence"] = symptom_prevalence
                     st.success(f"Updated '{selected_term}' prevalence to {new_prevalence}")
-                    safe_rerun()
+                    st.warning("⚠️ Rerun skipped for debugging")
+                    # safe_rerun()
     
     # Bulk prevalence operations
     st.markdown("---")
@@ -671,7 +726,8 @@ def _render_symptom_prevalence_section(df: pd.DataFrame, symptom_prevalence: Dic
             if st.checkbox("Confirm reset all prevalence scores"):
                 st.session_state["__symptom_prevalence"] = {}
                 st.success("All prevalence scores reset!")
-                safe_rerun()
+                st.warning("⚠️ Rerun skipped for debugging")
+                # safe_rerun()
     
     with col3:
         if st.button("💾 Export Prevalence Data"):
@@ -761,7 +817,8 @@ def _auto_assign_prevalence_scores(df: pd.DataFrame, symptom_prevalence: Dict):
             
             st.session_state["__symptom_prevalence"] = symptom_prevalence
             st.success(f"Auto-assigned prevalence scores to {len(term_counts)} terms!")
-            safe_rerun()
+            st.warning("⚠️ Rerun skipped for debugging")
+            # safe_rerun()
             
     except Exception as e:
         st.error(f"Error auto-assigning prevalence scores: {e}")
@@ -1088,7 +1145,7 @@ def _render_branch_editor_section(df: pd.DataFrame, sheet_name: str):
                 for i, col in enumerate(pcols):
                     if i < len(pt):
                         want = _nz(pt[i])
-                        dfm = dfm[dfm[col].astype(str).map(nz) == want]
+                        dfm = dfm[dfm[col].astype(str).map(_nz) == want]
                 # If level==1, parent is ROOT; we'll apply bulk to all Node 1 rows under this VM/sheet
                 return dfm
 
@@ -1304,7 +1361,8 @@ def _apply_branch_editor_changes(df: pd.DataFrame, level: int, parent_path: Tupl
                         st.write(f"Removed {abs(rows_affected)} rows to standardize the children set.")
                 
                 # Rerun to show updated state
-                safe_rerun()
+                st.warning("⚠️ Rerun skipped for debugging")
+                # safe_rerun()
             else:
                 st.error("Could not update active workbook.")
                 
@@ -1335,9 +1393,11 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
       margin-bottom: 0 !important;
     }
 
-    /* Collapse accidental empty markdown blocks */
-    .symp [data-testid="stMarkdownContainer"]:has(p:empty) {
+    /* Only hide empty <p>, don't hide the whole container */
+    .symp [data-testid="stMarkdownContainer"] > p:empty {
       display: none !important;
+      margin: 0 !important;
+      padding: 0 !important;
     }
 
     .symp .chip {
@@ -1385,7 +1445,7 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
     c1, c2, c3 = st.columns(3)
     m1 = c1.empty()
     c2.metric("Parents with 0 children", f"{zero_total}")
-    c3.metric("Parents with <5 children", f"{lt5_total}")
+    c3.metric("Parents with ≤5 children", f"{lt5_total}")
     
     # Controls bar with two Next buttons
     # Maintain per-sheet state keys
@@ -1407,9 +1467,9 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
     
     with col2:
         if queue_b:
-            if st.button("➡️ Next (<5 children)", key="sym_next_queue_b"):
-                st.session_state[posB_key] = (st.session_state.get(posB_key, 0) + 1) % len(queue_b)
-                st.session_state[active_key] = "B"
+            if st.button("➡️ Next (≤5 children)", key="sym_next_queue_b"):  # Updated label
+                st.session_state["sym_next_queue_b"] = True
+                st.session_state["sym_queue_b_pos"] = min(len(queue_b) - 1, queue_b_pos + 1)
                 st.rerun()
         else:
             st.success("No items in this queue 🎉")
@@ -1456,7 +1516,7 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
     if active == "A":
         queue_info = f"Queue A (no children) • position {pos+1} of {len(queue_a)}"
     else:
-        queue_info = f"Queue B (<5 children) • position {pos+1} of {len(queue_b)}"
+        queue_info = f"Queue B (≤5 children) • position {pos+1} of {len(queue_b)}"
     
     # Sheet & VM: show active sheet and the first non-empty df["Vital Measurement"]
     vm_label = "—"
@@ -1798,7 +1858,7 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
             if active == "A":
                 st.write(f"**In Queue A (no children):** {(L, pt) in queue_a}")
             else:
-                st.write(f"**In Queue B (<5 children):** {(L, pt) in queue_b}")
+                st.write(f"**In Queue B (≤5 children):** {(L, pt) in queue_b}")
             
             # 3) Add a one-time debug to verify equality paths
             st.write("---")

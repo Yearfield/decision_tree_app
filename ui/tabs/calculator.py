@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 from typing import Dict, Any, List, Tuple, Optional
 
-from utils.state import get_active_workbook, get_current_sheet
+from utils.state import get_active_workbook, get_current_sheet, get_active_df, has_active_workbook
 from logic.tree import infer_branch_options_with_overrides
 
 
@@ -13,23 +13,29 @@ def _nz(s) -> str:
 
 
 def render():
-    """Render the Calculator tab with Path Navigator."""
+    """Render the Calculator tab for navigating decision tree paths."""
     try:
         st.header("🧮 Calculator")
-        st.markdown("Navigate decision tree paths and explore outcomes.")
         
-        # Get active DF + sheet using utils.state
-        wb = get_active_workbook()
-        sheet = get_current_sheet()
+        # Check if we have a workbook before proceeding
+        from utils.state import get_active_df_safe
+        df, status, detail = get_active_df_safe()
         
-        if not wb or not sheet:
-            st.info("Load a workbook in Source.")
-            return
-        
-        df = wb.get(sheet)
-        if df is None or df.empty:
-            st.info("Load a workbook in Source.")
-            return
+        if status != "ok":
+            if status == "no_wb":
+                st.info("📂 **No workbook loaded yet**")
+                st.markdown("""
+                **To get started:**
+                1. Go to the **Source tab** (first tab)
+                2. **Upload a workbook** or **connect to Google Sheets**
+                3. **Select a sheet** to work with
+                
+                Once a workbook is loaded, this tab will show your decision tree data.
+                """)
+                return
+            else:
+                st.warning(f"Calculator not ready: {status} — {detail}")
+                return
         
         # Ensure Node columns exist (add empty strings if any of Node 1..Node 5 missing)
         node_cols = ["Node 1", "Node 2", "Node 3", "Node 4", "Node 5"]
@@ -63,6 +69,7 @@ def render():
             _render_path_results(df, sheet, current_path)
         
     except Exception as e:
+        st.error(f"Exception in Calculator.render(): {e}")
         st.exception(e)
 
 
@@ -183,7 +190,8 @@ def _render_path_navigator(df: pd.DataFrame, sheet_name: str):
     if st.button("🔄 Reset Path", key="calc_reset_path"):
         state = {"N1": None, "N2": None, "N3": None, "N4": None, "N5": None}
         st.session_state[nav_key] = state
-        st.rerun()
+        st.warning("⚠️ Rerun skipped for debugging")
+        # st.rerun()
     
     st.markdown("---")
     

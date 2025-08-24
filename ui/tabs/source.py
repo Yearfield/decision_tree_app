@@ -16,6 +16,8 @@ from io_utils.sheets import read_google_sheet
 
 def render():
     """Render the Source tab for loading and creating decision tree data."""
+    st.info("🚦 DISPATCH Source/Workbook loader reached")
+    
     try:
         st.header("📂 Source")
         st.markdown("Load/create your decision tree data.")
@@ -23,7 +25,7 @@ def render():
         # Status badge
         has_wb, sheet_count, current_sheet = get_workbook_status()
         if has_wb and current_sheet:
-            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{current_sheet}**")
+            st.caption(f"Workbook: ✅ {sheet_count} sheet(s) • Active: **{get_current_sheet()}**")
         else:
             st.caption("Workbook: ❌ not loaded")
 
@@ -86,8 +88,28 @@ def _render_upload_section():
         # Set as active workbook using canonical API
         set_active_workbook(clean_wb, source="upload")
         
-        # Clear stale caches to ensure immediate refresh
-        st.cache_data.clear()
+        # Prefer previously selected sheet_name if present; otherwise first sheet.
+        from utils.state import ensure_active_sheet
+        from ui.utils.rerun import safe_rerun
+        
+        # after you set wb dict in session (workbook OR gs_workbook)...
+        picked = ensure_active_sheet(default=st.session_state.get("sheet_name"))
+        if picked:
+            st.toast(f"Active sheet set to {picked}")
+        
+        # Force a refresh so other tabs see the new state
+        safe_rerun()
+        
+        # Debug: show current sheet status
+        st.info(f"✅ Current sheet set to {picked}")
+        
+        # Verify that get_workbook_status() now reflects the current sheet
+        from utils.state import get_workbook_status
+        has_wb, sheet_count, current_sheet = get_workbook_status()
+        st.info(f"🔍 Workbook status after set_current_sheet: has_wb={has_wb}, sheet_count={sheet_count}, current_sheet={picked}")
+        
+        # Additional verification - check session state directly
+        st.info(f"🔍 Session state check: workbook keys={list(st.session_state.get('workbook', {}).keys())}, current_sheet={st.session_state.get('current_sheet')}")
         
         # Sanity assertions (temporary; safe to remove later)
         wb_check, sheet_check = get_active_workbook(), get_current_sheet()
@@ -122,8 +144,31 @@ def _render_google_sheets_section():
                                 updated_wb[sheet_name] = new_df
                                 set_active_workbook(updated_wb, source="sheets")
                                 
-                                # Clear stale caches to ensure immediate refresh
-                                st.cache_data.clear()
+                                # Prefer previously selected sheet_name if present; otherwise first sheet.
+                                from utils.state import ensure_active_sheet
+                                from ui.utils.rerun import safe_rerun
+                                
+                                # after you set wb dict in session (workbook OR gs_workbook)...
+                                picked = ensure_active_sheet(default=st.session_state.get("sheet_name"))
+                                if picked:
+                                    st.toast(f"Active sheet set to {picked}")
+                                
+                                # Force a refresh so other tabs see the new state
+                                safe_rerun()
+                                
+                                # (optional) surface a tiny toast so we know it happened
+                                st.toast(f"Activated sheet: {sheet_name}")
+                                
+                                # Debug: show current sheet status
+                                st.info(f"✅ Current sheet set to {sheet_name}")
+                                
+                                # Verify that get_workbook_status() now reflects the current sheet
+                                from utils.state import get_workbook_status
+                                has_wb, sheet_count, current_sheet = get_workbook_status()
+                                st.info(f"🔍 Workbook status after set_current_sheet: has_wb={has_wb}, sheet_count={sheet_count}, current_sheet={sheet_name}")
+                                
+                                # Additional verification - check session state directly
+                                st.info(f"🔍 Session state check: workbook keys={list(st.session_state.get('workbook', {}).keys())}, current_sheet={st.session_state.get('current_sheet')}")
                                 
                                 # Sanity assertions (temporary; safe to remove later)
                                 wb_check, sheet_check = get_active_workbook(), get_current_sheet()
@@ -182,12 +227,31 @@ def _render_google_sheets_section():
                     # Set as active workbook using canonical API
                     set_active_workbook(clean_wb, default_sheet=default_sheet, source="sheets")
                     
-                    # Set work_context so other tabs (Outcomes) pick it up immediately
-                    st.session_state["work_context"] = {"source": "gs", "sheet": default_sheet}
+                    # Prefer previously selected sheet_name if present; otherwise first sheet.
+                    from utils.state import ensure_active_sheet
+                    from ui.utils.rerun import safe_rerun
                     
-                    # Clear stale caches - the nonce-based system should handle this automatically,
-                    # but we'll clear explicitly to ensure immediate refresh
-                    st.cache_data.clear()
+                    # after you set wb dict in session (workbook OR gs_workbook)...
+                    picked = ensure_active_sheet(default=st.session_state.get("sheet_name"))
+                    if picked:
+                        st.toast(f"Active sheet set to {picked}")
+                    
+                    # Force a refresh so other tabs see the new state
+                    safe_rerun()
+                    
+                    # (optional) surface a tiny toast so we know it happened
+                    st.toast(f"Activated sheet: {gs_sheet}")
+                    
+                    # Debug: show current sheet status
+                    st.info(f"✅ Current sheet set to {default_sheet}")
+                    
+                    # Verify that get_workbook_status() now reflects the current sheet
+                    from utils.state import get_workbook_status
+                    has_wb, sheet_count, current_sheet = get_workbook_status()
+                    st.info(f"🔍 Workbook status after set_current_sheet: has_wb={has_wb}, sheet_count={sheet_count}, current_sheet={current_sheet}")
+                    
+                    # Additional verification - check session state directly
+                    st.info(f"🔍 Session state check: workbook keys={list(st.session_state.get('workbook', {}).keys())}, current_sheet={st.session_state.get('current_sheet')}")
                     
                     # Show verification report for debugging
                     rep = verify_active_workbook()
@@ -406,8 +470,31 @@ def _render_new_sheet_wizard_section():
                 # Set as active workbook using canonical API
                 set_active_workbook(wiz_wb, default_sheet=name, source="wizard")
                 
-                # Clear stale caches to ensure immediate refresh
-                st.cache_data.clear()
+                # Prefer previously selected sheet_name if present; otherwise first sheet.
+                from utils.state import ensure_active_sheet
+                from ui.utils.rerun import safe_rerun
+                
+                # after you set wb dict in session (workbook OR gs_workbook)...
+                picked = ensure_active_sheet(default=name)
+                if picked:
+                    st.toast(f"Active sheet set to {picked}")
+                
+                # Force a refresh so other tabs see the new state
+                safe_rerun()
+                
+                # (optional) surface a tiny toast so we know it happened
+                st.toast(f"Activated sheet: {name}")
+                
+                # Debug: show current sheet status
+                st.info(f"✅ Current sheet set to {name}")
+                
+                # Verify that get_workbook_status() now reflects the current sheet
+                from utils.state import get_workbook_status
+                has_wb, sheet_count, current_sheet = get_workbook_status()
+                st.info(f"🔍 Workbook status after set_current_sheet: has_wb={has_wb}, sheet_count={sheet_count}, current_sheet={name}")
+                
+                # Additional verification - check session state directly
+                st.info(f"🔍 Session state check: workbook keys={list(st.session_state.get('workbook', {}).keys())}, current_sheet={st.session_state.get('current_sheet')}")
                 
                 # Set context to new sheet
                 st.session_state["work_context"] = {"source": "wizard", "sheet": name}

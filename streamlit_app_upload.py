@@ -27,6 +27,15 @@ from ui.tabs import (
 
 def main():
     """Main application entry point."""
+    # Early debug sidebar - ALWAYS drawn first
+    with st.sidebar:
+        st.markdown("### 🛠 Debug: Session State (early)")
+        snapshot = {
+            k: v if isinstance(v, (str, int, float, bool, type(None))) else type(v).__name__
+            for k, v in st.session_state.items()
+        }
+        st.json(snapshot)
+    
     # Page configuration
     st.set_page_config(
         page_title=f"Decision Tree App {APP_VERSION}",
@@ -38,11 +47,253 @@ def main():
     # Initialize session state
     _initialize_session_state()
     
+    # Early in main(), before rendering tabs, add a guard to self-heal state
+    from utils.state import ensure_current_sheet
+    ensure_current_sheet()  # harmless no-op if already set
+    
+    # Manual fix: if sheet_name exists but current_sheet is None, set it
+    if st.session_state.get("sheet_name") and not st.session_state.get("current_sheet"):
+        from utils.state import set_current_sheet
+        set_current_sheet(st.session_state["sheet_name"])
+        st.info(f"🔧 Auto-fixed: Set current_sheet to {st.session_state['sheet_name']}")
+    
+    # Manual fix: check if we need to migrate workbook data
+    workbook = st.session_state.get("workbook", {})
+    gs_workbook = st.session_state.get("gs_workbook", {})
+    upload_workbook = st.session_state.get("upload_workbook", {})
+    
+    # If main workbook is empty but legacy ones have data, migrate it
+    if (not workbook or not isinstance(workbook, dict) or not workbook) and (gs_workbook or upload_workbook):
+        from utils.state import set_active_workbook
+        # Merge legacy workbooks
+        merged = {}
+        if isinstance(upload_workbook, dict):
+            merged.update(upload_workbook)
+        if isinstance(gs_workbook, dict):
+            merged.update(gs_workbook)
+        
+        if merged:
+            set_active_workbook(merged, default_sheet=st.session_state.get("sheet_name"))
+            st.info(f"🔧 Auto-migrated: Merged {len(merged)} sheets from legacy workbooks")
+    
+    # AGGRESSIVE RECOVERY: Check all possible workbook sources and try to restore data
+    if not st.session_state.get("workbook") or not st.session_state.get("current_sheet"):
+        st.warning("🔍 **Data Recovery Mode** - Attempting to restore workbook data...")
+        
+        # Check if we have a sheet_id and sheet_name but no workbook data
+        sheet_id = st.session_state.get("sheet_id")
+        sheet_name = st.session_state.get("sheet_name")
+        
+        if sheet_id and sheet_name:
+            st.info(f"Found sheet_id: {sheet_id}, sheet_name: {sheet_name}")
+            st.info("Attempting to reload from Google Sheets...")
+            
+            # Try to reload the Google Sheets data
+            try:
+                # Remove the problematic import that doesn't exist
+                st.info("🔄 Google Sheets reload not available in this version")
+                if st.button("🔄 Try Manual Reload", key="recovery_reload"):
+                    # This will trigger a reload of the Google Sheets data
+                    st.session_state["recovery_mode"] = True
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Recovery failed: {e}")
+            
+            # More direct approach - force reload the specific sheet
+            if st.button("🚀 Force Reload BP Sheet", key="force_reload_bp"):
+                try:
+                    import gspread
+                    from google.oauth2.service_account import Credentials
+                    import pandas as pd
+                    
+                    # Get the credentials and sheet info
+                    sheet_id = st.session_state.get("sheet_id")
+                    sheet_name = st.session_state.get("sheet_name")
+                    
+                    if sheet_id and sheet_name:
+                        st.info(f"🔄 Reloading {sheet_name} from {sheet_id}...")
+                        
+                        # This is a simplified version - you might need to adjust based on your auth setup
+                        try:
+                            # Try to reload the sheet data
+                            # For now, just set a flag to trigger the reload
+                            st.session_state["force_reload_sheet"] = True
+                            st.session_state["force_reload_sheet_name"] = sheet_name
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Force reload failed: {e}")
+                    else:
+                        st.error("Missing sheet_id or sheet_name for reload")
+                except Exception as e:
+                    st.error(f"Force reload setup failed: {e}")
+            
+            # Direct restore button - restore workbook data from session state
+            if st.button("🔧 Restore Workbook from Session", key="restore_workbook"):
+                try:
+                    # Check if we have the data in the current session
+                    workbook = st.session_state.get("workbook", {})
+                    gs_workbook = st.session_state.get("gs_workbook", {})
+                    upload_workbook = st.session_state.get("upload_workbook", {})
+                    
+                    # Try to find any non-empty workbook
+                    active_wb = None
+                    if workbook and isinstance(workbook, dict) and workbook:
+                        active_wb = workbook
+                        st.success(f"✅ Found workbook with {len(workbook)} sheets")
+                    elif gs_workbook and isinstance(gs_workbook, dict) and gs_workbook:
+                        active_wb = gs_workbook
+                        st.success(f"✅ Found gs_workbook with {len(gs_workbook)} sheets")
+                    elif upload_workbook and isinstance(upload_workbook, dict) and upload_workbook:
+                        active_wb = upload_workbook
+                        st.success(f"✅ Found upload_workbook with {len(upload_workbook)} sheets")
+                    
+                    if active_wb:
+                        # Set this as the active workbook
+                        from utils.state import set_active_workbook
+                        set_active_workbook(active_wb, default_sheet=st.session_state.get("sheet_name"))
+                        st.success("✅ Workbook restored! Refreshing...")
+                        st.rerun()
+                    else:
+                        st.warning("⚠️ No workbook data found in session state")
+                        
+                except Exception as e:
+                    st.error(f"Restore failed: {e}")
+        
+        # Show all session state keys that might contain workbook data
+        with st.expander("🔍 All Session State Keys", expanded=True):
+            all_keys = list(st.session_state.keys())
+            workbook_related = [k for k in all_keys if any(x in k.lower() for x in ["workbook", "sheet", "data", "df"])]
+            st.write("**Workbook-related keys:**", workbook_related)
+            
+            # Show the actual content of these keys
+            for key in workbook_related[:10]:  # Limit to first 10 to avoid overwhelming
+                value = st.session_state.get(key)
+                if isinstance(value, dict):
+                    st.write(f"**{key}:** {len(value)} items")
+                    if value:
+                        sample_keys = list(value.keys())[:5]
+                        st.write(f"  Sample keys: {sample_keys}")
+                elif isinstance(value, list):
+                    st.write(f"**{key}:** {len(value)} items")
+                else:
+                    st.write(f"**{key}:** {type(value).__name__}")
+            
+            # Add a direct restore button for the specific case we're seeing
+            st.write("---")
+            st.write("**🔧 Direct Restore Options:**")
+            
+            # Check if we have BP data somewhere
+            bp_found = False
+            for key in ["workbook", "gs_workbook", "upload_workbook"]:
+                wb = st.session_state.get(key, {})
+                if isinstance(wb, dict) and "BP" in wb:
+                    bp_found = True
+                    st.success(f"✅ Found BP in {key}")
+                    if st.button(f"Restore from {key}", key=f"restore_{key}"):
+                        from utils.state import set_active_workbook
+                        set_active_workbook(wb, default_sheet="BP")
+                        st.success("✅ Restored! Refreshing...")
+                        st.rerun()
+                    break
+            
+            if not bp_found:
+                st.warning("⚠️ BP sheet not found in any workbook key")
+                
+                # Try to create a minimal workbook with BP
+                if st.button("Create Minimal BP Workbook", key="create_minimal"):
+                    try:
+                        # Create a minimal DataFrame for BP
+                        import pandas as pd
+                        minimal_df = pd.DataFrame({
+                            "Vital Measurement": ["Test"],
+                            "Node 1": ["Test"],
+                            "Node 2": ["Test"],
+                            "Node 3": ["Test"],
+                            "Node 4": ["Test"],
+                            "Node 5": ["Test"],
+                            "Diagnostic Triage": ["Test"],
+                            "Actions": ["Test"]
+                        })
+                        
+                        minimal_wb = {"BP": minimal_df}
+                        from utils.state import set_active_workbook
+                        set_active_workbook(minimal_wb, default_sheet="BP")
+                        st.success("✅ Created minimal workbook! Refreshing...")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Creation failed: {e}")
+    
     # Header with version and status
     _render_header()
     
     # Main content area
     _render_main_content()
+    
+    # ensure a valid current sheet every run before rendering any tab
+    ensure_current_sheet()
+    
+    # Sidebar debug inspector
+    with st.sidebar:
+        st.markdown("### 🛠 Debug: Session State")
+        snapshot = {
+            k: v if isinstance(v, (str, int, float, bool, type(None))) else type(v).__name__
+            for k, v in st.session_state.items()
+        }
+        st.json(snapshot)
+    
+    # Sheet picker in sidebar (or header), add a Sheet picker so you can manually recover if needed
+    from utils.state import get_sheet_names, set_current_sheet
+    
+    with st.sidebar:
+        st.markdown("### 📋 Sheet Picker")
+        names = get_sheet_names()
+        cur = st.session_state.get("current_sheet")
+        if names:
+            sel = st.selectbox("Active sheet", names, index=names.index(cur) if cur in names else 0, key="__sheet_picker")
+            if sel != cur:
+                set_current_sheet(sel)
+                st.rerun()
+        else:
+            st.caption("No sheets loaded yet.")
+    
+    # DEV bypass to prove the Symptoms render path
+    with st.sidebar:
+        st.subheader("🔧 Dev")
+        force_symptoms = st.checkbox("Force Symptoms render (dev)", key="DEV_FORCE_SYMPTOMS", help="Bypass nav and render Symptoms now")
+        
+        # Temporary bypass to restore all tabs
+        force_all_tabs = st.checkbox("Force All Tabs (bypass workbook check)", key="DEV_FORCE_ALL_TABS", help="Temporarily bypass workbook check to restore all tabs")
+    
+    # Late sidebar debug (use the single global st import; do NOT re-import inside the function)
+    def _debug_sidebar_late():
+        try:
+            import json
+            with st.sidebar:
+                st.markdown("🛠 **Debug (late)**")
+                wb = st.session_state.get("workbook") or {}
+                keys = list(wb.keys()) if isinstance(wb, dict) else []
+                info = {
+                    "current_tab": st.session_state.get("current_tab"),
+                    "current_sheet": st.session_state.get("current_sheet"),
+                    "sheet_name": st.session_state.get("sheet_name"),
+                    "wb_keys": keys,
+                    "wb_nonce": st.session_state.get("wb_nonce"),
+                }
+                st.code(json.dumps(info, indent=2), language="json")
+        except Exception as e:
+            st.warning(f"Late debug failed: {e}")
+
+    # Call this near the very end of main(), after tab rendering.
+    _debug_sidebar_late()
+    
+    # Tab Render Watchdog
+    with st.sidebar:
+        st.markdown("🧭 **Tab Watchdog**")
+        st.write({
+            "current_tab": st.session_state.get("current_tab"),
+            "current_sheet": st.session_state.get("current_sheet"),
+            "sheet_keys": list((st.session_state.get("workbook") or {}).keys()),
+        })
 
 
 def _initialize_session_state():
@@ -224,6 +475,85 @@ def _render_header():
 
 def _render_main_content():
     """Render the main content area with tabs."""
+    import datetime
+    
+    # Check if user wants to bypass workbook check
+    if st.session_state.get("DEV_FORCE_ALL_TABS"):
+        st.info("🚀 **DEV MODE: Bypassing workbook check - All tabs available**")
+        st.warning("⚠️ This bypasses normal workbook validation. Use only for debugging.")
+        
+        # Render all tabs normally
+        _render_all_tabs()
+        return
+    
+    # Check if we have a workbook before rendering tabs
+    from utils.state import get_active_workbook_safe
+    wb, wb_status, wb_detail = get_active_workbook_safe()
+    
+    # Debug: Show what's actually in the workbook dictionaries
+    with st.expander("🔍 Debug: Workbook Inspection", expanded=True):
+        st.write("**Session State Workbook Keys:**")
+        workbook = st.session_state.get("workbook", {})
+        gs_workbook = st.session_state.get("gs_workbook", {})
+        st.write({
+            "workbook_type": type(workbook).__name__,
+            "workbook_keys": list(workbook.keys()) if isinstance(workbook, dict) else "Not a dict",
+            "workbook_length": len(workbook) if isinstance(workbook, dict) else "N/A",
+            "gs_workbook_type": type(gs_workbook).__name__,
+            "gs_workbook_keys": list(gs_workbook.keys()) if isinstance(gs_workbook, dict) else "N/A",
+            "gs_workbook_length": len(gs_workbook) if isinstance(gs_workbook, dict) else "N/A",
+            "current_sheet": st.session_state.get("current_sheet"),
+            "sheet_name": st.session_state.get("sheet_name"),
+        })
+        
+        # Show actual workbook content if available
+        if isinstance(workbook, dict) and workbook:
+            st.write("**Workbook content sample:**")
+            for key, value in list(workbook.items())[:3]:
+                st.write(f"  {key}: {type(value).__name__}")
+        if isinstance(gs_workbook, dict) and gs_workbook:
+            st.write("**GS Workbook content sample:**")
+            for key, value in list(gs_workbook.items())[:3]:
+                st.write(f"  {key}: {type(value).__name__}")
+    
+    if wb_status != "ok":
+        # No workbook loaded - show clear message
+        st.info("📂 **No workbook loaded yet**")
+        st.markdown("""
+        To get started:
+        1. **Go to the Source tab** (first tab)
+        2. **Upload a workbook** or **connect to Google Sheets**
+        3. **Select a sheet** to work with
+        
+        Once a workbook is loaded, all tabs will become available.
+        """)
+        
+        # Show current status
+        with st.expander("🔍 Current Status", expanded=True):
+            st.write({
+                "workbook_status": wb_status,
+                "detail": wb_detail,
+                "session_keys": [k for k in st.session_state.keys() if "workbook" in k.lower() or "sheet" in k.lower()]
+            })
+        
+        # Only show Source tab when no workbook
+        st.info("🚦 DISPATCH Source/Workbook loader")
+        source.render()
+        return
+    
+    # DEV bypass: if force_symptoms is checked, render Symptoms directly and stop
+    if st.session_state.get("DEV_FORCE_SYMPTOMS"):
+        st.info("DEV: Forcing Symptoms.render()")
+        from ui.tabs import symptoms as T_SYMPT
+        T_SYMPT.render()
+        st.stop()  # prevent the rest of the app from double-rendering
+    
+    # Render all tabs normally (workbook is available)
+    _render_all_tabs()
+
+
+def _render_all_tabs():
+    """Render all tabs with normal error handling."""
     # Tab registry
     TAB_REGISTRY = [
         ("📂 Source", source.render),
@@ -242,14 +572,43 @@ def _render_main_content():
     tab_names = [t[0] for t in TAB_REGISTRY]
     tabs = st.tabs(tab_names)
     
-    # Render each tab
-    for i, (_, fn) in enumerate(TAB_REGISTRY):
+    # Render each tab with DISPATCH tracer and error handling
+    for i, (tab_name, fn) in enumerate(TAB_REGISTRY):
         with tabs[i]:
-            try:
-                fn()
-            except Exception as e:
-                st.error("This tab crashed:")
-                st.exception(e)
+            # Extract the actual tab name without emoji
+            clean_tab_name = tab_name.split(" ", 1)[1] if " " in tab_name else tab_name
+            
+            if clean_tab_name == "Symptoms":
+                st.info(f"🚦 DISPATCH Symptoms at {datetime.datetime.now().isoformat()}")
+                try:
+                    fn()
+                except Exception as e:
+                    st.error(f"❌ Symptoms tab crashed: {e}")
+                    st.exception(e)
+            
+            elif clean_tab_name == "Outcomes":
+                st.info(f"🚦 DISPATCH Outcomes at {datetime.datetime.now().isoformat()}")
+                try:
+                    fn()
+                except Exception as e:
+                    st.error(f"❌ Outcomes tab crashed: {e}")
+                    st.exception(e)
+            
+            elif clean_tab_name == "Calculator":
+                st.info(f"🚦 DISPATCH Calculator at {datetime.datetime.now().isoformat()}")
+                try:
+                    fn()
+                except Exception as e:
+                    st.error(f"❌ Calculator tab crashed: {e}")
+                    st.exception(e)
+            
+            else:
+                # Other tabs get basic error handling
+                try:
+                    fn()
+                except Exception as e:
+                    st.error(f"❌ {clean_tab_name} tab crashed: {e}")
+                    st.exception(e)
 
 
 def _get_cache_key(sheet_name: str, data_shape: Tuple[int, int], data_hash: str) -> Tuple:

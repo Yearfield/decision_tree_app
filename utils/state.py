@@ -9,47 +9,166 @@ import pandas as pd
 from typing import Dict, Optional, Any, List
 from uuid import uuid4
 
-# Canonical keys
+# Legacy constants (kept for compatibility)
 WORKBOOK_KEY = "workbook"          # Dict[str, pd.DataFrame]
 CURRENT_SHEET_KEY = "current_sheet"  # str
 WB_NONCE_KEY = "wb_nonce"          # random string for cache busting
 
-def set_active_workbook(wb: Dict[str, pd.DataFrame], default_sheet: Optional[str] = None, source: str = "") -> None:
-    """Set the active workbook in session state with cache busting."""
-    # Verify that all values are DataFrames
-    if not isinstance(wb, dict):
-        raise ValueError(f"workbook must be a dict, got {type(wb).__name__}")
+def get_sheet_names() -> list[str]:
+    """Get list of available sheet names from active workbook."""
+    wb = st.session_state.get("workbook") or {}
+    if isinstance(wb, dict):
+        return list(wb.keys())
+    return []
+
+def ensure_current_sheet() -> str | None:
+    """
+    Ensure there is a valid current sheet name in session.
+    Prefers st.session_state['current_sheet'], then 'sheet_name', then first sheet in workbook.
+    Returns the chosen sheet name or None.
+    """
+    wb = st.session_state.get("workbook") or {}
+    names = list(wb.keys()) if isinstance(wb, dict) else []
+
+    # Already set & valid?
+    cur = st.session_state.get("current_sheet")
+    if cur and cur in names:
+        return cur
+
+    # Fallback to 'sheet_name'
+    sn = st.session_state.get("sheet_name")
+    if sn and sn in names:
+        st.session_state["current_sheet"] = sn
+        return sn
+
+    # Fallback to first available
+    if names:
+        st.session_state["current_sheet"] = names[0]
+        return names[0]
+
+    # Nothing available
+    st.session_state["current_sheet"] = None
+    return None
+
+def _wb_dict():
+    """Prefer non-empty 'workbook', else non-empty 'gs_workbook', else None."""
+    wb = st.session_state.get("workbook")
+    if isinstance(wb, dict) and wb:
+        return wb
+    wb = st.session_state.get("gs_workbook")
+    if isinstance(wb, dict) and wb:
+        return wb
+    return None
+
+def set_active_workbook(wb: dict, default_sheet: str | None = None, source: str = "unspecified"):
+    """Set the active workbook in session state with smart sheet selection."""
+    st.session_state["workbook"] = wb
+    # If current_sheet invalid or missing, pick default or the first sheet
+    curr = st.session_state.get("current_sheet")
+    if not curr or curr not in wb:
+        chosen = default_sheet if default_sheet and default_sheet in wb else (next(iter(wb.keys())) if wb else None)
+        if chosen:
+            st.session_state["current_sheet"] = chosen
+            st.session_state["sheet_name"] = chosen  # keep in sync
+    # bump nonce to invalidate caches if needed
+    st.session_state["wb_nonce"] = (st.session_state.get("wb_nonce") or "") + "•"
+
+def get_active_workbook():
+    """Get the active workbook from session state with fallback to legacy keys."""
+    return st.session_state.get("workbook") or st.session_state.get("gs_workbook")
+
+def set_current_sheet(name: str):
+    """Set current sheet and keep sheet_name in sync."""
+    st.session_state["current_sheet"] = name
+    st.session_state["sheet_name"] = name
+
+def ensure_active_sheet(default: str | None = None, source: str = "ensure_active_sheet"):
+    """
+    Guarantee a valid current_sheet in session_state if a workbook exists.
+    Preference: default -> current_sheet -> sheet_name -> first key.
+    """
+    wb = _wb_dict()
+    if not wb:
+        return None
+    keys = list(wb.keys())
+    if not keys:
+        return None
+
+    pick = None
+    if default in keys:
+        pick = default
+    elif st.session_state.get("current_sheet") in keys:
+        pick = st.session_state["current_sheet"]
+    elif st.session_state.get("sheet_name") in keys:
+        pick = st.session_state["sheet_name"]
+    else:
+        pick = keys[0]
+
+    st.session_state["current_sheet"] = pick
+    st.session_state["sheet_name"] = pick
+    return pick
+
+
+def get_current_sheet():
+    """Get current sheet with auto-repair fallback."""
+    cs = st.session_state.get("current_sheet")
+    if cs:
+        return cs
+    # fall back and try to set one
+    return ensure_active_sheet()
+
+def get_active_workbook_safe():
+    """
+    Return (wb, status, detail) where status in:
+      - 'ok'           (workbook exists and has sheets)
+      - 'no_wb'        (no workbook)
+      - 'empty_wb'     (workbook exists but is empty)
+    """
+    wb = _wb_dict()
+    if not wb:
+        return None, "no_wb", "No workbook in session_state"
     
-    # Check each value is a DataFrame
-    non_df_keys = [k for k, v in wb.items() if not isinstance(v, pd.DataFrame)]
-    if non_df_keys:
-        raise ValueError(f"workbook contains non-DataFrame entries: {non_df_keys}")
+    if not wb:  # This checks if the dict is empty
+        return None, "empty_wb", "Workbook exists but has no sheets"
     
-    st.session_state[WORKBOOK_KEY] = wb
-    st.session_state[WB_NONCE_KEY] = uuid4().hex
-    if default_sheet is None:
-        default_sheet = (list(wb.keys())[0] if wb else None)
-    st.session_state[CURRENT_SHEET_KEY] = default_sheet
-    if source:
-        st.session_state["workbook_source"] = source
+    return wb, "ok", f"Workbook with {len(wb)} sheet(s)"
 
-def get_active_workbook() -> Optional[Dict[str, pd.DataFrame]]:
-    """Get the active workbook from session state."""
-    return st.session_state.get(WORKBOOK_KEY)
+def get_active_df_safe():
+    """
+    Return (df, status, detail) where status in:
+      - 'ok'
+      - 'no_wb'        (no workbook)
+      - 'no_sheet'     (no current sheet)
+      - 'sheet_missing'(current sheet not in wb)
+      - 'not_df'       (object is not a DataFrame)
+    """
+    wb = _wb_dict()
+    if not wb:
+        return None, "no_wb", "No workbook in session_state"
 
-def set_current_sheet(name: Optional[str]) -> None:
-    """Set the current sheet name in session state with cache busting."""
-    st.session_state[CURRENT_SHEET_KEY] = name
-    # Bump nonce so caches that depend on current sheet refresh
-    st.session_state[WB_NONCE_KEY] = uuid4().hex
+    sheet = st.session_state.get("current_sheet") or st.session_state.get("sheet_name")
+    if not sheet:
+        sheet = ensure_active_sheet()
+    if not sheet:
+        return None, "no_sheet", "Could not determine a sheet name"
 
-def get_current_sheet() -> Optional[str]:
-    """Get the current sheet name from session state."""
-    return st.session_state.get(CURRENT_SHEET_KEY)
+    if sheet not in wb:
+        # try to heal once
+        healed = ensure_active_sheet(default=st.session_state.get("sheet_name"))
+        if not healed:
+            return None, "sheet_missing", f"'{sheet}' not in workbook keys={list(wb.keys())[:5]}..."
+        sheet = healed
+
+    df = wb.get(sheet)
+    import pandas as pd
+    if not isinstance(df, pd.DataFrame):
+        return None, "not_df", f"Value at wb['{sheet}'] is {type(df).__name__}"
+
+    return df, "ok", sheet
 
 def get_wb_nonce() -> str:
     """Get the current workbook nonce for cache keys."""
-    return st.session_state.get(WB_NONCE_KEY, "")
+    return st.session_state.get("wb_nonce", "")
 
 def get_active_df() -> Optional[pd.DataFrame]:
     """Get the currently active DataFrame from the active workbook and sheet."""
@@ -64,27 +183,18 @@ def has_active_workbook() -> bool:
     wb = get_active_workbook()
     return bool(wb and len(wb) > 0)
 
-def get_workbook_status() -> tuple[bool, Optional[str], Optional[str]]:
-    """Get workbook status for UI display.
-    
-    Returns:
-        Tuple of (has_workbook, sheet_count, current_sheet)
-    """
-    wb = get_active_workbook()
-    sheet = get_current_sheet()
-    
-    if not wb:
-        return False, None, None
-    
-    sheet_count = len(wb)
-    return True, str(sheet_count), sheet
+def get_workbook_status():
+    """Get workbook status for UI display."""
+    wb = get_active_workbook() or {}
+    current_sheet = get_current_sheet()
+    return (bool(wb), len(wb), current_sheet)
 
 def migrate_legacy_state() -> None:
     """Migrate legacy state keys to the new unified format.
     This should be called during app initialization.
     """
     # Check if we need to migrate from old state
-    if WORKBOOK_KEY not in st.session_state:
+    if "workbook" not in st.session_state:
         # Try to migrate from legacy keys
         upload_wb = st.session_state.get("upload_workbook", {})
         gs_wb = st.session_state.get("gs_workbook", {})
@@ -98,12 +208,12 @@ def migrate_legacy_state() -> None:
             set_active_workbook(merged_wb)
             
             # Set a default current sheet if none is set
-            if CURRENT_SHEET_KEY not in st.session_state and merged_wb:
+            if "current_sheet" not in st.session_state and merged_wb:
                 set_current_sheet(list(merged_wb.keys())[0])
 
 def clear_workbook_state() -> None:
     """Clear all workbook-related state."""
-    for key in [WORKBOOK_KEY, CURRENT_SHEET_KEY, WB_NONCE_KEY]:
+    for key in ["workbook", "current_sheet", "wb_nonce"]:
         if key in st.session_state:
             del st.session_state[key]
     
@@ -185,7 +295,7 @@ def coerce_workbook_to_dataframes(raw_wb: Dict[str, Any]) -> Dict[str, pd.DataFr
 
 def assert_workbook_integrity() -> None:
     """Assert that the current workbook contains only DataFrames."""
-    wb = st.session_state.get("workbook")
+    wb = get_active_workbook()
     if wb is not None:
         assert isinstance(wb, dict), "workbook is not a dict"
         assert all(isinstance(v, pd.DataFrame) for v in wb.values()), "workbook contains non-DataFrame entries"
