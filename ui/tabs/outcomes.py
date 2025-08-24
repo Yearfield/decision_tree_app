@@ -129,7 +129,7 @@ def render():
             wb = {sheet: df}
         
         # Ensure columns exist before editing, using CANON_HEADERS order
-        CANON_HEADERS = ["Vital Measurement","Node 1","Node 2","Node 3","Node 4","Node 5","Diagnostic Triage","Actions"]
+        from utils.constants import CANON_HEADERS
         df_cur = wb.get(sheet, pd.DataFrame()).copy()
         for c in CANON_HEADERS:
             if c not in df_cur.columns:

@@ -10,7 +10,8 @@ import time
 import datetime
 from typing import Dict, Any, Tuple, List
 
-from utils import APP_VERSION, CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
+from utils.constants import APP_VERSION, CANON_HEADERS, LEVEL_COLS
+from utils import normalize_text, validate_headers
 from utils.state import (
     set_active_workbook, get_active_workbook, set_current_sheet, get_current_sheet,
     get_active_df, has_active_workbook, get_workbook_status, migrate_legacy_state,
@@ -422,11 +423,11 @@ def _render_header():
             def _rows_full_path_counts(df0: pd.DataFrame) -> tuple[int, int]:
                 if df0 is None or df0.empty:
                     return 0, 0
-                node_cols = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
-                for c in node_cols:
+                from utils.constants import NODE_COLS
+                for c in NODE_COLS:
                     if c not in df0.columns:
                         df0[c] = ""
-                ok = int((df0[node_cols] != "").all(axis=1).sum())
+                ok = int((df0[NODE_COLS] != "").all(axis=1).sum())
                 total = int(len(df0))
                 return ok, total
 
@@ -434,16 +435,16 @@ def _render_header():
                 if df0 is None or df0.empty:
                     return 0, 0
                 dfv = df0.copy()
-                node_cols = ["Node 1","Node 2","Node 3","Node 4","Node 5"]
-                for c in ["Vital Measurement"] + node_cols:
+                from utils.constants import NODE_COLS
+                for c in ["Vital Measurement"] + NODE_COLS:
                     if c not in dfv.columns:
                         dfv[c] = ""
                     dfv[c] = dfv[c].astype(str).str.strip()
                 ok_total = 0
                 total_parents = 0
                 for lvl in range(1, 6):
-                    parent_cols = node_cols[:lvl-1]
-                    child_col  = node_cols[lvl-1]
+                    parent_cols = NODE_COLS[:lvl-1]
+                    child_col  = NODE_COLS[lvl-1]
                     scope = dfv[dfv[child_col] != ""].copy()
                     if parent_cols:
                         scope = scope[(scope[parent_cols] != "").all(axis=1)]

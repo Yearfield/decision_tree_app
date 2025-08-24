@@ -40,8 +40,8 @@ def render():
         sheet = USTATE.get_current_sheet()
         
         # Ensure Node columns exist (add empty strings if any of Node 1..Node 5 missing)
-        node_cols = ["Node 1", "Node 2", "Node 3", "Node 4", "Node 5"]
-        for col in node_cols:
+        from utils.constants import NODE_COLS
+        for col in NODE_COLS:
             if col not in df.columns:
                 df[col] = ""
         

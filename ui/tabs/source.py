@@ -4,9 +4,10 @@ import pandas as pd
 from typing import Dict, Any
 
 from utils import (
-    CANON_HEADERS, LEVEL_COLS, normalize_text, validate_headers
+    normalize_text, validate_headers
 )
 import utils.state as USTATE
+from utils.constants import CANON_HEADERS, LEVEL_COLS
 from logic.tree import build_raw_plus_v630 # Not fully used yet, but imported
 from io_utils.sheets import read_google_sheet
 
@@ -130,8 +131,8 @@ def _render_google_sheets_section():
     st.subheader("🔄 Google Sheets")
     
     # Re-sync button for current sheet
-            current_wb = USTATE.get_active_workbook()
-        current_sheet = USTATE.get_current_sheet()
+    current_wb = USTATE.get_active_workbook()
+    current_sheet = USTATE.get_current_sheet()
     if bool(current_wb) and current_sheet:
         if st.button("🔄 Re-sync current sheet"):
             sheet_id = st.session_state.get("sheet_id")
@@ -346,7 +347,7 @@ def _render_new_sheet_wizard_section():
     st.subheader("🧙 New Sheet Wizard (create sheet + seed branches)")
     
     # Use canonical workbook instead of legacy access
-                    active_wb = USTATE.get_active_workbook()
+    active_wb = USTATE.get_active_workbook()
     if not active_wb:
         st.info("No active workbook. Please load a workbook first (upload or Google Sheets).")
         return
