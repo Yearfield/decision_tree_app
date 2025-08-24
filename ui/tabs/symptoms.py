@@ -1084,7 +1084,7 @@ def _render_branch_editor_section(df: pd.DataFrame, sheet_name: str):
         st.info("💡 **Note:** Level-1 (ROOT) children are managed in the ⚖️ Conflicts tab. Use the Level-1 editor there to set the Node-1 options.")
     
     # Get distinct parent paths at level-1
-    parent_paths = _get_parent_paths_at_level(df, level, get_wb_nonce())
+    parent_paths = _get_parent_paths_at_level(df, level, USTATE.get_wb_nonce())
     
     if not parent_paths:
         st.info(f"No parent paths found at level {level}.")
@@ -1103,7 +1103,7 @@ def _render_branch_editor_section(df: pd.DataFrame, sheet_name: str):
         return
     
     # Show current children for the selected parent
-    current_children = _get_current_children_for_parent(df, level, selected_parent_path, get_wb_nonce())
+    current_children = _get_current_children_for_parent(df, level, selected_parent_path, USTATE.get_wb_nonce())
     
     # Build clear parent title
     if len(selected_parent_path) == 0 and level == 1:
@@ -1738,10 +1738,9 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
             # Call your existing materialize/save routine (the one already used elsewhere) to write to Node L
             try:
                 from logic.tree import infer_branch_options_with_overrides
-                from utils.state import get_active_workbook, set_active_workbook
                 
                 # Get active workbook
-                wb = get_active_workbook()
+                wb = USTATE.get_active_workbook()
                 if not wb or sheet_name not in wb:
                     st.error("No active workbook found.")
                     return
@@ -1751,7 +1750,7 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
                 
                 # Update workbook
                 wb[sheet_name] = updated_df
-                set_active_workbook(wb, source="symptoms_editor")
+                USTATE.set_active_workbook(wb, source="symptoms_editor")
                 
                 # Clear caches
                 st.cache_data.clear()
@@ -1768,7 +1767,7 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
                 if active == "A" and queue_a:
                     st.session_state[posA_key] = (st.session_state.get(posA_key, 0) + 1) % len(queue_a)
                 elif active == "B" and queue_b:
-                    st.session_state[posB_key] = (st.session_state.get(posB_key, 0) + 1) % len(queue_b)
+                    st.session_state[posB_key] = (st.session_state.get(posB_key, 0) + 1) % len(queue_a)
                 
                 # Rerun to update queues
                 st.rerun()
@@ -1811,10 +1810,9 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
             # Call your existing materialize/save routine (the one already used elsewhere) to write to Node L
             try:
                 from logic.tree import infer_branch_options_with_overrides
-                from utils.state import get_active_workbook, set_active_workbook
                 
                 # Get active workbook
-                wb = get_active_workbook()
+                wb = USTATE.get_active_workbook()
                 if not wb or sheet_name not in wb:
                     st.error("No active workbook found.")
                     return
@@ -1824,7 +1822,7 @@ def _render_streamlined_symptoms_editor(df: pd.DataFrame, df_norm: pd.DataFrame,
                 
                 # Update workbook
                 wb[sheet_name] = updated_df
-                set_active_workbook(wb, source="symptoms_editor")
+                USTATE.set_active_workbook(wb, source="symptoms_editor")
                 
                 # Clear caches
                 st.cache_data.clear()

@@ -125,8 +125,8 @@ def _render_google_sheets_section():
     st.subheader("🔄 Google Sheets")
     
     # Re-sync button for current sheet
-    current_wb = get_active_workbook()
-    current_sheet = get_current_sheet()
+            current_wb = USTATE.get_active_workbook()
+        current_sheet = USTATE.get_current_sheet()
     if bool(current_wb) and current_sheet:
         if st.button("🔄 Re-sync current sheet"):
             sheet_id = st.session_state.get("sheet_id")
@@ -140,7 +140,7 @@ def _render_google_sheets_section():
                         with st.spinner("Re-syncing..."):
                             new_df = read_google_sheet(sheet_id, sheet_name, st.secrets["gcp_service_account"])
                             if not new_df.empty:
-                                updated_wb = get_active_workbook() or {}
+                                updated_wb = USTATE.get_active_workbook() or {}
                                 updated_wb[sheet_name] = new_df
                                 USTATE.set_active_workbook(updated_wb, source="sheets")
                                 
@@ -169,7 +169,7 @@ def _render_google_sheets_section():
                                 st.info(f"🔍 Session state check: workbook keys={list(st.session_state.get('workbook', {}).keys())}, current_sheet={st.session_state.get('current_sheet')}")
                                 
                                 # Sanity assertions (temporary; safe to remove later)
-                                wb_check, sheet_check = get_active_workbook(), get_current_sheet()
+                                wb_check, sheet_check = USTATE.get_active_workbook(), USTATE.get_current_sheet()
                                 assert wb_check is not None, "active workbook missing after re-sync"
                                 assert isinstance(wb_check, dict), "active workbook should be Dict[str, DataFrame]"
                                 assert sheet_check is None or sheet_check in wb_check, "current_sheet must be a key of active workbook"
@@ -331,7 +331,7 @@ def _render_new_sheet_wizard_section():
     st.subheader("🧙 New Sheet Wizard (create sheet + seed branches)")
     
     # Use canonical workbook instead of legacy access
-    active_wb = get_active_workbook()
+                    active_wb = USTATE.get_active_workbook()
     if not active_wb:
         st.info("No active workbook. Please load a workbook first (upload or Google Sheets).")
         return
@@ -462,7 +462,7 @@ def _render_new_sheet_wizard_section():
                 wiz_wb[name] = df_new
                 
                 # Set as active workbook using canonical API
-                set_active_workbook(wiz_wb, default_sheet=name, source="wizard")
+                USTATE.set_active_workbook(wiz_wb, default_sheet=name, source="wizard")
                 
                 # Prefer previously selected sheet_name if present; otherwise first sheet.
                 from ui.utils.rerun import safe_rerun

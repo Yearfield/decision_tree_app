@@ -121,7 +121,7 @@ def render():
             where = "upload"
         else:
             # active context
-            wb = get_active_workbook() or {}
+            wb = USTATE.get_active_workbook() or {}
             where = "active"
         
         if not wb or sheet not in wb:
